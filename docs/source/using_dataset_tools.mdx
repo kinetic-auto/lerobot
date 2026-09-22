@@ -305,17 +305,15 @@ For a private or gated dataset, authenticate first with `hf auth login`, or set 
 automatically; no token argument is needed.
 
 **From a local folder:**
-Add the `--root` option and set `--mode local`. For example, to search in `./my_local_data_dir/lerobot/pusht`:
+Point `--root` at the dataset directory (the folder that contains `meta/`). `--repo-id` is optional.
 
 ```bash
 lerobot-dataset-viz \
-    --repo-id lerobot/pusht \
-    --root ./my_local_data_dir \
-    --mode local \
+    --root /path/to/my_dataset \
     --episode-index 0
 ```
 
-Once executed, the tool opens `rerun.io` and displays the camera streams, robot states, and actions for the selected episode.
+Once executed, the tool opens the Rerun web viewer and displays the camera streams, robot states, and actions for the selected episode.
 
 To use [Foxglove](https://foxglove.dev) instead of Rerun, install the extra add `--display-mode foxglove`. This starts a WebSocket server (connect the Foxglove app to `ws://127.0.0.1:8765`) that serves the episode as a seekable timeline you can play/pause and scrub.
 

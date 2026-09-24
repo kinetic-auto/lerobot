@@ -322,3 +322,14 @@ For advanced usage—including visualizing datasets stored on a remote server—
 ```bash
 lerobot-dataset-viz --help
 ```
+
+## Static episode overview
+
+`lerobot-dataset-plot` saves one PNG per episode. Each figure shows camera frames along the top and the matching state or action traces below. By default it plots every episode, every RGB video camera, and `observation.state` plus `action`.
+
+```bash
+lerobot-dataset-plot \
+    --dataset-path /path/to/my_dataset
+```
+
+Use `--episodes`, `--image-observations`, `--feature-keys`, and `--obs-plot-groups` to plot a subset. Figures are written to `<dataset-path>/episode_plots/episode_<i>.png` unless `--output-dir` is set.

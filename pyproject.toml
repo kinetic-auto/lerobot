@@ -141,8 +141,8 @@ core_scripts = ["lerobot[dataset]", "lerobot[hardware]", "lerobot[viz]"]
 # lerobot-eval -- base evaluation framework. You also need the policy's extra (e.g., lerobot[pi])
 # and the environment's extra (e.g., lerobot[pusht]) if evaluating in simulation.
 evaluation = ["lerobot[av-dep]"]
-# lerobot-dataset-viz, lerobot-imgtransform-viz
-dataset_viz = ["lerobot[dataset]", "lerobot[viz]"]
+# lerobot-dataset-viz, lerobot-imgtransform-viz, lerobot-dataset-plot
+dataset_viz = ["lerobot[dataset]", "lerobot[viz]", "lerobot[matplotlib-dep]"]
 
 # Common
 av-dep = ["av>=15.0.0,<16.0.0"]
@@ -372,6 +372,7 @@ lerobot-eval="lerobot.scripts.lerobot_eval:main"
 lerobot-train="lerobot.scripts.lerobot_train:main"
 lerobot-train-tokenizer="lerobot.scripts.lerobot_train_tokenizer:main"
 lerobot-dataset-viz="lerobot.scripts.lerobot_dataset_viz:main"
+lerobot-dataset-plot="lerobot.scripts.lerobot_dataset_plot:main"
 lerobot-info="lerobot.scripts.lerobot_info:main"
 lerobot-find-joint-limits="lerobot.scripts.lerobot_find_joint_limits:main"
 lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"

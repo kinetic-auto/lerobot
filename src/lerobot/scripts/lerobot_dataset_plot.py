@@ -21,7 +21,7 @@ Example:
 ```
 lerobot-dataset-plot \
     --dataset-path /path/to/my_dataset \
-    --state-observations observation.state action
+    --feature-keys observation.state action
 ```
 """
 
@@ -35,7 +35,7 @@ import numpy as np
 
 from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.video_utils import decode_video_frames
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import _matplotlib_available, require_package
 from lerobot.utils.utils import init_logging
 
@@ -47,6 +47,8 @@ FIGURE_WIDTH_INCHES = 24.0
 FIGURE_BASE_HEIGHT_INCHES = 12.0
 FIGURE_STRIP_HEIGHT_INCHES = 2.2
 NON_PLOTTABLE_DTYPES = ("video", "image")
+DEFAULT_FEATURE_KEYS = (OBS_STATE, ACTION)
+OBS_PLOT_GROUPS = ("position", "velocity", "effort")
 _pyplot = None
 
 
@@ -68,11 +70,18 @@ def main() -> None:
         help="Episode indices to plot. Default: all.",
     )
     parser.add_argument(
-        "--state-observations",
+        "--feature-keys",
         type=str,
         nargs="+",
-        default=[OBS_STATE],
-        help="State feature keys. Default: observation.state.",
+        default=None,
+        help="1-D feature keys (observation or action). Default: observation.state action.",
+    )
+    parser.add_argument(
+        "--obs-plot-groups",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Dimension groups to plot. Default: position velocity effort.",
     )
     parser.add_argument(
         "--image-observations",
@@ -105,7 +114,8 @@ def main() -> None:
     init_logging()
     dataset = load_dataset(args.dataset_path, args.episodes, args.tolerance_s)
     image_observation_keys = resolve_image_observation_keys(dataset, args.image_observations)
-    validate_state_observation_keys(dataset, args.state_observations)
+    feature_keys = resolve_feature_keys(dataset, args.feature_keys)
+    obs_plot_groups = resolve_obs_plot_groups(args.obs_plot_groups)
     episode_indices = resolve_episode_indices_to_plot(dataset, args.episodes)
     output_dir = (
         args.output_dir if args.output_dir is not None else os.path.join(str(dataset.root), "episode_plots")
@@ -116,7 +126,8 @@ def main() -> None:
             dataset,
             episode_index,
             image_observation_keys,
-            args.state_observations,
+            feature_keys,
+            obs_plot_groups,
             args.num_image_samples,
             output_dir,
             args.dpi,
@@ -181,6 +192,28 @@ def get_feature_names(dataset: LeRobotDataset, key: str) -> list[str]:
     return [f"{key}_{d}" for d in range(dim)]
 
 
+def group_feature_dims(
+    names: list[str], plot_groups: list[str] | None = None
+) -> list[tuple[str, list[int], list[str]]]:
+    """Split feature dimensions by trailing name suffix.
+
+    Args:
+        names (list[str]): Dimension names.
+        plot_groups (list[str] | None): Groups to keep. Default: ``OBS_PLOT_GROUPS``.
+
+    Returns:
+        list[tuple[str, list[int], list[str]]]: Group name, indices, and series names.
+    """
+    groups: dict[str, list[int]] = {}
+    for i, name in enumerate(names):
+        suffix = name.rsplit(".", 1)[-1] if "." in name else ""
+        groups.setdefault(suffix, []).append(i)
+    requested = list(OBS_PLOT_GROUPS if plot_groups is None else plot_groups)
+    selected = [key for key in requested if key in groups]
+    ordered = selected if selected else list(groups)
+    return [(key, groups[key], [names[i] for i in groups[key]]) for key in ordered]
+
+
 def validate_episode_indices(episodes: list[int] | None, total_episodes: int) -> None:
     """Validate episode indices.
 
@@ -243,28 +276,74 @@ def resolve_image_observation_keys(
     return list(image_observations)
 
 
-def validate_state_observation_keys(dataset: LeRobotDataset, state_observation_keys: list[str]) -> None:
+def is_plottable_vector(feature: dict) -> bool:
+    """Return whether a feature is a 1-D non-image vector.
+
+    Args:
+        feature (dict): Feature spec.
+
+    Returns:
+        bool: Plottable flag.
+    """
+    return feature["dtype"] not in NON_PLOTTABLE_DTYPES and len(feature["shape"]) == 1
+
+
+def resolve_feature_keys(dataset: LeRobotDataset, feature_keys: list[str] | None) -> list[str]:
+    """Resolve 1-D observation or action feature keys.
+
+    Args:
+        dataset (LeRobotDataset): Dataset.
+        feature_keys (list[str] | None): Feature keys.
+
+    Returns:
+        list[str]: Feature keys.
+    """
+    if feature_keys is None:
+        available = [
+            key
+            for key in DEFAULT_FEATURE_KEYS
+            if key in dataset.features and is_plottable_vector(dataset.features[key])
+        ]
+        if not available:
+            raise ValueError(
+                f"Default feature keys {list(DEFAULT_FEATURE_KEYS)} are missing or not 1-D vectors. "
+                "Pass --feature-keys with observation or action keys."
+            )
+        return available
+    validate_feature_keys(dataset, feature_keys)
+    return list(feature_keys)
+
+
+def resolve_obs_plot_groups(obs_plot_groups: list[str] | None) -> list[str]:
+    """Resolve dimension groups to plot.
+
+    Args:
+        obs_plot_groups (list[str] | None): Group names.
+
+    Returns:
+        list[str]: Group names.
+    """
+    if obs_plot_groups is None:
+        return list(OBS_PLOT_GROUPS)
+    return list(obs_plot_groups)
+
+
+def validate_feature_keys(dataset: LeRobotDataset, feature_keys: list[str]) -> None:
     """Validate 1-D vector feature keys.
 
     Args:
         dataset (LeRobotDataset): Dataset.
-        state_observation_keys (list[str]): State feature keys.
+        feature_keys (list[str]): Feature keys.
     """
-    plottable = [
-        key
-        for key, feature in dataset.features.items()
-        if feature["dtype"] not in NON_PLOTTABLE_DTYPES and len(feature["shape"]) == 1
-    ]
+    plottable = [key for key, feature in dataset.features.items() if is_plottable_vector(feature)]
     invalid = [
         key
-        for key in state_observation_keys
-        if key not in dataset.features
-        or dataset.features[key]["dtype"] in NON_PLOTTABLE_DTYPES
-        or len(dataset.features[key]["shape"]) != 1
+        for key in feature_keys
+        if key not in dataset.features or not is_plottable_vector(dataset.features[key])
     ]
     if invalid:
         raise ValueError(
-            f"State observation keys are missing or not 1-D vector features: {invalid}. "
+            f"Feature keys are missing or not 1-D vector features: {invalid}. "
             f"Plottable keys: {plottable}"
         )
 
@@ -273,7 +352,8 @@ def plot_episode(
     dataset: LeRobotDataset,
     episode_index: int,
     image_observation_keys: list[str],
-    state_observation_keys: list[str],
+    feature_keys: list[str],
+    obs_plot_groups: list[str],
     num_image_samples: int,
     output_dir: str,
     dpi: int,
@@ -285,7 +365,8 @@ def plot_episode(
         dataset (LeRobotDataset): Dataset.
         episode_index (int): Episode index.
         image_observation_keys (list[str]): Image feature keys.
-        state_observation_keys (list[str]): State feature keys.
+        feature_keys (list[str]): Feature keys.
+        obs_plot_groups (list[str]): Dimension groups to plot.
         num_image_samples (int): Image count per strip.
         output_dir (str): Output directory.
         dpi (int): Figure resolution.
@@ -294,7 +375,7 @@ def plot_episode(
     Returns:
         str: Saved figure path.
     """
-    timestamps, signals = read_episode_signals(dataset, episode_index, state_observation_keys)
+    timestamps, signals = read_episode_signals(dataset, episode_index, feature_keys)
     split_timestamps = split_episode_timestamps(timestamps, num_image_samples)
     midpoint_timestamps = select_midpoint_timestamps(split_timestamps)
     keyframe_timestamps = snap_to_frame_timestamps(midpoint_timestamps, timestamps)
@@ -302,14 +383,15 @@ def plot_episode(
         key: decode_keyframes(dataset, episode_index, key, keyframe_timestamps, tolerance_s)
         for key in image_observation_keys
     }
-    signal_names = {key: get_feature_names(dataset, key) for key in state_observation_keys}
+    signal_names = {key: get_feature_names(dataset, key) for key in feature_keys}
     figure = draw_episode_overview(
         dataset.repo_id,
         episode_index,
         timestamps,
         signals,
         signal_names,
-        state_observation_keys,
+        feature_keys,
+        obs_plot_groups,
         split_timestamps,
         keyframe_timestamps,
         keyframe_images,
@@ -322,14 +404,14 @@ def plot_episode(
 
 
 def read_episode_signals(
-    dataset: LeRobotDataset, episode_index: int, state_observation_keys: list[str]
+    dataset: LeRobotDataset, episode_index: int, feature_keys: list[str]
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Read episode timestamps and state signals.
+    """Read episode timestamps and 1-D signals.
 
     Args:
         dataset (LeRobotDataset): Dataset.
         episode_index (int): Episode index.
-        state_observation_keys (list[str]): State feature keys.
+        feature_keys (list[str]): Feature keys.
 
     Returns:
         tuple[np.ndarray, dict[str, np.ndarray]]: Timestamps and signals.
@@ -342,7 +424,7 @@ def read_episode_signals(
         raise ValueError(f"Episode {episode_index} has no frames")
     timestamps = timestamps - timestamps[0]
     signals = {}
-    for key in state_observation_keys:
+    for key in feature_keys:
         values = np.asarray(hf[key], dtype=np.float64)
         if values.ndim == 1:
             values = values.reshape(-1, 1)
@@ -450,7 +532,8 @@ def draw_episode_overview(
     timestamps: np.ndarray,
     signals: dict[str, np.ndarray],
     signal_names: dict[str, list[str]],
-    state_observation_keys: list[str],
+    feature_keys: list[str],
+    obs_plot_groups: list[str],
     split_timestamps: np.ndarray,
     keyframe_timestamps: np.ndarray,
     keyframe_images: dict[str, list[np.ndarray]],
@@ -463,7 +546,8 @@ def draw_episode_overview(
         timestamps (np.ndarray): Frame timestamps.
         signals (dict[str, np.ndarray]): State signals.
         signal_names (dict[str, list[str]]): Per-key dimension names.
-        state_observation_keys (list[str]): State feature keys.
+        feature_keys (list[str]): Feature keys.
+        obs_plot_groups (list[str]): Dimension groups to plot.
         split_timestamps (np.ndarray): Split timestamps.
         keyframe_timestamps (np.ndarray): Keyframe timestamps.
         keyframe_images (dict[str, list[np.ndarray]]): Per-key images.
@@ -501,7 +585,8 @@ def draw_episode_overview(
         timestamps,
         signals,
         signal_names,
-        state_observation_keys,
+        feature_keys,
+        obs_plot_groups,
         split_timestamps,
     )
 
@@ -509,11 +594,11 @@ def draw_episode_overview(
         f"{repo_id}   episode {episode_index}   {len(timestamps)} frames, {timestamps[-1]:.1f}s",
         fontsize=14,
     )
-    first_names = signal_names[state_observation_keys[0]]
+    legend_labels = signal_axes[0].get_legend_handles_labels()[1]
     signal_axes[0].legend(
         loc="upper center",
         bbox_to_anchor=(0.5, 1.30),
-        ncol=max(len(first_names), 1),
+        ncol=max(len(legend_labels), 1),
         fontsize=8,
         frameon=False,
     )
@@ -558,7 +643,8 @@ def draw_signal_axes(
     timestamps: np.ndarray,
     signals: dict[str, np.ndarray],
     signal_names: dict[str, list[str]],
-    state_observation_keys: list[str],
+    feature_keys: list[str],
+    obs_plot_groups: list[str],
     split_timestamps: np.ndarray,
 ) -> list["Axes"]:
     """Draw state-signal axes.
@@ -569,33 +655,41 @@ def draw_signal_axes(
         timestamps (np.ndarray): Frame timestamps.
         signals (dict[str, np.ndarray]): State signals.
         signal_names (dict[str, list[str]]): Per-key dimension names.
-        state_observation_keys (list[str]): State feature keys.
+        feature_keys (list[str]): Feature keys.
+        obs_plot_groups (list[str]): Dimension groups to plot.
         split_timestamps (np.ndarray): Split timestamps.
 
     Returns:
         list[Axes]: Signal axes.
     """
     plt = _import_pyplot()
-    signal_grid = grid_cell.subgridspec(len(state_observation_keys), 1, hspace=0.08)
+    signal_rows: list[tuple[str, str, list[int], list[str]]] = []
+    for key in feature_keys:
+        for group_name, dim_indices, series_names in group_feature_dims(
+            signal_names[key], obs_plot_groups
+        ):
+            signal_rows.append((key, group_name, dim_indices, series_names))
+
+    signal_grid = grid_cell.subgridspec(len(signal_rows), 1, hspace=0.08)
     keyframe_timestamps = select_midpoint_timestamps(split_timestamps)
     axes: list[Axes] = []
-    for row, key in enumerate(state_observation_keys):
-        names = signal_names[key]
-        joint_colors = plt.get_cmap("tab10")(np.arange(len(names)) % 10)
+    for row, (key, group_name, dim_indices, series_names) in enumerate(signal_rows):
+        joint_colors = plt.get_cmap("tab10")(np.arange(len(series_names)) % 10)
         axis = figure.add_subplot(signal_grid[row, 0], sharex=axes[0] if axes else None)
-        for joint_index, joint_name in enumerate(names):
+        for joint_index, series_name in enumerate(series_names):
+            label = series_name.rsplit(".", 1)[0] if group_name else series_name
             axis.plot(
                 timestamps,
-                signals[key][:, joint_index],
+                signals[key][:, dim_indices[joint_index]],
                 lw=1.0,
                 color=joint_colors[joint_index],
-                label=joint_name if row == 0 else None,
+                label=label if row == 0 else None,
             )
         draw_interval_markers(axis, split_timestamps, keyframe_timestamps, annotate=row == 0)
-        axis.set_ylabel(key, fontsize=9)
+        axis.set_ylabel(f"{key}/{group_name}" if group_name else key, fontsize=9)
         axis.grid(True, alpha=0.3)
         axis.tick_params(labelsize=8)
-        if row < len(state_observation_keys) - 1:
+        if row < len(signal_rows) - 1:
             axis.tick_params(labelbottom=False)
         axes.append(axis)
 

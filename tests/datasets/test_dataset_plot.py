@@ -24,14 +24,19 @@ pytest.importorskip("matplotlib", reason="matplotlib is required (install lerobo
 import numpy as np
 
 from lerobot.scripts.lerobot_dataset_plot import (
+    OBS_PLOT_GROUPS,
+    group_feature_dims,
     main,
-    select_midpoint_timestamps,
+    resolve_feature_keys,
     resolve_image_observation_keys,
-    split_episode_timestamps,
+    resolve_obs_plot_groups,
+    select_midpoint_timestamps,
     snap_to_frame_timestamps,
+    split_episode_timestamps,
     validate_episode_indices,
-    validate_state_observation_keys,
+    validate_feature_keys,
 )
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 
 def test_split_episode_timestamps_count():
@@ -47,6 +52,49 @@ def test_split_episode_timestamps_rejects_zero():
         split_episode_timestamps(np.array([0.0, 1.0]), 0)
 
 
+def test_group_feature_dims_packed_joints():
+    names = [
+        "right_joint1.position",
+        "right_joint1.velocity",
+        "right_joint1.effort",
+        "right_joint2.position",
+        "right_joint2.velocity",
+        "right_joint2.effort",
+    ]
+    groups = group_feature_dims(names)
+    assert [group[0] for group in groups] == ["position", "velocity", "effort"]
+    assert groups[0][1] == [0, 3]
+    assert groups[1][2] == ["right_joint1.velocity", "right_joint2.velocity"]
+
+
+def test_group_feature_dims_obs_plot_groups_order():
+    names = [
+        "joint1.current",
+        "joint1.effort",
+        "joint1.position",
+        "joint1.velocity",
+    ]
+    groups = group_feature_dims(names)
+    assert [group[0] for group in groups] == ["position", "velocity", "effort"]
+
+
+def test_group_feature_dims_selected_groups():
+    names = ["joint1.position", "joint1.velocity", "joint1.effort"]
+    groups = group_feature_dims(names, ["velocity"])
+    assert [group[0] for group in groups] == ["velocity"]
+
+
+def test_group_feature_dims_fallback_when_groups_missing():
+    names = ["shoulder_pan", "shoulder_lift"]
+    groups = group_feature_dims(names, list(OBS_PLOT_GROUPS))
+    assert [group[0] for group in groups] == [""]
+
+
+def test_resolve_obs_plot_groups_default():
+    assert resolve_obs_plot_groups(None) == list(OBS_PLOT_GROUPS)
+    assert resolve_obs_plot_groups(["position"]) == ["position"]
+
+
 def test_select_midpoint_timestamps():
     np.testing.assert_allclose(select_midpoint_timestamps(np.array([0.0, 2.0, 4.0])), [1.0, 3.0])
 
@@ -57,17 +105,40 @@ def test_snap_to_frame_timestamps():
     np.testing.assert_allclose(snapped, [0.0, 0.3])
 
 
-def test_validate_state_observation_keys_missing(tmp_path, lerobot_dataset_factory):
+def test_validate_feature_keys_missing(tmp_path, lerobot_dataset_factory):
     dataset = lerobot_dataset_factory(root=tmp_path, use_videos=False)
     with pytest.raises(ValueError, match="observation.velocity"):
-        validate_state_observation_keys(dataset, ["observation.velocity"])
+        validate_feature_keys(dataset, ["observation.velocity"])
 
 
-def test_validate_state_observation_keys_rejects_image(tmp_path, lerobot_dataset_factory):
+def test_validate_feature_keys_rejects_image(tmp_path, lerobot_dataset_factory):
     dataset = lerobot_dataset_factory(root=tmp_path, use_videos=False)
     image_key = dataset.meta.camera_keys[0]
     with pytest.raises(ValueError, match=image_key):
-        validate_state_observation_keys(dataset, [image_key])
+        validate_feature_keys(dataset, [image_key])
+
+
+def test_resolve_feature_keys_default(tmp_path, lerobot_dataset_factory):
+    dataset = lerobot_dataset_factory(root=tmp_path, use_videos=False)
+    dataset.features[OBS_STATE] = dataset.features["state"]
+    assert resolve_feature_keys(dataset, None) == [OBS_STATE, ACTION]
+
+
+def test_resolve_feature_keys_default_action_only(tmp_path, lerobot_dataset_factory):
+    dataset = lerobot_dataset_factory(root=tmp_path, use_videos=False)
+    assert resolve_feature_keys(dataset, None) == [ACTION]
+
+
+def test_resolve_feature_keys_default_missing(tmp_path, lerobot_dataset_factory):
+    dataset = lerobot_dataset_factory(root=tmp_path, use_videos=False)
+    del dataset.features[ACTION]
+    with pytest.raises(ValueError, match="observation.state"):
+        resolve_feature_keys(dataset, None)
+
+
+def test_resolve_feature_keys_explicit(tmp_path, lerobot_dataset_factory):
+    dataset = lerobot_dataset_factory(root=tmp_path, use_videos=False)
+    assert resolve_feature_keys(dataset, ["state", ACTION]) == ["state", ACTION]
 
 
 def test_resolve_image_observation_keys_default(tmp_path, lerobot_dataset_factory):
@@ -114,7 +185,7 @@ def test_plot_all_episodes_default_output(tmp_path, lerobot_dataset_factory, mon
             str(root),
             "--num-image-samples",
             "3",
-            "--state-observations",
+            "--feature-keys",
             "state",
         ],
     )
@@ -141,7 +212,7 @@ def test_plot_single_episode_custom_output(tmp_path, lerobot_dataset_factory, mo
             "1",
             "--num-image-samples",
             "3",
-            "--state-observations",
+            "--feature-keys",
             "state",
             "--output-dir",
             str(output_dir),

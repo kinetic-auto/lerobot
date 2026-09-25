@@ -53,11 +53,12 @@ class ACTConfig(PreTrainedConfig):
             the output data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
-        vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
-        pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
-            `None` means no pretrained weights.
+        vision_backbone: Torchvision ResNet name or DINOv2 / DINOv3 ViT id.
+        pretrained_backbone_weights: Pretrained vision-backbone weights.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
             convolution.
+        freeze_vision_backbone: Whether to freeze the vision backbone.
+        backbone_token_budget: DINO patch-token budget.
         pre_norm: Whether to use "pre-norm" in the transformer blocks.
         dim_model: The transformer blocks' main hidden dimension.
         n_heads: The number of heads to use in the transformer blocks' multi-head attention.
@@ -98,6 +99,8 @@ class ACTConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    freeze_vision_backbone: bool = False
+    backbone_token_budget: int | None = 300
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -131,10 +134,16 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        if not self.vision_backbone.startswith("resnet") and not self.is_vision_backbone_dino:
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"`vision_backbone` must be a ResNet or a DINOv2 / DINOv3 ViT. Got {self.vision_backbone}."
             )
+        if self.is_vision_backbone_dino and self.replace_final_stride_with_dilation:
+            raise ValueError(
+                "`replace_final_stride_with_dilation` is ResNet-only and cannot be used with a DINO backbone."
+            )
+        if self.backbone_token_budget is not None and self.backbone_token_budget <= 0:
+            raise ValueError(f"`backbone_token_budget` must be positive. Got {self.backbone_token_budget}.")
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
@@ -162,6 +171,10 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
+    @property
+    def is_vision_backbone_dino(self) -> bool:
+        return "dino" in self.vision_backbone.lower()
 
     @property
     def observation_delta_indices(self) -> None:

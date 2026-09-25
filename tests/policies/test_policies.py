@@ -271,6 +271,24 @@ def test_act_backbone_lr():
     assert len(optimizer.param_groups[1]["params"]) == 20
 
 
+def test_act_resnet_state_dict_keys_unchanged(dummy_dataset_metadata):
+    policy_cls = get_policy_class("act")
+    policy_cfg = make_policy_config("act")
+    features = dataset_to_policy_features(dummy_dataset_metadata.features)
+    policy_cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    policy_cfg.input_features = {
+        key: ft for key, ft in features.items() if key not in policy_cfg.output_features
+    }
+    policy = policy_cls(policy_cfg)
+    state_dict = policy.state_dict()
+
+    assert "model.backbone.conv1.weight" in state_dict
+    assert "model.backbone.layer4.1.bn2.running_var" in state_dict
+    assert "model.encoder_img_feat_input_proj.weight" in state_dict
+    assert state_dict["model.encoder_img_feat_input_proj.weight"].shape == (512, 512, 1, 1)
+    assert not any(key.startswith("model.backbone.model.") for key in state_dict)
+
+
 @pytest.mark.parametrize("policy_name", AVAILABLE_POLICIES)
 def test_policy_defaults(dummy_dataset_metadata, policy_name: str):
     """Check that the policy can be instantiated with defaults."""

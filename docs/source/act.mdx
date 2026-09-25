@@ -32,7 +32,7 @@ ACT stands out as an excellent starting point for several reasons:
 
 ACT uses a transformer-based architecture with three main components:
 
-1. **Vision Backbone**: ResNet-18 processes images from multiple camera viewpoints
+1. **Vision Backbone**: ResNet-18 or a DINOv2 / DINOv3 ViT processes images from multiple camera viewpoints
 2. **Transformer Encoder**: Synthesizes information from camera features, joint positions, and a learned latent variable
 3. **Transformer Decoder**: Generates coherent action sequences using cross-attention
 
@@ -69,6 +69,37 @@ lerobot-train \
 1. **Start with defaults**: ACT's default hyperparameters work well for most tasks
 2. **Training duration**: Expect a few hours for 100k training steps on a single GPU
 3. **Batch size**: Start with batch size 8 and adjust based on your GPU memory
+
+### Using a DINOv2 / DINOv3 vision backbone
+
+Requires `pip install 'lerobot[transformers-dep]'`.
+
+Supported `--policy.vision_backbone` `model_type` values:
+
+- `dinov2` (`facebook/dinov2-small`)
+- `dinov2_with_registers` (`facebook/dinov2-with-registers-small`)
+- `dinov3_vit` (`facebook/dinov3-vits16-pretrain-lvd1689m`; gated)
+
+Not supported:
+
+- `dinov3_convnext`
+- `eomt_dinov3`
+- `grounding-dino`
+- `mm-grounding-dino`
+
+- `--policy.backbone_token_budget`: 300 (default). `null`: native DINO grid.
+- `--policy.freeze_vision_backbone=true`: freeze the vision backbone.
+
+```bash
+lerobot-train \
+  --dataset.repo_id=${HF_USER}/your_dataset \
+  --policy.type=act \
+  --policy.vision_backbone=facebook/dinov2-small \
+  --policy.backbone_token_budget=300 \
+  --policy.freeze_vision_backbone=true \
+  --policy.device=cuda \
+  --output_dir=outputs/train/act_dinov2_your_dataset
+```
 
 ### Train using Google Colab
 

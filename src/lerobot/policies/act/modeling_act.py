@@ -23,6 +23,7 @@ import math
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
+from typing import TYPE_CHECKING
 
 import einops
 import numpy as np
@@ -34,9 +35,18 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.import_utils import _transformers_available, require_package
 
 from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
+
+if TYPE_CHECKING or _transformers_available:
+    from transformers import AutoConfig, AutoModel
+else:
+    AutoConfig = None
+    AutoModel = None
+
+DINO_MODEL_TYPES = ("dinov2", "dinov2_with_registers", "dinov3_vit")
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -325,15 +335,22 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            if self.config.is_vision_backbone_dino:
+                self.backbone = ACTDinoBackbone(config)
+                backbone_output_channels = self.backbone.output_channels
+            else:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+                # feature map).
+                # Note: The forward method of this returns a dict: {"feature_map": output}.
+                self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+                backbone_output_channels = backbone_model.fc.in_features
+            if self.config.freeze_vision_backbone:
+                self.backbone.requires_grad_(False)
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -352,7 +369,7 @@ class ACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                backbone_output_channels, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
@@ -432,7 +449,7 @@ class ACT(nn.Module):
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
-                device=batch[OBS_STATE].device,
+                device=(batch[OBS_STATE] if OBS_STATE in batch else batch[OBS_IMAGES][0]).device,
             )
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
@@ -456,7 +473,7 @@ class ACT(nn.Module):
             mu = log_sigma_x2 = None
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
             latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
+                (batch[OBS_STATE] if OBS_STATE in batch else batch[OBS_IMAGES][0]).device
             )
 
         # Prepare transformer encoder inputs.
@@ -512,6 +529,57 @@ class ACT(nn.Module):
         actions = self.action_head(decoder_out)
 
         return actions, (mu, log_sigma_x2)
+
+
+class ACTDinoBackbone(nn.Module):
+    """DINOv2 / DINOv3 ViT that returns patch tokens as a (B, C, h, w) feature map."""
+
+    def __init__(self, config: ACTConfig):
+        super().__init__()
+        require_package("transformers", extra="transformers-dep")
+        self.config = config
+        backbone_config = AutoConfig.from_pretrained(config.vision_backbone)
+        if backbone_config.model_type not in DINO_MODEL_TYPES:
+            raise ValueError(
+                f"`vision_backbone` must be a DINOv2 or DINOv3 ViT. Got model_type={backbone_config.model_type!r}."
+            )
+        if config.pretrained_backbone_weights is None:
+            self.model = AutoModel.from_config(backbone_config)
+        else:
+            self.model = AutoModel.from_pretrained(config.vision_backbone)
+        self.patch_size = backbone_config.patch_size
+        # Token layout is [CLS, registers..., patches...]; Dinov2Config has no register attribute.
+        self.num_prefix_tokens = 1 + getattr(backbone_config, "num_register_tokens", 0)
+        self.output_channels = backbone_config.hidden_size
+
+    def train(self, mode: bool = True) -> "ACTDinoBackbone":
+        super().train(mode and not self.config.freeze_vision_backbone)
+        return self
+
+    def forward(self, images: Tensor) -> dict[str, Tensor]:
+        if self.config.backbone_token_budget is not None:
+            images = resize_to_token_budget(images, self.config.backbone_token_budget, self.patch_size)
+        patch_tokens = self.model(pixel_values=images).last_hidden_state[:, self.num_prefix_tokens :]
+        feature_height = images.shape[-2] // self.patch_size
+        feature_width = images.shape[-1] // self.patch_size
+        feature_map = einops.rearrange(
+            patch_tokens, "b (h w) c -> b c h w", h=feature_height, w=feature_width
+        )
+        return {"feature_map": feature_map}
+
+
+def resize_to_token_budget(images: Tensor, token_budget: int, patch_size: int) -> Tensor:
+    """Resize images so the patch grid has about `token_budget` tokens."""
+    if token_budget < 1:
+        raise ValueError(f"`token_budget` must be positive. Got {token_budget}.")
+    height, width = images.shape[-2:]
+    width_patches_exact = math.sqrt(token_budget * width / height)
+    width_patches = max(1, round(width_patches_exact))
+    height_patches = max(1, round(token_budget / width_patches_exact))
+    target_size = (height_patches * patch_size, width_patches * patch_size)
+    if target_size == (height, width):
+        return images
+    return F.interpolate(images, size=target_size, mode="bilinear", align_corners=False, antialias=True)
 
 
 class ACTEncoder(nn.Module):

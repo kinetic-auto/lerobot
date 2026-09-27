@@ -14,6 +14,7 @@
 import builtins
 import datetime as dt
 import json
+import logging
 import multiprocessing
 import os
 import tempfile
@@ -38,8 +39,10 @@ from . import parser
 from .default import DatasetConfig, EMAConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
+from .vision_backbones import resolve_vision_backbone
 
 TRAIN_CONFIG_NAME = "train_config.json"
+logger = logging.getLogger(__name__)
 
 
 class CheckpointFormat(str, Enum):
@@ -116,7 +119,8 @@ class TrainPipelineConfig(HubMixin):
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
     output_dir: Path | None = None
     job_name: str | None = None
-    # Set `resume` to true to resume a previous run. Pass `--config_path` pointing at either a local
+    # Set `resume` to true to resume a previous run, or pass `--resume=PATH` as a shorthand. Pass
+    # `--config_path` pointing at either a local
     # checkpoint's train_config.json or a Hub repo id holding `checkpoints/<step>/` subtrees (the
     # latest checkpoint is downloaded and resumed from). Note that when resuming, the default behavior
     # is to use the configuration from the checkpoint, regardless of what's provided with the training
@@ -141,7 +145,7 @@ class TrainPipelineConfig(HubMixin):
     dataloader_multiprocessing_context: str | None = "spawn"
     steps: int = 100_000
     # Run policy in the simulation environment every N steps to measure reward/success (0 = disabled).
-    env_eval_freq: int = 20_000
+    env_eval_freq: int = 0
     log_freq: int = 200
     # Compute eval loss on held-out episodes every N steps (0 = disabled). Requires eval_split > 0.
     eval_steps: int = 0
@@ -151,7 +155,7 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     # A non-positive value disables periodic saving, keeping only the final checkpoint.
-    save_freq: int = 20_000
+    save_freq: int = 10_000
     # Model-artifact format inside checkpoints; non-default values require a sharded run.
     checkpoint_format: CheckpointFormat = CheckpointFormat.SAFETENSORS
     use_policy_training_preset: bool = True
@@ -180,6 +184,8 @@ class TrainPipelineConfig(HubMixin):
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Vision alias: resnet18/34/50, DINO aliases for ACT, or a DINO model id.
+    backbone: str | None = None
     checkpoint_path: Path | None = field(init=False, default=None)
 
     @property
@@ -193,6 +199,37 @@ class TrainPipelineConfig(HubMixin):
         if self.is_reward_model_training:
             return self.reward_model  # type: ignore[return-value]
         return self.policy  # type: ignore[return-value]
+
+    @property
+    def dataset_name(self) -> str:
+        if self.dataset.root:
+            return Path(self.dataset.root).name
+        return self.dataset.repo_id.rsplit("/", maxsplit=1)[-1]
+
+    def _apply_backbone_alias(self) -> None:
+        if (
+            self.backbone is None
+            or self.resume
+            or self.policy is None
+            or self.policy.pretrained_path is not None
+        ):
+            return
+        if not hasattr(self.policy, "vision_backbone"):
+            logger.info("Ignoring --backbone because policy %s has no vision backbone.", self.policy.type)
+            return
+
+        choice = resolve_vision_backbone(self.backbone)
+        if choice.is_dino and self.policy.type != "act":
+            raise ValueError("DINO backbones are currently supported only by ACT.")
+
+        overrides = parser.get_cli_overrides("policy") or []
+        explicit_fields = {arg.removeprefix("--").split("=", maxsplit=1)[0] for arg in overrides}
+        if "vision_backbone" not in explicit_fields:
+            self.policy.vision_backbone = choice.vision_backbone  # type: ignore[attr-defined]
+        if "pretrained_backbone_weights" not in explicit_fields:
+            self.policy.pretrained_backbone_weights = choice.pretrained_backbone_weights  # type: ignore[attr-defined]
+        if hasattr(self.policy, "use_group_norm") and "use_group_norm" not in explicit_fields:
+            self.policy.use_group_norm = False  # type: ignore[attr-defined]
 
     def _resolve_pretrained_from_cli(self) -> None:
         """Resolve the pretrained source passed on the CLI into a loaded config.
@@ -277,6 +314,9 @@ class TrainPipelineConfig(HubMixin):
 
         self._resolve_pretrained_from_cli()
 
+        if isinstance(self.dataset.repo_id, list):
+            raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+
         if self.policy is None and self.reward_model is None:
             raise ValueError(
                 "Neither policy nor reward_model is configured. "
@@ -284,6 +324,7 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        self._apply_backbone_alias()
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "
@@ -291,10 +332,11 @@ class TrainPipelineConfig(HubMixin):
             )
 
         if not self.job_name:
+            now = dt.datetime.now()
             if self.env is None:
-                self.job_name = f"{active_cfg.type}"
+                self.job_name = f"{active_cfg.type}_{now:%Y%m%d_%H%M%S}"
             else:
-                self.job_name = f"{self.env.type}_{active_cfg.type}"
+                self.job_name = f"{self.env.type}_{active_cfg.type}_{now:%Y%m%d_%H%M%S}"
 
         if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
             raise FileExistsError(
@@ -302,12 +344,15 @@ class TrainPipelineConfig(HubMixin):
                 f"Please change your output directory so that {self.output_dir} is not overwritten."
             )
         elif not self.output_dir:
-            now = dt.datetime.now()
-            train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
-            self.output_dir = Path("outputs/train") / train_dir
+            self.output_dir = Path("model_zoo") / self.dataset_name / self.job_name
 
-        if isinstance(self.dataset.repo_id, list):
-            raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+        if self.wandb.project is None:
+            self.wandb.project = self.dataset_name
+
+        if self.job.is_remote and self.dataset.repo_id == "local":
+            raise ValueError(
+                "Remote jobs require a Hub dataset.repo_id; local dataset roots are unavailable."
+            )
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
@@ -315,8 +360,8 @@ class TrainPipelineConfig(HubMixin):
             self.optimizer = active_cfg.get_optimizer_preset()
             self.scheduler = active_cfg.get_scheduler_preset()
 
-        if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
-            raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
+        if self.eval_steps > 0 and not self.dataset.has_validation_split:
+            raise ValueError("eval_steps > 0 requires a validation split.")
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be
         # resolved here, from --policy.path), so don't demand it up front for them.

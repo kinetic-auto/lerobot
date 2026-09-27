@@ -75,7 +75,9 @@ class AttentionRecorder:
             self._handles.append(layer.self_attn.register_forward_hook(self._record_encoder_self_attention))
         for layer in self.model.decoder.layers:
             self._handles.append(layer.self_attn.register_forward_hook(self._record_decoder_self_attention))
-            self._handles.append(layer.multihead_attn.register_forward_hook(self._record_decoder_cross_attention))
+            self._handles.append(
+                layer.multihead_attn.register_forward_hook(self._record_decoder_cross_attention)
+            )
         self._handles.append(self.model.backbone.register_forward_hook(self._record_feature_map_shape))
         return self
 
@@ -191,9 +193,7 @@ def main() -> None:
     policy, preprocessor = load_act_policy(args.policy_path, dataset.meta, args.device)
     image_observation_keys = resolve_policy_image_keys(dataset, policy, args.image_observations)
     output_dir = (
-        args.output_dir
-        if args.output_dir is not None
-        else os.path.join(str(dataset.root), "attention_plots")
+        args.output_dir if args.output_dir is not None else os.path.join(str(dataset.root), "attention_plots")
     )
 
     for episode_index in episode_indices:

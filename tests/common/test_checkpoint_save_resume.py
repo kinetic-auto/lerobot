@@ -30,9 +30,12 @@ from lerobot.common.train_utils import (
 )
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import CheckpointFormat, TrainPipelineConfig
+from lerobot.datasets.utils import EpisodeSplit
 from lerobot.utils.constants import (
+    CHECKPOINT_METADATA,
     PRETRAINED_MODEL_DIR,
     SCALER_STATE,
+    SPLIT_INFO,
     TRAINING_STATE_DIR,
     TRAINING_STEP,
 )
@@ -80,6 +83,25 @@ class TestSaveCheckpoint:
         weights = load_file(pretrained / "model.safetensors")
         assert torch.allclose(weights["net.weight"], torch.full_like(weights["net.weight"], 0.5))
         assert not list(pretrained.glob("*.index.json"))
+        assert not (pretrained / SPLIT_INFO).exists()
+        assert not (pretrained / CHECKPOINT_METADATA).exists()
+
+    def test_optional_checkpoint_sidecars(self, tmp_path):
+        policy = make_dummy_policy()
+        split = EpisodeSplit([8, 1, 1], 3, [0], [1], [2], seed=7)
+        save_checkpoint(
+            tmp_path,
+            step=7,
+            cfg=make_cfg(),
+            policy=policy,
+            optimizer=torch.optim.Adam(policy.parameters()),
+            accelerator=passthrough_accelerator(),
+            episode_split=split,
+            checkpoint_metadata={"action_type": "delta_sequential"},
+        )
+        pretrained = tmp_path / PRETRAINED_MODEL_DIR
+        assert load_json(pretrained / SPLIT_INFO) == split.to_dict()
+        assert load_json(pretrained / CHECKPOINT_METADATA) == {"action_type": "delta_sequential"}
 
     def test_training_step_records_topology(self, tmp_path):
         cfg = make_cfg()

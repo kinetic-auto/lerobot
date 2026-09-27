@@ -126,14 +126,22 @@ Depending on your hardware training the policy might take a few hours. That's ho
 ```bash
 lerobot-train \
     --dataset.repo_id=${HF_USER}/so101_dataset_test \
+    --dataset.split_ratio='[0.8,0.1,0.1]' \
     --policy.type=act \
-    --output_dir=outputs/train/act_so101_test \
-    --job_name=act_so101_test \
+    --backbone=resnet18 \
     --policy.device=cuda \
     --wandb.enable=true \
     --policy.repo_id=${HF_USER}/policy_test \
+    --policy.push_to_hub=true \
+    --eval_steps=1000 \
     --steps=20000
 ```
+
+By default, runs are written to `model_zoo/<dataset>/<policy>_<timestamp>`. Use
+`--dataset.exclude_features='["observation.images.wrist"]'` to omit observations and
+`--dataset.task_override="pick up the cube"` to replace the task text for a run. Three-way splits
+log validation loss periodically and test loss whenever a checkpoint is saved. Checkpoints include
+`split_info.json` and `training_metadata.json`.
 
 - Policy Types: `act`, `diffusion`, `smolvla`, `pi05`
 - Devices: `cuda` (NVIDIA), `mps` (Apple Silicon), `cpu`
@@ -152,7 +160,14 @@ lerobot-train \
 
 No local GPU? Add `--job.target=<flavor>` (e.g. `a10g-small`) to either command and `lerobot-train` runs it on [Hugging Face Jobs](https://huggingface.co/docs/hub/jobs) instead — it uploads a local-only dataset for you and pushes the trained model. List flavors with `hf jobs hardware`.
 
-To resume, point `--config_path` at a checkpoint and add `--resume=true`. It accepts a local path or a Hub repo id (the latest checkpoint is fetched), and works locally or on a job by adding `--job.target=<flavor>`:
+To resume a local run, pass its run or checkpoint path directly:
+
+```bash
+lerobot-train --resume=model_zoo/so101_dataset_test/act_20260927_120000
+```
+
+For Hub checkpoints, point `--config_path` at the model repo and add `--resume=true`. The latest
+checkpoint is fetched, and the same command works on a job by adding `--job.target=<flavor>`:
 
 ```bash
 lerobot-train --config_path=${HF_USER}/policy_test --resume=true --job.target=a10g-small

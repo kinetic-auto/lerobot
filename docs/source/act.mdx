@@ -94,12 +94,33 @@ Not supported:
 lerobot-train \
   --dataset.repo_id=${HF_USER}/your_dataset \
   --policy.type=act \
-  --policy.vision_backbone=facebook/dinov2-small \
+  --policy.vision_backbone=dinov2 \
   --policy.backbone_token_budget=300 \
   --policy.freeze_vision_backbone=true \
   --policy.device=cuda \
   --output_dir=outputs/train/act_dinov2_your_dataset
 ```
+
+`--policy.vision_backbone` accepts `resnet18`, `resnet34`, `resnet50`, `dinov2`,
+`dinov2_with_registers`, `dinov3`, or `dinov3_vit`.
+
+### Relative and sequential actions
+
+ACT can train on offsets from the current state (`obs_t`) or sequential deltas:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=${HF_USER}/your_dataset \
+  --policy.type=act \
+  --policy.use_relative_actions=true \
+  --policy.relative_action_mode=sequential \
+  --policy.relative_exclude_joints='["gripper"]'
+```
+
+LeRobot validates action/state channel-name alignment and recomputes action normalization statistics
+in the selected representation. Set `--policy.recompute_relative_action_stats=false` only when the
+dataset already contains compatible statistics. Relative actions cannot be combined with ACT
+temporal ensembling.
 
 ### Train using Google Colab
 

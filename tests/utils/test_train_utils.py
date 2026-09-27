@@ -28,6 +28,7 @@ from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_metadata,
+    locate_resume_checkpoint,
     push_checkpoint_to_hub,
     save_training_metadata,
     save_training_state,
@@ -74,6 +75,27 @@ def test_get_step_checkpoint_dir():
     output_dir = Path("/checkpoints")
     step_dir = get_step_checkpoint_dir(output_dir, 1000, 5)
     assert step_dir == output_dir / CHECKPOINTS_DIR / "000005"
+
+
+def test_locate_resume_checkpoint_accepts_run_checkpoint_and_deeper_paths(tmp_path):
+    run_dir = tmp_path / "run"
+    checkpoint_dir = run_dir / CHECKPOINTS_DIR / "000010"
+    pretrained_dir = checkpoint_dir / "pretrained_model"
+    pretrained_dir.mkdir(parents=True)
+    (pretrained_dir / "train_config.json").write_text("{}")
+    (run_dir / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK).symlink_to("000010")
+
+    assert locate_resume_checkpoint(run_dir) == (
+        run_dir,
+        run_dir / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK,
+    )
+    assert locate_resume_checkpoint(checkpoint_dir) == (run_dir, checkpoint_dir)
+    assert locate_resume_checkpoint(pretrained_dir) == (run_dir, checkpoint_dir)
+
+
+def test_locate_resume_checkpoint_rejects_missing_config(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Checkpoint config"):
+        locate_resume_checkpoint(tmp_path / "missing")
 
 
 def make_cfg(batch_size: int = 32) -> TrainPipelineConfig:
@@ -224,11 +246,21 @@ def test_dataloaders_filter_boundaries_without_consuming_policy_rng(
         dataloader_multiprocessing_context=None,
         max_eval_samples=max_eval_samples,
     )
-    train, evaluation = make_dataloaders(cfg, Dataset(), Dataset(), 0, SimpleNamespace(device_type="cpu"))
+    train, evaluation, test = make_dataloaders(
+        cfg,
+        Dataset(),
+        Dataset(),
+        None,
+        0,
+        SimpleNamespace(device_type="cpu", dp_world_size=2),
+    )
+    assert test is None
     assert sorted(train.sampler) == expected
     rng = torch.get_rng_state().clone()
     next(iter(train))
     assert torch.equal(rng, torch.get_rng_state())
+    if len(evaluation.dataset) % (cfg.batch_size * 2):
+        assert evaluation.batch_size == 1
     assert torch.cat(list(evaluation)).tolist() == (
         expected[:max_eval_samples] if max_eval_samples else expected
     )

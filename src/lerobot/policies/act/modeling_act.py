@@ -57,6 +57,7 @@ class ACTPolicy(PreTrainedPolicy):
 
     config_class = ACTConfig
     name = "act"
+    validation_loss_in_train_mode = True
     # FSDP2 wrap units: one unit per transformer layer of both stacks.
     _fsdp_wrap_modules = ["ACTEncoderLayer", "ACTDecoderLayer"]
 

@@ -25,7 +25,11 @@ from lerobot.configs.train import TrainPipelineConfig  # noqa: E402
 from lerobot.policies.act.configuration_act import (
     ACTConfig,  # noqa: E402, F401  (registers --policy.type act)
 )
-from lerobot.scripts.lerobot_train import _remote_target_in_argv, train  # noqa: E402
+from lerobot.scripts.lerobot_train import (  # noqa: E402
+    _expand_resume_path_in_argv,
+    _remote_target_in_argv,
+    train,
+)
 
 
 def _set_argv(monkeypatch, *args):
@@ -65,3 +69,41 @@ def test_train_dispatches_to_submit_when_remote(monkeypatch):
     # Returns the submitter's result and never enters the local training path.
     assert train(cfg) == "submitted"
     assert captured == [cfg]
+
+
+def test_expand_resume_run_path(monkeypatch, tmp_path):
+    run_dir = tmp_path / "run"
+    pretrained = run_dir / "checkpoints" / "last" / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    (pretrained / "train_config.json").write_text("{}")
+    _set_argv(monkeypatch, f"--resume={run_dir}")
+
+    _expand_resume_path_in_argv()
+
+    assert "--resume=true" in sys.argv
+    assert f"--config_path={pretrained / 'train_config.json'}" in sys.argv
+    assert f"--output_dir={run_dir}" in sys.argv
+
+
+def test_expand_resume_keeps_explicit_output_dir(monkeypatch, tmp_path):
+    run_dir = tmp_path / "run"
+    pretrained = run_dir / "checkpoints" / "last" / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    (pretrained / "train_config.json").write_text("{}")
+    output_dir = tmp_path / "other"
+    _set_argv(monkeypatch, f"--resume={run_dir}", f"--output_dir={output_dir}")
+
+    _expand_resume_path_in_argv()
+
+    assert sys.argv.count(f"--output_dir={output_dir}") == 1
+    assert f"--output_dir={run_dir}" not in sys.argv
+
+
+def test_expand_resume_leaves_boolean_and_rejects_config_path(monkeypatch, tmp_path):
+    _set_argv(monkeypatch, "--resume=true")
+    _expand_resume_path_in_argv()
+    assert sys.argv == ["lerobot-train", "--resume=true"]
+
+    _set_argv(monkeypatch, f"--resume={tmp_path}", "--config_path=checkpoint.json")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _expand_resume_path_in_argv()

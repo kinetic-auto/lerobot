@@ -16,7 +16,10 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.configs.vision_backbones import lookup_vision_backbone
 from lerobot.optim import AdamWConfig
+from lerobot.processor import RELATIVE_ACTION_MODES
+from lerobot.utils.constants import OBS_STATE
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -93,6 +96,11 @@ class ACTConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
+    use_relative_actions: bool = False
+    relative_action_mode: str = "obs_t"
+    relative_exclude_joints: list[str] = field(default_factory=list)
+    recompute_relative_action_stats: bool = True
+    action_feature_names: list[str] | None = None
 
     # Architecture.
     # Vision backbone.
@@ -132,6 +140,11 @@ class ACTConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        # Resolve the vision backbone.
+        named_backbone = lookup_vision_backbone(self.vision_backbone)
+        if named_backbone is not None:
+            self.vision_backbone = named_backbone.vision_backbone
+            self.pretrained_backbone_weights = named_backbone.pretrained_backbone_weights
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet") and not self.is_vision_backbone_dino:
@@ -149,6 +162,13 @@ class ACTConfig(PreTrainedConfig):
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
             )
+        if self.relative_action_mode not in RELATIVE_ACTION_MODES:
+            raise ValueError(
+                f"Unknown relative_action_mode {self.relative_action_mode!r}; "
+                f"expected one of {RELATIVE_ACTION_MODES}."
+            )
+        if self.use_relative_actions and self.temporal_ensemble_coeff is not None:
+            raise ValueError("Relative actions are incompatible with ACT temporal ensembling.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
@@ -171,6 +191,8 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if self.use_relative_actions and OBS_STATE not in self.input_features:
+            raise ValueError("ACT relative actions require an observation.state input feature.")
 
     @property
     def is_vision_backbone_dino(self) -> bool:

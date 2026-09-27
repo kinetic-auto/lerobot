@@ -149,12 +149,15 @@ lerobot-train \
   --dataset.repo_id=${HF_USER}/my_task \
   --policy.type=act \
   --policy.device=cuda \
-  --output_dir=outputs/train/act_my_task \
-  --job_name=act_my_task \
   --batch_size=8 \
   --wandb.enable=true \
+  --policy.push_to_hub=true \
   --policy.repo_id=${HF_USER}/act_my_task
 ```
+
+Without `--output_dir`, the run is saved under `model_zoo/my_task/act_<timestamp>`. Resume it with
+`lerobot-train --resume=model_zoo/my_task/act_<timestamp>`. Models remain local unless
+`--policy.push_to_hub=true` is set.
 
 **4.10 Evaluate on the real robot** — compare success rate to a teleoperated baseline.
 

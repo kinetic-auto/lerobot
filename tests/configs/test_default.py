@@ -62,3 +62,44 @@ def test_dataset_config_eval_split():
     DatasetConfig(repo_id="user/repo", repo_type="bucket", eval_split=0.1)
     with pytest.raises(ValueError, match="streaming"):
         DatasetConfig(repo_id="user/repo", streaming=True, eval_split=0.1)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"split_ratio": [1]}, "must contain"),
+        ({"split_ratio": [1, -1]}, "non-negative"),
+        ({"split_ratio": [0, 1]}, "train weight"),
+        ({"split_ratio": [0, 0]}, "must not all be zero"),
+        ({"split_ratio": [1, float("nan")]}, "finite"),
+        ({"split_ratio": [1, float("inf")]}, "finite"),
+        ({"split_ratio": [1, 1], "eval_split": 0.1}, "mutually exclusive"),
+        ({"split_ratio": [1, 1], "streaming": True}, "streaming"),
+    ],
+)
+def test_dataset_config_rejects_invalid_split_ratio(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        DatasetConfig(repo_id="user/repo", **kwargs)
+
+
+def test_dataset_config_validation_split_property():
+    assert DatasetConfig(repo_id="user/repo", split_ratio=[8, 1, 1]).has_validation_split
+    assert not DatasetConfig(repo_id="user/repo", split_ratio=[1, 0]).has_validation_split
+
+
+def test_dataset_config_validates_feature_and_task_overrides():
+    with pytest.raises(ValueError, match="duplicates"):
+        DatasetConfig(
+            repo_id="user/repo",
+            exclude_features=["observation.image", "observation.image"],
+        )
+    with pytest.raises(ValueError, match="observation"):
+        DatasetConfig(repo_id="user/repo", exclude_features=["action"])
+    with pytest.raises(ValueError, match="must not be empty"):
+        DatasetConfig(repo_id="user/repo", task_override="")
+
+
+def test_local_dataset_requires_root():
+    with pytest.raises(ValueError, match="dataset.root"):
+        DatasetConfig()
+    assert DatasetConfig(root="/tmp/dataset").repo_id == "local"

@@ -169,13 +169,22 @@ def test_pod_forwarded_args_drops_host_only_flags():
 def _minimal_cfg():
     return draccus.parse(
         TrainPipelineConfig,
-        args=["--dataset.repo_id", "u/d", "--policy.type", "act", "--job.target", "a10g-small"],
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "true",
+            "--job.target",
+            "a10g-small",
+        ],
     )
 
 
 def test_validate_skips_repo_id_check_for_remote():
     """Remote runs auto-assign repo_id in submit_to_hf, so validate() must not demand it up front."""
-    cfg = _minimal_cfg()  # remote target, push_to_hub default True, no explicit repo_id
+    cfg = _minimal_cfg()  # remote target, push requested, no explicit repo_id
     assert cfg.policy.repo_id is None
     cfg.validate()  # must not raise
 
@@ -184,7 +193,7 @@ def test_validate_requires_repo_id_for_local_push():
     """Local runs that push to the Hub still need an explicit repo_id."""
     cfg = draccus.parse(
         TrainPipelineConfig,
-        args=["--dataset.repo_id", "u/d", "--policy.type", "act"],
+        args=["--dataset.repo_id", "u/d", "--policy.type", "act", "--policy.push_to_hub", "true"],
     )
     with pytest.raises(ValueError, match="repo_id"):
         cfg.validate()

@@ -29,11 +29,13 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 """
 
 import dataclasses
+import functools
 import logging
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -46,9 +48,11 @@ from torch.optim import Optimizer
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
+    build_checkpoint_metadata,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_metadata,
+    locate_resume_checkpoint,
     publish_trained_model,
     push_checkpoint_to_hub,
     resume_after_prepare,
@@ -77,8 +81,9 @@ from lerobot.policies.factory import ProcessorConfigKwargs
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
+from lerobot.utils.constants import CHECKPOINT_METADATA, PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
 from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
+from lerobot.utils.io_utils import write_json
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -97,6 +102,38 @@ else:
 from .lerobot_eval import eval_policy_all
 
 EMA_STATE_FILENAME = "ema_state.pt"
+_resume_log_context: tuple[Path, Path] | None = None
+
+
+def _compute_validation_loss(
+    policy: PreTrainedPolicy,
+    dataloader: torch.utils.data.DataLoader,
+    accelerator: "Accelerator",
+    preprocess_batch: Any,
+) -> float:
+    unwrapped_policy = accelerator.unwrap_model(policy)
+    if getattr(unwrapped_policy, "validation_loss_in_train_mode", False):
+        policy.train()
+    else:
+        policy.eval()
+    loss_sum = 0.0
+    sample_count = 0
+    with torch.no_grad(), accelerator.autocast():
+        for batch in dataloader:
+            batch_size = next(
+                (len(value) for value in batch.values() if isinstance(value, (torch.Tensor, list, tuple))),
+                1,
+            )
+            loss, _ = policy(preprocess_batch(batch))
+            batch_losses = loss.detach().repeat(batch_size)
+            gathered_losses = accelerator.gather_for_metrics(batch_losses)
+            loss_sum += gathered_losses.sum().item()
+            sample_count += gathered_losses.numel()
+    if sample_count == 0:
+        raise ValueError("Held-out dataloader is empty.")
+    reduced_loss = loss_sum / sample_count
+    policy.train()
+    return reduced_loss
 
 
 def _ema_parameters(policy: PreTrainedPolicy) -> list[torch.nn.Parameter]:
@@ -137,8 +174,15 @@ def _preprocess_dataset_batch(
     camera_keys: list[str],
     rename_map: dict[str, str],
     preprocessor: Any,
+    *,
+    exclude_features: Sequence[str] = (),
+    task_override: str | None = None,
 ) -> Any:
     """Prepare a raw dataset batch identically for training and held-out evaluation."""
+    for key in exclude_features:
+        batch.pop(key, None)
+    if task_override is not None and "task" in batch:
+        batch["task"] = [task_override] * len(batch["task"])
     for cam_key in camera_keys:
         if cam_key in batch and batch[cam_key].dtype == torch.uint8:
             batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
@@ -286,31 +330,86 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def _make_validation_dataloader(
+    cfg: TrainPipelineConfig,
+    validation_dataset,
+    has_language_columns: bool,
+    device_type: str,
+    dp_world_size: int,
+) -> torch.utils.data.DataLoader:
+    active_cfg = cfg.trainable_config
+    validation_data = validation_dataset
+    valid_frames = None
+    if not cfg.dataset.streaming and (
+        getattr(active_cfg, "drop_n_first_frames", 0) or getattr(active_cfg, "drop_n_last_frames", 0)
+    ):
+        valid_frames = list(
+            EpisodeAwareSampler(
+                validation_dataset.meta.episodes["dataset_from_index"],
+                validation_dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=validation_dataset.episodes,
+                drop_n_first_frames=getattr(active_cfg, "drop_n_first_frames", 0),
+                drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+                absolute_to_relative_idx=validation_dataset.absolute_to_relative_idx,
+            )
+        )
+        validation_data = torch.utils.data.Subset(validation_dataset, valid_frames)
+    if cfg.max_eval_samples > 0 and hasattr(validation_dataset, "hf_dataset"):
+        task_arr = validation_dataset.hf_dataset.data.column("task_index").to_numpy()
+        if valid_frames is not None:
+            task_arr = task_arr[valid_frames]
+        unique_tasks = sorted(set(task_arr.tolist()))
+        per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
+        selected: list[int] = []
+        for task_index in unique_tasks:
+            frames = (task_arr == task_index).nonzero()[0][:per_task]
+            selected.extend(frames.tolist())
+        validation_data = torch.utils.data.Subset(validation_data, selected)
+
+    batch_size = cfg.batch_size
+    if dp_world_size > 1 and len(validation_data) % (batch_size * dp_world_size):
+        # Batch size 1 lets gather_for_metrics remove Accelerate's duplicated tail samples exactly.
+        batch_size = 1
+    return torch.utils.data.DataLoader(
+        validation_data,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        generator=torch.Generator().manual_seed(cfg.seed) if cfg.seed is not None else None,
+        pin_memory=device_type == "cuda",
+        drop_last=False,
+        collate_fn=lerobot_collate_fn if has_language_columns else None,
+        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+        persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        multiprocessing_context=cfg.dataloader_multiprocessing_context if cfg.num_workers > 0 else None,
+    )
+
+
 def make_dataloaders(
     cfg: TrainPipelineConfig,
     dataset,
     eval_dataset,
+    test_dataset,
     step: int,
     parallel_dims: ParallelDims,
-) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader | None]:
-    """Build the train (and optional eval) dataloader, including the sampler resume offset.
-
-    The sampler offset is *derived* from `step` (`resume_before_prepare` loads step + RNG only):
-    each loop step consumes `batch_size` samples on each of the `dp_world_size` distinct
-    data-parallel workers — no grad-accumulation factor, since `step` counts micro-batches.
+) -> tuple[
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader | None,
+    torch.utils.data.DataLoader | None,
+]:
+    """Build train, validation, and test dataloaders.
 
     Args:
-        cfg (TrainPipelineConfig): The training config (batch size, workers, streaming, resume, seed).
-        dataset (LeRobotDataset | MultiLeRobotDataset): The training dataset.
-        eval_dataset (LeRobotDataset | None): Optional held-out split; when provided, an eval
-            dataloader is built (subsampled per task when `cfg.max_eval_samples > 0`).
-        step (int): The loop step to resume the sampler from (0 for a fresh run).
-        parallel_dims (ParallelDims): The resolved parallelism topology; provides the device type
-            and the fallback dp world size for the resume offset.
+        cfg (TrainPipelineConfig): Training configuration.
+        dataset (LeRobotDataset | MultiLeRobotDataset): Training dataset.
+        eval_dataset (LeRobotDataset | None): Validation dataset.
+        test_dataset (LeRobotDataset | None): Test dataset.
+        step (int): Resume step.
+        parallel_dims (ParallelDims): Parallelism topology.
 
     Returns:
-        tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader | None]: The train
-        dataloader and the eval dataloader (None when no eval split exists).
+        tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader | None,
+            torch.utils.data.DataLoader | None]: Train, validation, and test dataloaders.
     """
     active_cfg = cfg.trainable_config
     if not cfg.dataset.streaming:
@@ -364,6 +463,7 @@ def make_dataloaders(
         sampler = None
 
     device_type = parallel_dims.device_type
+    dp_world_size = getattr(parallel_dims, "dp_world_size", 1)
     # Only swap in the language-aware collate when the dataset actually
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
@@ -385,52 +485,29 @@ def make_dataloaders(
         multiprocessing_context=cfg.dataloader_multiprocessing_context if cfg.num_workers > 0 else None,
     )
 
-    # Build eval dataloader if a held-out split exists
-    eval_dataloader = None
-    if eval_dataset is not None:
-        eval_ds = eval_dataset
-        valid_frames = None
-        if not cfg.dataset.streaming and (
-            getattr(active_cfg, "drop_n_first_frames", 0) or getattr(active_cfg, "drop_n_last_frames", 0)
-        ):
-            valid_frames = list(
-                EpisodeAwareSampler(
-                    eval_dataset.meta.episodes["dataset_from_index"],
-                    eval_dataset.meta.episodes["dataset_to_index"],
-                    episode_indices_to_use=eval_dataset.episodes,
-                    drop_n_first_frames=getattr(active_cfg, "drop_n_first_frames", 0),
-                    drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
-                    absolute_to_relative_idx=eval_dataset.absolute_to_relative_idx,
-                )
-            )
-            eval_ds = torch.utils.data.Subset(eval_dataset, valid_frames)
-        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
-            task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
-            if valid_frames is not None:
-                task_arr = task_arr[valid_frames]
-            unique_tasks = sorted(set(task_arr.tolist()))
-            per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
-            selected: list[int] = []
-            for t in unique_tasks:
-                frames = (task_arr == t).nonzero()[0][:per_task]
-                selected.extend(frames.tolist())
-            eval_ds = torch.utils.data.Subset(eval_ds, selected)
-
-        eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
-        eval_dataloader = torch.utils.data.DataLoader(
-            eval_ds,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=cfg.num_workers,
-            generator=torch.Generator().manual_seed(cfg.seed) if cfg.seed is not None else None,
-            pin_memory=device_type == "cuda",
-            drop_last=False,
-            collate_fn=eval_collate_fn,
-            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
-            multiprocessing_context=cfg.dataloader_multiprocessing_context if cfg.num_workers > 0 else None,
+    eval_dataloader = (
+        _make_validation_dataloader(
+            cfg,
+            eval_dataset,
+            dataset.meta.has_language_columns,
+            device_type,
+            dp_world_size,
         )
-    return dataloader, eval_dataloader
+        if eval_dataset is not None
+        else None
+    )
+    test_dataloader = (
+        _make_validation_dataloader(
+            cfg,
+            test_dataset,
+            dataset.meta.has_language_columns,
+            device_type,
+            dp_world_size,
+        )
+        if test_dataset is not None
+        else None
+    )
+    return dataloader, eval_dataloader, test_dataloader
 
 
 @parser.wrap()
@@ -470,6 +547,9 @@ def train(cfg: TrainPipelineConfig):
     init_logging(accelerator=accelerator)
 
     if is_main_process():
+        if _resume_log_context is not None:
+            run_dir, checkpoint_dir = _resume_log_context
+            logging.info("Resuming %s from %s", run_dir, checkpoint_dir)
         logging.info(pformat(cfg.to_dict()))
 
     if cfg.wandb.enable and cfg.wandb.project and is_main_process():
@@ -493,10 +573,31 @@ def train(cfg: TrainPipelineConfig):
     # --- data (the main process downloads once; peers read the populated cache) ----------------
     if is_main_process():
         logging.info("Creating dataset")
-        dataset, eval_dataset = make_train_eval_datasets(cfg)
+        datasets = make_train_eval_datasets(cfg)
     accelerator.wait_for_everyone()
     if not is_main_process():
-        dataset, eval_dataset = make_train_eval_datasets(cfg)
+        datasets = make_train_eval_datasets(cfg)
+    dataset = datasets.train
+    eval_dataset = datasets.eval
+    test_dataset = datasets.test
+    if cfg.is_reward_model_training:
+        action_type = None
+        delta_exclude_joints = None
+        task_description = None
+    else:
+        use_relative_actions = getattr(cfg.policy, "use_relative_actions", False)
+        relative_mode = getattr(cfg.policy, "relative_action_mode", "obs_t")
+        action_type = f"delta_{relative_mode}" if use_relative_actions else "absolute"
+        delta_exclude_joints = (
+            getattr(cfg.policy, "relative_exclude_joints", []) if use_relative_actions else None
+        )
+        task_description = cfg.dataset.task_override
+    checkpoint_metadata = build_checkpoint_metadata(
+        dataset.meta,
+        action_type=action_type,
+        delta_exclude_joints=delta_exclude_joints,
+        task_description=task_description,
+    )
 
     # --- policy (weight source decided by the resume rule) -------------------------------------
     # On resume, cfg was parsed FROM the checkpoint's train_config.json, so cfg.checkpoint_format
@@ -590,6 +691,7 @@ def train(cfg: TrainPipelineConfig):
                 "enabled": True,
                 "exclude_joints": getattr(active_cfg, "relative_exclude_joints", []),
                 "action_names": getattr(active_cfg, "action_feature_names", None),
+                "mode": getattr(active_cfg, "relative_action_mode", "obs_t"),
             }
             postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
         processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
@@ -607,6 +709,14 @@ def train(cfg: TrainPipelineConfig):
             pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
             **processor_kwargs,
         )
+    preprocess_batch = functools.partial(
+        _preprocess_dataset_batch,
+        camera_keys=dataset.meta.camera_keys,
+        rename_map=cfg.rename_map,
+        preprocessor=preprocessor,
+        exclude_features=cfg.dataset.exclude_features or (),
+        task_override=cfg.dataset.task_override,
+    )
 
     # Created BEFORE prepare on the unsharded parameters — accelerate's FSDP2 path requires the
     # model and optimizer in one prepare() call and rebinds the param groups itself.
@@ -619,21 +729,22 @@ def train(cfg: TrainPipelineConfig):
     if cfg.resume:
         step = resume_before_prepare(cfg)  # step + RNG only; sharded state loads after prepare
 
-    dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
+    dataloader, eval_dataloader, test_dataloader = make_dataloaders(
+        cfg, dataset, eval_dataset, test_dataset, step, parallel_dims
+    )
 
     # --- prepare & resume phase 2 ---------------------------------------------------------------
     # The FSDP wrap-unit class names resolve right before prepare: user override, else the
     # policy's _fsdp_wrap_modules declaration — root-only wrapping is never silently accepted.
     set_fsdp_wrap_modules(accelerator, accelerator.unwrap_model(policy) if peft_model else policy)
     accelerator.wait_for_everyone()
+    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        policy, optimizer, dataloader, lr_scheduler
+    )
     if eval_dataloader is not None:
-        policy, optimizer, dataloader, lr_scheduler, eval_dataloader = accelerator.prepare(
-            policy, optimizer, dataloader, lr_scheduler, eval_dataloader
-        )
-    else:
-        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-            policy, optimizer, dataloader, lr_scheduler
-        )
+        eval_dataloader = accelerator.prepare_data_loader(eval_dataloader)
+    if test_dataloader is not None:
+        test_dataloader = accelerator.prepare_data_loader(test_dataloader)
     finalize_sharded_policy(policy, parallel_dims)
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
@@ -796,7 +907,7 @@ def train(cfg: TrainPipelineConfig):
         batch = next(dl_iter)
         preprocessing_start = time.perf_counter()
         train_tracker.dataloading_s = preprocessing_start - step_start
-        batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
+        batch = preprocess_batch(batch)
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
 
         train_tracker, _ = update_policy(
@@ -828,6 +939,7 @@ def train(cfg: TrainPipelineConfig):
         is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
         is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
+        is_test_step = is_saving_step and test_dataloader is not None
 
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
@@ -852,26 +964,18 @@ def train(cfg: TrainPipelineConfig):
             train_tracker.reset_averages()
 
         if is_eval_step:
-            policy.eval()
-            eval_loss_sum = 0.0
-            n_eval_batches = 0
-            with torch.no_grad(), accelerator.autocast():
-                for eval_batch in eval_dataloader:
-                    eval_batch = _preprocess_dataset_batch(
-                        eval_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
-                    )
-                    loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
-                    eval_loss_sum += loss.item()
-                    n_eval_batches += 1
-            eval_loss = eval_loss_sum / max(n_eval_batches, 1)
-            eval_loss = torch.tensor(eval_loss, device=device)
-            eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
-            policy.train()
-
+            eval_loss = _compute_validation_loss(policy, eval_dataloader, accelerator, preprocess_batch)
             if is_main_process():
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+
+        if is_test_step:
+            test_loss = _compute_validation_loss(policy, test_dataloader, accelerator, preprocess_batch)
+            if is_main_process():
+                logging.info(f"step {step}: test_loss={test_loss:.4f}")
+                if wandb_logger:
+                    wandb_logger.log_dict({"test_loss": test_loss}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file
@@ -889,6 +993,8 @@ def train(cfg: TrainPipelineConfig):
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
                 accelerator=accelerator,
+                episode_split=datasets.episode_split,
+                checkpoint_metadata=checkpoint_metadata,
             )
             if is_main_process():
                 if ema is not None:
@@ -903,6 +1009,7 @@ def train(cfg: TrainPipelineConfig):
                         cfg.save_pretrained(ema_dir)
                         preprocessor.save_pretrained(ema_dir)
                         postprocessor.save_pretrained(ema_dir)
+                        write_json(checkpoint_metadata, ema_dir / CHECKPOINT_METADATA)
                 update_last_checkpoint(checkpoint_dir)
                 if cfg.save_checkpoint_to_hub:
                     push_checkpoint_to_hub(
@@ -1028,7 +1135,41 @@ def _remote_target_in_argv() -> bool:
     return JobConfig.is_remote_target(target)
 
 
+def _expand_resume_path_in_argv() -> None:
+    global _resume_log_context
+    _resume_log_context = None
+    resume_value = parser.parse_arg("resume")
+    if resume_value is None or resume_value.lower() in {"true", "false"}:
+        return
+    if parser.parse_arg("config_path") is not None:
+        raise ValueError("--resume=PATH and --config_path are mutually exclusive.")
+
+    run_dir, checkpoint_dir = locate_resume_checkpoint(resume_value)
+    rewritten: list[str] = []
+    skip_next = False
+    for index, arg in enumerate(sys.argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--resume":
+            rewritten.append("--resume=true")
+            if index + 1 < len(sys.argv):
+                skip_next = True
+        elif arg.startswith("--resume="):
+            rewritten.append("--resume=true")
+        else:
+            rewritten.append(arg)
+
+    config_path = checkpoint_dir / PRETRAINED_MODEL_DIR / "train_config.json"
+    rewritten.append(f"--config_path={config_path}")
+    if parser.parse_arg("output_dir") is None:
+        rewritten.append(f"--output_dir={run_dir}")
+    sys.argv[:] = rewritten
+    _resume_log_context = (run_dir, checkpoint_dir)
+
+
 def main():
+    _expand_resume_path_in_argv()
     register_third_party_plugins()
     if _remote_target_in_argv():
         # The policy device is resolved on the remote pod, not here, so silence the

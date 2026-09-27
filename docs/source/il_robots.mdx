@@ -527,14 +527,14 @@ Let's explain the command:
 3. We provided `policy.device=cuda` since we are training on a Nvidia GPU, but you could use `policy.device=mps` to train on Apple silicon.
 4. We provided `wandb.enable=true` to use [Weights and Biases](https://docs.wandb.ai/quickstart) for visualizing training plots. This is optional but if you use it, make sure you are logged in by running `wandb login`.
 
-Training should take several hours. You will find checkpoints in `outputs/train/act_so101_test/checkpoints`.
+Training should take several hours. When `--output_dir` is omitted, checkpoints are written under
+`model_zoo/<dataset>/<policy>_<timestamp>/checkpoints`.
 
 To resume training from a checkpoint, below is an example command to resume from `last` checkpoint of the `act_so101_test` policy:
 
 ```bash
 lerobot-train \
-  --config_path=outputs/train/act_so101_test/checkpoints/last/pretrained_model/train_config.json \
-  --resume=true
+  --resume=model_zoo/so101_test/act_20260927_120000
 ```
 
 `--config_path` also accepts a **Hub repo id**: if a run pushed its checkpoints to the Hub (with `--save_checkpoint_to_hub=true`), you can resume straight from the repo — its latest checkpoint is downloaded and training continues, restoring the optimizer, scheduler, step counter and data order:
@@ -543,7 +543,8 @@ lerobot-train \
 lerobot-train --config_path=${HF_USER}/my_policy --resume=true
 ```
 
-If you do not want to push your model to the hub after training use `--policy.push_to_hub=false`.
+Models stay local by default. To publish one, pass
+`--policy.push_to_hub=true --policy.repo_id=${HF_USER}/my_policy`.
 
 Additionally you can provide extra `tags` or specify a `license` for your model or make the model repo `private` by adding this: `--policy.private=true --policy.tags=\[ppo,rl\] --policy.license=mit`
 

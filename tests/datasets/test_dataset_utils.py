@@ -29,10 +29,14 @@ from huggingface_hub import DatasetCard
 import lerobot.datasets.utils as dataset_utils
 from lerobot.datasets.io_utils import hf_transform_to_torch
 from lerobot.datasets.utils import (
+    EpisodeSplit,
     create_lerobot_dataset_card,
+    flatten_feature_names,
     get_repo_versions,
     get_safe_version,
     resolve_episode_indices,
+    resolve_excluded_features,
+    split_episodes_randomly,
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.feature_utils import combine_feature_dicts
@@ -73,6 +77,45 @@ def test_resolve_episode_indices_applies_allowlist_and_exclusions():
 
 def test_resolve_episode_indices_preserves_none_without_filtering():
     assert resolve_episode_indices(None, 5) is None
+
+
+def test_split_episodes_randomly_is_deterministic_and_disjoint():
+    first = split_episodes_randomly(range(10), [8, 1, 1], seed=42)
+    second = split_episodes_randomly(range(10), [8, 1, 1], seed=42)
+    assert first == second
+    assert not (set(first.train_episodes) & set(first.val_episodes))
+    assert not (set(first.train_episodes) & set(first.test_episodes))
+    assert sorted(first.train_episodes + first.val_episodes + first.test_episodes) == list(range(10))
+    assert EpisodeSplit.from_dict(first.to_dict()) == first
+
+
+def test_split_episodes_randomly_two_way_and_empty():
+    split = split_episodes_randomly(range(5), [4, 1], seed=0)
+    assert split.test_episodes == []
+    with pytest.raises(ValueError, match="empty"):
+        split_episodes_randomly([], [1, 1], seed=0)
+
+
+def test_split_episodes_randomly_allows_rounded_empty_heldout_splits():
+    split = split_episodes_randomly(range(2), [0.98, 0.01, 0.01], seed=0)
+    assert split.train_episodes == [0, 1]
+    assert split.val_episodes == []
+    assert split.test_episodes == []
+
+
+def test_resolve_excluded_features_warns_for_unknown(caplog):
+    features = {"observation.state": {}, "observation.images.wrist": {}}
+    assert resolve_excluded_features(
+        ["observation.images.wrist", "observation.images.missing"], features
+    ) == ["observation.images.wrist"]
+    assert "unknown excluded feature" in caplog.text
+
+
+def test_flatten_feature_names():
+    assert flatten_feature_names(["a", "b"]) == ["a", "b"]
+    assert flatten_feature_names({"arm": ["a", "b"], "gripper": ["g"]}) == ["a", "b", "g"]
+    assert flatten_feature_names({"shoulder": 0, "gripper": 1}) == ["shoulder", "gripper"]
+    assert flatten_feature_names(None) is None
 
 
 def test_resolve_episode_indices_ignores_out_of_range_values(caplog):

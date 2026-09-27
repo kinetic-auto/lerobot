@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from lerobot.datasets import TrainEvalDatasets
 from lerobot.policies import factory
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -85,6 +86,11 @@ def _run_training_until_processors(monkeypatch, cfg, stats, *, main_process=Fals
     cfg.cudnn_deterministic = False
     cfg.checkpoint_format = SimpleNamespace(wants_dcp=False)
     cfg.peft = None
+    cfg.dataset = SimpleNamespace(
+        root=None,
+        exclude_features=None,
+        task_override=None,
+    )
     accelerator = SimpleNamespace(num_processes=1, device=torch.device("cpu"), wait_for_everyone=lambda: None)
     monkeypatch.setattr(trainer, "make_accelerator", lambda _: accelerator)
     monkeypatch.setattr(trainer.ParallelDims, "from_config", lambda *args: None)
@@ -93,7 +99,12 @@ def _run_training_until_processors(monkeypatch, cfg, stats, *, main_process=Fals
     monkeypatch.setattr(
         trainer,
         "make_train_eval_datasets",
-        lambda _: (SimpleNamespace(meta=SimpleNamespace(stats=stats)), None),
+        lambda _: TrainEvalDatasets(
+            train=SimpleNamespace(meta=SimpleNamespace(stats=stats, features={}, camera_keys=[])),
+            eval=None,
+            test=None,
+            episode_split=None,
+        ),
     )
     monkeypatch.setattr(trainer, "make_policy", lambda **kwargs: SimpleNamespace(config=cfg.policy))
     # Restore backend globals changed during training setup after each test.

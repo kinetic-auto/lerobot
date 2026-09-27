@@ -441,6 +441,17 @@ class LeRobotDatasetMetadata:
                 stat: value if stat == "count" else value * factor for stat, value in self.stats[key].items()
             }
 
+    def exclude_features(self, keys: list[str]) -> None:
+        """Exclude features from the dataset.
+
+        Args:
+            keys: List of feature keys to exclude.
+        """
+        for key in keys:
+            self.info.features.pop(key, None)
+            if self.stats is not None:
+                self.stats.pop(key, None)
+
     @property
     def camera_keys(self) -> list[str]:
         """Keys to access visual modalities (regardless of their storage method)."""

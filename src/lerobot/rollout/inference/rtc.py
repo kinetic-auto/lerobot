@@ -246,6 +246,8 @@ class RTCInferenceEngine(InferenceEngine):
             None,
         )
         if self._relative_step is not None:
+            if self._relative_step.mode == "sequential":
+                raise NotImplementedError("RTC inference does not support sequential relative actions.")
             if self._relative_step.action_names is None:
                 cfg_names = getattr(policy.config, "action_feature_names", None)
                 if cfg_names:

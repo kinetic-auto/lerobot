@@ -36,9 +36,36 @@ __all__ = [
     "RelativeActionsProcessorStep",
     "AbsoluteActionsProcessorStep",
     "bind_relative_anchor",
+    "RELATIVE_ACTION_MODES",
     "to_relative_actions",
     "to_absolute_actions",
+    "to_sequential_actions",
+    "from_sequential_actions",
+    "validate_relative_action_names",
 ]
+
+RELATIVE_ACTION_MODES = ("obs_t", "sequential")
+
+
+def _relative_state_offset(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> tuple[Tensor, int]:
+    # Align state to the same device/dtype as actions. _last_state is cached before
+    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
+    if state.device != actions.device or state.dtype != actions.dtype:
+        state = state.to(device=actions.device, dtype=actions.dtype)
+    # A temporally stacked observation (a policy whose ``observation_delta_indices`` spans several
+    # frames, e.g. VLA-JEPA or LingBot-VA) hands over a (B, T_obs, state_dim) state. The reference
+    # is the CURRENT frame -- delta 0, i.e. index 0 -- so collapse to it and let the offset
+    # broadcast over the action horizon. pi0/pi05 pass a 2D (B, state_dim) state and are unaffected.
+    if state.ndim == 3:
+        state = state[:, 0]
+    dims = min(actions.shape[-1], state.shape[-1], len(mask))
+    if any(mask[dims : min(actions.shape[-1], len(mask))]):
+        raise ValueError("Relative action dimensions cannot exceed the observation.state width.")
+    mask_t = torch.tensor(mask[:dims], dtype=actions.dtype, device=actions.device)
+    state_offset = state[..., :dims] * mask_t
+    if actions.ndim == 3:
+        state_offset = state_offset.unsqueeze(-2)
+    return state_offset, dims
 
 
 def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
@@ -50,21 +77,7 @@ def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
             observation (collapsed to the current frame). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
     """
-    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
-    if state.device != actions.device or state.dtype != actions.dtype:
-        state = state.to(device=actions.device, dtype=actions.dtype)
-    # A temporally stacked observation (a policy whose ``observation_delta_indices`` spans several
-    # frames, e.g. VLA-JEPA or LingBot-VA) hands over a (B, T_obs, state_dim) state. The reference
-    # is the CURRENT frame -- delta 0, i.e. index 0 -- so collapse to it and let the offset
-    # broadcast over the action horizon. pi0/pi05 pass a 2D (B, state_dim) state and are unaffected.
-    if state.ndim == 3:
-        state = state[:, 0]
-    state_offset = state[..., :dims] * mask_t
-    if actions.ndim == 3:
-        state_offset = state_offset.unsqueeze(-2)
+    state_offset, dims = _relative_state_offset(actions, state, mask)
     actions = actions.clone()
     actions[..., :dims] -= state_offset
     return actions
@@ -79,24 +92,51 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
             observation (collapsed to the current frame). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
     """
-    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
-    if state.device != actions.device or state.dtype != actions.dtype:
-        state = state.to(device=actions.device, dtype=actions.dtype)
-    # A temporally stacked observation (a policy whose ``observation_delta_indices`` spans several
-    # frames, e.g. VLA-JEPA or LingBot-VA) hands over a (B, T_obs, state_dim) state. The reference
-    # is the CURRENT frame -- delta 0, i.e. index 0 -- so collapse to it and let the offset
-    # broadcast over the action horizon. pi0/pi05 pass a 2D (B, state_dim) state and are unaffected.
-    if state.ndim == 3:
-        state = state[:, 0]
-    state_offset = state[..., :dims] * mask_t
-    if actions.ndim == 3:
-        state_offset = state_offset.unsqueeze(-2)
+    state_offset, dims = _relative_state_offset(actions, state, mask)
     actions = actions.clone()
     actions[..., :dims] += state_offset
     return actions
+
+
+def to_sequential_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
+    sequential = to_relative_actions(actions, state, mask)
+    if actions.ndim != 3 or actions.shape[1] < 2:
+        return sequential
+    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
+    dims = mask_t.shape[0]
+    sequential[:, 1:, :dims] = (actions[:, 1:, :dims] - actions[:, :-1, :dims]) * mask_t + actions[
+        :, 1:, :dims
+    ] * (~mask_t.bool())
+    return sequential
+
+
+def from_sequential_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
+    if actions.ndim != 3:
+        return to_absolute_actions(actions, state, mask)
+    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
+    dims = mask_t.shape[0]
+    accumulated = actions.clone()
+    accumulated[..., :dims] = torch.cumsum(actions[..., :dims], dim=1) * mask_t + actions[..., :dims] * (
+        ~mask_t.bool()
+    )
+    return to_absolute_actions(accumulated, state, mask)
+
+
+def validate_relative_action_names(
+    action_names: Sequence[str], state_names: Sequence[str], mask: Sequence[bool]
+) -> None:
+    mismatches = []
+    for index, is_relative in enumerate(mask):
+        if not is_relative:
+            continue
+        action_name = action_names[index] if index < len(action_names) else "<missing>"
+        state_name = state_names[index] if index < len(state_names) else "<missing>"
+        if action_name != state_name:
+            mismatches.append(f"{index}: action={action_name!r}, state={state_name!r}")
+    if mismatches:
+        raise ValueError(
+            "Relative action dimensions must align by name with observation.state: " + "; ".join(mismatches)
+        )
 
 
 @ProcessorStepRegistry.register("relative_actions_processor")
@@ -119,8 +159,13 @@ class RelativeActionsProcessorStep(ProcessorStep):
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
+    mode: str = "obs_t"
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
     _count_queued_actions: Callable[[], int] | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.mode not in RELATIVE_ACTION_MODES:
+            raise ValueError(f"Unknown relative action mode {self.mode!r}; expected {RELATIVE_ACTION_MODES}.")
 
     def _build_mask(self, action_dim: int) -> list[bool]:
         if not self.exclude_joints or self.action_names is None:
@@ -160,7 +205,10 @@ class RelativeActionsProcessorStep(ProcessorStep):
             return new_transition
 
         mask = self._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
+        if self.mode == "sequential":
+            new_transition[TransitionKey.ACTION] = to_sequential_actions(action, state, mask)
+        else:
+            new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
         return new_transition
 
     def reset(self) -> None:
@@ -182,6 +230,7 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "enabled": self.enabled,
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
+            "mode": self.mode,
         }
 
     def transform_features(
@@ -206,6 +255,8 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
 
     enabled: bool = False
     relative_step: RelativeActionsProcessorStep | None = field(default=None, repr=False)
+    _anchor: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _previous_absolute_action: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         if not self.enabled:
@@ -230,8 +281,30 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
             return new_transition
 
         mask = self.relative_step._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_absolute_actions(action, cached_state, mask)
+        if self.relative_step.mode == "sequential":
+            if action.ndim == 3:
+                absolute_action = from_sequential_actions(action, cached_state, mask)
+            else:
+                absolute_action = self._integrate_streamed_action(action, cached_state, mask)
+        else:
+            absolute_action = to_absolute_actions(action, cached_state, mask)
+        new_transition[TransitionKey.ACTION] = absolute_action
         return new_transition
+
+    def _integrate_streamed_action(
+        self, action: Tensor, cached_state: Tensor, mask: Sequence[bool]
+    ) -> Tensor:
+        if self._anchor is not cached_state:
+            self._anchor = cached_state
+            self._previous_absolute_action = None
+        reference = cached_state if self._previous_absolute_action is None else self._previous_absolute_action
+        absolute_action = to_absolute_actions(action, reference, mask)
+        self._previous_absolute_action = absolute_action
+        return absolute_action
+
+    def reset(self) -> None:
+        self._anchor = None
+        self._previous_absolute_action = None
 
     def get_config(self) -> dict[str, Any]:
         return {"enabled": self.enabled}

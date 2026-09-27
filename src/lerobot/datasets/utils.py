@@ -18,6 +18,7 @@ import dataclasses
 import importlib.resources
 import json
 import logging
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -138,6 +139,77 @@ def resolve_episode_indices(
         )
     excluded = {episode for episode in excluded if 0 <= episode < total_episodes}
     return [episode for episode in candidates if episode not in excluded]
+
+
+def resolve_excluded_features(exclude_features: Sequence[str] | None, features: dict[str, dict]) -> list[str]:
+    if not exclude_features:
+        return []
+    unknown = [key for key in exclude_features if key not in features]
+    if unknown:
+        logger.warning("Ignoring unknown excluded feature keys: %s", unknown)
+    return [key for key in exclude_features if key in features]
+
+
+def flatten_feature_names(
+    names: Sequence[str] | dict[str, Sequence[str] | int] | None,
+) -> list[str] | None:
+    if names is None:
+        return None
+    if isinstance(names, dict):
+        grouped_names: list[str] = []
+        for group in names.values():
+            if not isinstance(group, (list, tuple)):
+                return list(names)
+            grouped_names.extend(group)
+        return grouped_names
+    return list(names)
+
+
+@dataclass
+class EpisodeSplit:
+    split_ratio: list[float]
+    total_episodes: int
+    train_episodes: list[int]
+    val_episodes: list[int]
+    test_episodes: list[int]
+    seed: int
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EpisodeSplit":
+        return cls(
+            split_ratio=list(data["split_ratio"]),
+            total_episodes=int(data["total_episodes"]),
+            train_episodes=list(data["train_episodes"]),
+            val_episodes=list(data["val_episodes"]),
+            test_episodes=list(data.get("test_episodes", [])),
+            seed=int(data["seed"]),
+        )
+
+
+def split_episodes_randomly(episodes: Sequence[int], split_ratio: Sequence[float], seed: int) -> EpisodeSplit:
+    episode_pool = sorted(episodes)
+    if not episode_pool:
+        raise ValueError("Cannot split an empty episode set.")
+
+    shuffled = episode_pool.copy()
+    random.Random(seed).shuffle(shuffled)
+    total_weight = sum(split_ratio)
+    val_count = round(len(shuffled) * split_ratio[1] / total_weight)
+    test_count = round(len(shuffled) * split_ratio[2] / total_weight) if len(split_ratio) == 3 else 0
+    test_episodes = sorted(shuffled[:test_count])
+    val_episodes = sorted(shuffled[test_count : test_count + val_count])
+    train_episodes = sorted(shuffled[test_count + val_count :])
+    return EpisodeSplit(
+        split_ratio=list(split_ratio),
+        total_episodes=len(episode_pool),
+        train_episodes=train_episodes,
+        val_episodes=val_episodes,
+        test_episodes=test_episodes,
+        seed=seed,
+    )
 
 
 DEPTH_FILE_PATTERN = "frame-{frame_index:06d}.tiff"

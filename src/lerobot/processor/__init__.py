@@ -92,11 +92,15 @@ from .policy_robot_bridge import (
     RobotActionToPolicyActionProcessorStep,
 )
 from .relative_action_processor import (
+    RELATIVE_ACTION_MODES,
     AbsoluteActionsProcessorStep,
     RelativeActionsProcessorStep,
     bind_relative_anchor,
+    from_sequential_actions,
     to_absolute_actions,
     to_relative_actions,
+    to_sequential_actions,
+    validate_relative_action_names,
 )
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
 from .render_messages_processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
@@ -139,6 +143,7 @@ __all__ = [
     "make_default_robot_observation_processor",
     "make_policy_processor_pipelines",
     "AbsoluteActionsProcessorStep",
+    "RELATIVE_ACTION_MODES",
     "RelativeActionsProcessorStep",
     "bind_relative_anchor",
     "MapDeltaActionToRobotActionStep",
@@ -178,6 +183,9 @@ __all__ = [
     "TruncatedProcessorStep",
     "to_absolute_actions",
     "to_relative_actions",
+    "to_sequential_actions",
+    "from_sequential_actions",
+    "validate_relative_action_names",
     "UnnormalizerProcessorStep",
     "VanillaObservationProcessorStep",
 ]

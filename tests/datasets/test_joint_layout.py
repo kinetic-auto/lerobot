@@ -15,6 +15,7 @@
 import pytest
 
 from lerobot.datasets.joint_layout import (
+    channel_groups,
     feature_channel_names,
     io_block_layout,
     io_layout_from_dataset_features,
@@ -67,3 +68,12 @@ def test_io_layout_rejects_mismatched_joints():
                 ACTION: {"names": ["wrist"]},
             }
         )
+
+
+def test_channel_groups_packed_names():
+    names = packed_feature_names(["shoulder", "gripper"], ["position", "effort"])
+    assert channel_groups(names) == {"position": [0, 1], "effort": [2, 3]}
+
+
+def test_channel_groups_legacy_names_are_positions():
+    assert channel_groups(["shoulder", "gripper"]) == {"position": [0, 1]}

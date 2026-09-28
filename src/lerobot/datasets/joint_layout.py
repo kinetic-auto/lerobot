@@ -40,6 +40,17 @@ def feature_channel_names(feature: Mapping[str, Any]) -> list[str]:
     return []
 
 
+def channel_groups(names: Sequence[str]) -> dict[str, list[int]]:
+    groups: dict[str, list[int]] = {}
+    for field in VALID_JOINT_FIELDS:
+        indices = [index for index, name in enumerate(names) if name.endswith(f".{field}")]
+        if indices:
+            groups[field] = indices
+    if not groups:
+        groups["position"] = list(range(len(names)))
+    return groups
+
+
 def io_block_layout(names: Sequence[str]) -> tuple[list[str], list[str]]:
     names = list(names)
     if not names:

@@ -128,6 +128,10 @@ If your local computer doesn't have a powerful GPU, you can utilize Google Colab
 
 ## Evaluating ACT
 
+For a quick check without hardware, `lerobot-eval-open-loop --policy.path=<checkpoint>/pretrained_model --dataset.root=<dataset> --split=val`
+replays the held-out episodes and reports per-joint action errors. Relative-action checkpoints are
+evaluated on absolute actions because the saved postprocessor restores them.
+
 Once training is complete, you can evaluate your ACT policy using the `lerobot-record` command with your trained policy. This will run inference and record evaluation episodes:
 
 ```bash

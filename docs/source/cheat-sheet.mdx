@@ -173,6 +173,27 @@ checkpoint is fetched, and the same command works on a job by adding `--job.targ
 lerobot-train --config_path=${HF_USER}/policy_test --resume=true --job.target=a10g-small
 ```
 
+### Open-loop evaluation on a dataset
+
+Before running on a robot, replay the held-out episodes recorded during training through the
+checkpoint and compare its predictions with the recorded actions:
+
+```bash
+lerobot-eval-open-loop \
+    --policy.path=model_zoo/so101_dataset_test/act_20260927_120000/checkpoints/last/pretrained_model \
+    --dataset.root=/path/to/so101_dataset_test \
+    --split=val \
+    --episodes_per_split=5
+```
+
+Episodes come from the checkpoint's `split_info.json` (`--split` is `train`, `val`, `test` or
+`all`), or pass `--dataset.episodes='[3, 7]'` for specific ones. Results land next to the checkpoint
+in `eval_open_loop/`: `metrics_summary.json` and `metrics_per_episode.csv` with per-joint MAE, MSE
+and RMSE on absolute actions, plus one plot per episode and a per-joint MAE box plot by split.
+Add `--policy.n_action_steps=1` to re-infer at every frame instead of once per chunk. Checkpoints
+trained with relative actions are converted back to absolute actions by their postprocessor, so
+no extra flags are needed.
+
 ### Inference
 
 Inference means running the trained policy/model on a robot. For that we use `lerobot-rollout`. You will need to provide a path to your policy. It can be a local path or a path to Hugging Face for example "lerobot/folding_latest". Your cameras configuration needs to match what was used when collecting the dataset. Duration is in seconds if unspecified, it will run forever.

@@ -20,7 +20,7 @@ from pathlib import Path
 from lerobot import envs, policies  # noqa: F401
 
 from . import parser
-from .default import EvalConfig
+from .default import DatasetConfig, EvalConfig
 from .policies import PreTrainedConfig
 
 logger = getLogger(__name__)
@@ -72,6 +72,66 @@ class EvalPipelineConfig:
             now = dt.datetime.now()
             eval_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/eval") / eval_dir
+
+    @classmethod
+    def __get_path_fields__(cls) -> list[str]:
+        """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
+        return ["policy"]
+
+
+OPEN_LOOP_SPLITS = ("train", "val", "test", "all")
+
+
+@dataclass
+class OpenLoopEvalConfig:
+    # Dataset whose recorded episodes are replayed. Only `repo_id`, `root`, `revision`, `video_backend`,
+    # `episodes` (explicit episode selection), `exclude_features` and `task_override` are used; the
+    # training-only fields (`image_transforms`, `split_ratio`, `eval_split`, `use_imagenet_stats`) are ignored.
+    dataset: DatasetConfig
+    # Checkpoint to evaluate, given as `--policy.path=<checkpoint>/pretrained_model`.
+    policy: PreTrainedConfig | None = None
+    # Episodes are drawn from the checkpoint's split_info.json: "train", "val", "test" or "all".
+    split: str = "all"
+    # Episodes evaluated per split; zero or less evaluates every episode of the split.
+    episodes_per_split: int = 3
+    # Seeds the episode sampling only.
+    seed: int | None = 42
+    # Defaults to `<checkpoint step dir>/eval_open_loop` next to a local checkpoint.
+    output_dir: Path | None = None
+    # Write per-episode joint plots and the per-joint MAE summary plot (requires matplotlib).
+    save_plots: bool = True
+    dpi: int = 150
+    # Rename map for the observation to override the image and state keys
+    rename_map: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        policy_path = parser.get_path_arg("policy")
+        if policy_path:
+            yaml_overrides = parser.get_yaml_overrides("policy")
+            cli_overrides = parser.get_cli_overrides("policy") or []
+            self.policy = PreTrainedConfig.from_pretrained(
+                policy_path, cli_overrides=yaml_overrides + cli_overrides
+            )
+            self.policy.pretrained_path = Path(policy_path)
+        if self.policy is None:
+            raise ValueError("Open-loop evaluation needs a trained checkpoint: pass `--policy.path=<dir>`.")
+        if self.split not in OPEN_LOOP_SPLITS:
+            raise ValueError(f"split must be one of {OPEN_LOOP_SPLITS}, got {self.split!r}")
+        if self.dataset.streaming:
+            raise ValueError(
+                "Open-loop evaluation replays frames by index and does not support dataset.streaming=true."
+            )
+        if not self.output_dir:
+            self.output_dir = self._default_output_dir()
+
+    def _default_output_dir(self) -> Path:
+        if self.policy is None:
+            raise ValueError("A policy config is required to derive the default output_dir.")
+        pretrained_path = self.policy.pretrained_path
+        if pretrained_path is not None and Path(pretrained_path).is_dir():
+            return Path(pretrained_path).parent / "eval_open_loop"
+        now = dt.datetime.now()
+        return Path("outputs/eval_open_loop") / f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.policy.type}"
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

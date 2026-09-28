@@ -359,6 +359,23 @@ lerobot-record \
 
 Report success rate across episodes. Compare to a teleoperated baseline and to an earlier checkpoint to catch regressions.
 
+### 8.1b Open-loop eval on held-out episodes
+
+Cheapest regression check, no robot or simulator needed: `lerobot-eval-open-loop` replays the
+validation and test episodes that training held out (from the checkpoint's `split_info.json`)
+through the policy and reports per-joint action errors against the recorded actions.
+
+```bash
+lerobot-eval-open-loop \
+  --policy.path=model_zoo/<dataset>/<run>/checkpoints/last/pretrained_model \
+  --dataset.root=<dataset> \
+  --split=val
+```
+
+- Outputs go to `<checkpoint>/eval_open_loop/`: `metrics_summary.json`, `metrics_per_episode.csv`, `plots/`.
+- Compare `by_split.train` with `by_split.val` in the summary to spot overfitting; compare checkpoints on the same `--seed` for a like-for-like episode sample.
+- Low open-loop error is necessary, not sufficient: it says nothing about error accumulation under closed-loop control, so still run 8.1 or 8.2 before shipping.
+
 ### 8.2 Sim-benchmark eval
 
 For policies trained on sim datasets (PushT, Aloha, LIBERO, MetaWorld, RoboCasa, …) use `lerobot-eval` against the matching `env.type`:

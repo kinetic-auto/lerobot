@@ -18,7 +18,8 @@
 #   LEROBOT_EXTRAS — pip extras at build (default: training,dataset_viz)
 #   SHM_SIZE       — /dev/shm size; DataLoader workers need well above the
 #                    64MB Docker default (default: 16gb)
-#   HOST_UID / HOST_GID — uid:gid owning the output files (default: 1000:1000)
+#   HOST_UID / HOST_GID — uid:gid the container runs as and that owns the output
+#                    files; also baked into the image as user `lerobot` (default: 1000:1000)
 #   CUDA_VISIBLE_DEVICES — restrict which GPUs the trainer sees
 #   WANDB_MODE     — offline by default so nothing is uploaded; set to "online"
 #                    with WANDB_API_KEY to stream metrics to wandb
@@ -33,6 +34,8 @@ services:
       dockerfile: docker/Dockerfile.train
       args:
         LEROBOT_EXTRAS: "${LEROBOT_EXTRAS:-training,dataset_viz}"
+        HOST_UID: "${HOST_UID:-1000}"
+        HOST_GID: "${HOST_GID:-1000}"
     container_name: lerobot-train
     working_dir: /lerobot
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
@@ -41,7 +44,6 @@ services:
     command: bash
     shm_size: ${SHM_SIZE:-16gb}
     environment:
-      # HOST_UID has no passwd entry; getpass.getuser() uses USER and LOGNAME.
       - USER=lerobot
       - LOGNAME=lerobot
       - HOME=/lerobot/.train_home

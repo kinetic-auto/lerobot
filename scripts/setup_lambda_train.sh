@@ -178,6 +178,8 @@ orchestrate_from_laptop() {
             --exclude '.git/' \
             "${local_repo}/" \
             "${SSH_USER}@${INSTANCE_IP}:${REMOTE_REPO}/"
+        # Image from the first attempt is reused; compose up without --build.
+        SKIP_BUILD=true
         run_box_half "${script_path}"
     fi
 }
@@ -221,13 +223,10 @@ checkout_repo() {
 }
 
 verify_container() {
-    local root="/data/datasets/${DATASET_NAME}"
     log "lerobot-info"
-    sg docker -c "docker exec lerobot-train lerobot-info"
-    log "dataset at ${root}"
-    sg docker -c "docker exec lerobot-train python3 -c $(printf %q "from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
-m = LeRobotDatasetMetadata('local', root='${root}')
-print(m.total_episodes, m.total_frames, m.fps, list(m.features))")"
+    sg docker -c 'docker exec lerobot-train lerobot-info'
+    log "dataset at /data/datasets/${DATASET_NAME}"
+    sg docker -c "docker exec -e DATASET_NAME=${DATASET_NAME} lerobot-train python3 -c 'import os; from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata; m = LeRobotDatasetMetadata(\"local\", root=\"/data/datasets/\" + os.environ[\"DATASET_NAME\"]); print(m.total_episodes, m.total_frames, m.fps, list(m.features))'"
 }
 
 print_train_hint() {
@@ -285,7 +284,6 @@ Multi-GPU (DDP; set --num_processes to the GPU count):
     --wandb.enable=false
 
 Runs land in model_zoo/${DATASET_NAME}/<job_name> on the box.
-Use --batch_size=32 on a single A6000 48GB or A100 40GB.
 EOF
 }
 

@@ -41,10 +41,14 @@ services:
     command: bash
     shm_size: ${SHM_SIZE:-16gb}
     environment:
+      # HOST_UID has no passwd entry; getpass.getuser() uses USER and LOGNAME.
+      - USER=lerobot
+      - LOGNAME=lerobot
       - HOME=/lerobot/.train_home
       - HF_HOME=/lerobot/.train_home/huggingface
       - HF_LEROBOT_HOME=/lerobot/.train_home/huggingface/lerobot
       - TORCH_HOME=/lerobot/.train_home/torch
+      - TORCHINDUCTOR_CACHE_DIR=/lerobot/.train_home/torchinductor
       - TRITON_CACHE_DIR=/lerobot/.train_home/triton
       - WANDB_MODE=${WANDB_MODE:-offline}
       # Passed through only when set on the host. Assigning an empty value here

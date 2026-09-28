@@ -142,19 +142,22 @@ lerobot-replay --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.
   --dataset.repo_id=${HF_USER}/my_task --dataset.episode=0
 ```
 
-**4.9 Train** (default: ACT — fastest, lowest memory). Apple silicon: `--policy.device=mps`. No local GPU? Add `--job.target=<flavor>` (e.g. `a10g-small`, list them with `hf jobs hardware`) to run on Hugging Face Jobs instead. See §6/§7 for policy and duration.
+**4.9 Train** (default: ACT — fastest, lowest memory). Apple silicon: `--policy.device=mps`. No local GPU? Add `--job.target=<flavor>` (e.g. `a10g-small`, list them with `hf jobs hardware`) to run on Hugging Face Jobs instead, or run `scripts/setup_lambda_train.sh` for a rented Lambda GPU box (see `docker/README.md`). See §6/§7 for policy and duration.
 
 ```bash
 lerobot-train \
   --dataset.repo_id=${HF_USER}/my_task \
   --policy.type=act \
   --policy.device=cuda \
-  --output_dir=outputs/train/act_my_task \
-  --job_name=act_my_task \
   --batch_size=8 \
   --wandb.enable=true \
+  --policy.push_to_hub=true \
   --policy.repo_id=${HF_USER}/act_my_task
 ```
+
+Without `--output_dir`, the run is saved under `model_zoo/my_task/act_<timestamp>`. Resume it with
+`lerobot-train --resume=model_zoo/my_task/act_<timestamp>`. Models remain local unless
+`--policy.push_to_hub=true` is set.
 
 **4.10 Evaluate on the real robot** — compare success rate to a teleoperated baseline.
 
@@ -355,6 +358,23 @@ lerobot-record \
 ```
 
 Report success rate across episodes. Compare to a teleoperated baseline and to an earlier checkpoint to catch regressions.
+
+### 8.1b Open-loop eval on held-out episodes
+
+Cheapest regression check, no robot or simulator needed: `lerobot-eval-open-loop` replays the
+validation and test episodes that training held out (from the checkpoint's `split_info.json`)
+through the policy and reports per-joint action errors against the recorded actions.
+
+```bash
+lerobot-eval-open-loop \
+  --policy.path=model_zoo/<dataset>/<run>/checkpoints/last/pretrained_model \
+  --dataset.root=<dataset> \
+  --split=val
+```
+
+- Outputs go to `<checkpoint>/eval_open_loop/`: `metrics_summary.json`, `metrics_per_episode.csv`, `plots/`.
+- Compare `by_split.train` with `by_split.val` in the summary to spot overfitting; compare checkpoints on the same `--seed` for a like-for-like episode sample.
+- Low open-loop error is necessary, not sufficient: it says nothing about error accumulation under closed-loop control, so still run 8.1 or 8.2 before shipping.
 
 ### 8.2 Sim-benchmark eval
 

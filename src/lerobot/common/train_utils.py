@@ -37,8 +37,9 @@ from torch.optim.lr_scheduler import LRScheduler
 from lerobot.__version__ import __version__
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
-from lerobot.configs.train import TrainPipelineConfig
+from lerobot.configs.train import TRAIN_CONFIG_NAME, TrainPipelineConfig
 from lerobot.configs.types import PolicyFeature
+from lerobot.datasets.joint_layout import io_layout_from_dataset_features
 from lerobot.distributed.checkpoint import (
     is_sharded_module,
     load_sharded_model,
@@ -58,12 +59,15 @@ from lerobot.optim import (
 from lerobot.policies import PreTrainedPolicy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import (
+    CHECKPOINT_METADATA,
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
     PRETRAINED_MODEL_DIR,
+    SPLIT_INFO,
     TRAINING_STATE_DIR,
     TRAINING_STEP,
 )
+from lerobot.utils.git_utils import git_provenance
 from lerobot.utils.hub import find_latest_hub_checkpoint
 from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
@@ -72,6 +76,7 @@ if TYPE_CHECKING:
     from accelerate import Accelerator
 
     from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+    from lerobot.datasets.utils import EpisodeSplit
     from lerobot.rewards.pretrained import PreTrainedRewardModel
 
 
@@ -103,6 +108,25 @@ def get_step_checkpoint_dir(output_dir: Path, total_steps: int, step: int) -> Pa
     """
     step_identifier = get_step_identifier(step, total_steps)
     return output_dir / CHECKPOINTS_DIR / step_identifier
+
+
+def locate_resume_checkpoint(resume_path: str | Path) -> tuple[Path, Path]:
+    path = Path(resume_path).expanduser()
+    parts = path.parts
+    if CHECKPOINTS_DIR in parts:
+        checkpoint_index = parts.index(CHECKPOINTS_DIR)
+        if checkpoint_index + 1 >= len(parts):
+            raise FileNotFoundError(f"Resume path does not name a checkpoint: {path}")
+        run_dir = Path(*parts[:checkpoint_index])
+        checkpoint_dir = run_dir / CHECKPOINTS_DIR / parts[checkpoint_index + 1]
+    else:
+        run_dir = path
+        checkpoint_dir = run_dir / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK
+
+    config_path = checkpoint_dir / PRETRAINED_MODEL_DIR / TRAIN_CONFIG_NAME
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Checkpoint config not found: {config_path}")
+    return run_dir, checkpoint_dir
 
 
 def should_save_checkpoint(step: int, save_freq: int, total_steps: int) -> bool:
@@ -198,6 +222,28 @@ def load_training_metadata(training_state_dir: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------------------------
 
 
+def build_checkpoint_metadata(
+    dataset_meta: "LeRobotDatasetMetadata",
+    *,
+    action_type: str | None,
+    delta_exclude_joints: list[str] | None,
+    task_description: str | None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if action_type is not None:
+        metadata["action_type"] = action_type
+    if delta_exclude_joints is not None:
+        metadata["delta_exclude_joints"] = delta_exclude_joints
+    if task_description is not None:
+        metadata["task_description"] = task_description
+    metadata.update(git_provenance())
+    try:
+        metadata["io"] = io_layout_from_dataset_features(dataset_meta.features)
+    except (KeyError, ValueError) as error:
+        logging.warning("Could not derive checkpoint IO metadata: %s", error)
+    return metadata
+
+
 def save_checkpoint(
     checkpoint_dir: Path,
     step: int,
@@ -208,6 +254,8 @@ def save_checkpoint(
     preprocessor: PolicyProcessorPipeline | None = None,
     postprocessor: PolicyProcessorPipeline | None = None,
     accelerator: "Accelerator | None" = None,
+    episode_split: "EpisodeSplit | None" = None,
+    checkpoint_metadata: dict[str, Any] | None = None,
 ) -> None:
     """This function creates the following directory structure:
 
@@ -217,6 +265,8 @@ def save_checkpoint(
     │   ├── model.safetensors  # policy weights (checkpoint_format ∈ {safetensors, safetensors_dcp}, or any non-sharded run)
     │   ├── pytorch_model_fsdp_0/  # DCP model shards (checkpoint_format ∈ {dcp, safetensors_dcp})
     │   ├── train_config.json  # train config
+    │   ├── split_info.json  # episode split (if provided)
+    │   ├── training_metadata.json  # action/task/code/IO metadata (if provided)
     │   ├── policy_preprocessor.json  # preprocessor config (if preprocessor provided)
     │   ├── policy_preprocessor_step_*.safetensors  # state of the stateful preprocessor steps
     │   ├── policy_postprocessor.json  # postprocessor config (if postprocessor provided)
@@ -280,6 +330,10 @@ def save_checkpoint(
             preprocessor.save_pretrained(pretrained_dir)
         if postprocessor is not None:
             postprocessor.save_pretrained(pretrained_dir)
+        if episode_split is not None:
+            write_json(episode_split.to_dict(), pretrained_dir / SPLIT_INFO)
+        if checkpoint_metadata is not None:
+            write_json(checkpoint_metadata, pretrained_dir / CHECKPOINT_METADATA)
 
     save_training_state(
         checkpoint_dir, step, cfg, optimizer, scheduler, accelerator, sharded=sharded, model=policy_to_save

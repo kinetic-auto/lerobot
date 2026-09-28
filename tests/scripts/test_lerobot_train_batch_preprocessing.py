@@ -44,3 +44,22 @@ def test_preprocess_dataset_batch_normalizes_and_renames_before_processor():
     assert set(processed) == {f"{OBS_IMAGES}.camera1", ACTION}
     assert processed[f"{OBS_IMAGES}.camera1"].dtype == torch.float32
     torch.testing.assert_close(processed[f"{OBS_IMAGES}.camera1"], torch.ones(1, 3, 2, 2))
+
+
+def test_preprocess_dataset_batch_excludes_before_rename_and_overrides_task():
+    batch = {
+        "observation.images.wrist": torch.zeros(2, 3, 2, 2),
+        "observation.state": torch.zeros(2, 2),
+        "task": ["old", "old"],
+    }
+    processed = _preprocess_dataset_batch(
+        batch,
+        camera_keys=["observation.images.wrist"],
+        rename_map={"observation.images.wrist": "observation.images.renamed"},
+        preprocessor=lambda value: value,
+        exclude_features=["observation.images.wrist"],
+        task_override="new task",
+    )
+    assert "observation.images.wrist" not in processed
+    assert "observation.images.renamed" not in processed
+    assert processed["task"] == ["new task", "new task"]

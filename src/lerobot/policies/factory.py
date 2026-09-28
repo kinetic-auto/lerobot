@@ -306,12 +306,9 @@ def make_policy(
         )
         action_names = raw_action_feature.get("names") if raw_action_feature is not None else None
         if action_names is not None:
-            # Grouped metadata stores dimension names in the values, not the group keys.
-            if isinstance(action_names, dict) and all(
-                isinstance(group, (list, tuple)) for group in action_names.values()
-            ):
-                action_names = [name for group in action_names.values() for name in group]
-            cfg.action_feature_names = list(action_names)
+            from lerobot.datasets.utils import flatten_feature_names
+
+            cfg.action_feature_names = flatten_feature_names(action_names)
     if ds_meta is not None:
         set_dataset_feature_metadata = getattr(cfg, "set_dataset_feature_metadata", None)
         if callable(set_dataset_feature_metadata):

@@ -20,18 +20,22 @@ import pytest
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
+from datasets import Dataset
+
 from lerobot.datasets.compute_stats import (
     RunningQuantileStats,
     _assert_type_and_shape,
     aggregate_feature_stats,
     aggregate_stats,
     compute_episode_stats,
+    compute_relative_action_stats,
+    compute_sequential_action_stats,
     estimate_num_samples,
     get_feature_stats,
     sample_images,
     sample_indices,
 )
-from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 
 
 def mock_load_image_as_numpy(path, dtype, channel_first):
@@ -53,6 +57,52 @@ def test_estimate_num_samples():
     assert estimate_num_samples(100) == 100
     assert estimate_num_samples(200) == 100
     assert estimate_num_samples(1000) == 177
+
+
+def test_relative_and_sequential_action_stats():
+    dataset = Dataset.from_dict(
+        {
+            ACTION: [[1.0, 10.0], [3.0, 20.0], [8.0, 30.0], [102.0, 40.0]],
+            OBS_STATE: [[0.0, 5.0], [1.0, 6.0], [3.0, 7.0], [100.0, 8.0]],
+            "episode_index": [0, 0, 0, 1],
+        }
+    )
+    features = {
+        ACTION: {"shape": (2,), "names": ["arm", "gripper"]},
+        OBS_STATE: {"shape": (2,), "names": ["arm", "gripper"]},
+    }
+
+    relative = compute_relative_action_stats(dataset, features, chunk_size=1, exclude_joints=["gripper"])
+    sequential = compute_sequential_action_stats(dataset, features, exclude_joints=["gripper"])
+
+    np.testing.assert_allclose(relative["mean"], [2.5, 25.0], atol=1e-5)
+    np.testing.assert_allclose(sequential["mean"], [2.5, 25.0], atol=1e-5)
+    np.testing.assert_allclose(sequential["min"], [1.0, 10.0], atol=1e-5)
+
+
+def test_relative_stats_support_excluded_action_only_dimension():
+    dataset = Dataset.from_dict(
+        {
+            ACTION: [
+                [1.0, 10.0, 0.1],
+                [3.0, 20.0, 0.2],
+                [8.0, 30.0, 0.3],
+                [102.0, 40.0, 0.4],
+            ],
+            OBS_STATE: [[0.0, 5.0], [1.0, 6.0], [3.0, 7.0], [100.0, 8.0]],
+            "episode_index": [0, 0, 0, 1],
+        }
+    )
+    features = {
+        ACTION: {"shape": (3,), "names": ["arm", "wrist", "tool"]},
+        OBS_STATE: {"shape": (2,), "names": ["arm", "wrist"]},
+    }
+
+    relative = compute_relative_action_stats(dataset, features, chunk_size=1, exclude_joints=["tool"])
+    sequential = compute_sequential_action_stats(dataset, features, exclude_joints=["tool"])
+
+    np.testing.assert_allclose(relative["mean"], [2.5, 18.5, 0.25], atol=1e-5)
+    np.testing.assert_allclose(sequential["mean"], [2.5, 14.25, 0.25], atol=1e-5)
     assert estimate_num_samples(2000) == 299
     assert estimate_num_samples(5000) == 594
     assert estimate_num_samples(10_000) == 1000

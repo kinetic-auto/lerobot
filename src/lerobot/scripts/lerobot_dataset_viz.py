@@ -351,10 +351,7 @@ def format_episode_table(meta: LeRobotDatasetMetadata) -> str:
         tasks = ep.get("tasks", [])
         if isinstance(tasks, np.ndarray):
             tasks = tasks.tolist()
-        if isinstance(tasks, list):
-            task_s = ", ".join(str(t) for t in tasks)
-        else:
-            task_s = str(tasks)
+        task_s = ", ".join(str(t) for t in tasks) if isinstance(tasks, list) else str(tasks)
         video_bits: list[str] = []
         for vid_key in meta.video_keys:
             rel = meta.get_video_file_path(i, vid_key)
@@ -363,9 +360,7 @@ def format_episode_table(meta: LeRobotDatasetMetadata) -> str:
                 video_bits.append(label)
             else:
                 video_bits.append(f"{label}(missing)")
-        lines.append(
-            f"{i:4d}  {length:7d}  {duration:7.1f}  {task_s:<32}  {','.join(video_bits)}"
-        )
+        lines.append(f"{i:4d}  {length:7d}  {duration:7.1f}  {task_s:<32}  {','.join(video_bits)}")
     return "\n".join(lines)
 
 
@@ -582,7 +577,9 @@ def visualize_dataset(
         rr.serve_web_viewer(open_browser=True, web_port=local_web_port, connect_to=server_uri)
 
     if serve_web:
-        logging.info("Logged episode %s. Viewer is open — press play in Rerun, Ctrl-C to exit.", episode_index)
+        logging.info(
+            "Logged episode %s. Viewer is open — press play in Rerun, Ctrl-C to exit.", episode_index
+        )
         try:
             while True:
                 time.sleep(1)

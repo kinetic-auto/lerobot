@@ -1,0 +1,58 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# docker build -f docker/Dockerfile.train -t lerobot-train .
+#
+# Override extras (default training,dataset_viz):
+#   docker build -f docker/Dockerfile.train \
+#     --build-arg LEROBOT_EXTRAS=training,dataset_viz,smolvla \
+#     -t lerobot-train .
+
+ARG CUDA_VERSION=12.8.1
+ARG OS_VERSION=22.04
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
+
+ARG LEROBOT_EXTRAS=training,dataset_viz
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+ARG PYTHON_VERSION=3.12
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    MUJOCO_GL=egl \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_EXTRA_INDEX_URL=${TORCH_INDEX_URL}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common gnupg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+    build-essential git ffmpeg \
+    libglib2.0-0 libgl1 libegl1 \
+    cmake pkg-config ninja-build \
+    && python${PYTHON_VERSION} -m ensurepip --upgrade \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /lerobot
+COPY pyproject.toml setup.py README.md MANIFEST.in ./
+COPY src ./src
+RUN python3 -m pip install -e ".[${LEROBOT_EXTRAS}]"
+
+# torchcodec prerequires nvidia-npp-cu12
+RUN python3 -m pip install nvidia-npp-cu12
+ENV LD_LIBRARY_PATH=/usr/local/lib/python${PYTHON_VERSION}/dist-packages/nvidia/npp/lib:${LD_LIBRARY_PATH}
+
+CMD ["bash"]

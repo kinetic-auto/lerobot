@@ -85,6 +85,8 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     # and a bare `_action_queue` deque. A chunking policy using another name must extend this
     # ClassVar (or override the method), otherwise dropping the queue silently does nothing.
     _action_queue_attrs: ClassVar[tuple[str, ...]] = ("_queues", "_action_queue")
+    # Whether validation and test loss need training mode for policy-specific loss branches.
+    validation_loss_in_train_mode: ClassVar[bool] = False
 
     def __init__(self, config: PreTrainedConfig, *inputs, **kwargs):
         super().__init__()

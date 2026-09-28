@@ -123,7 +123,7 @@ The figure below (based on a figure from [UMI, Chi et al., 2024](https://arxiv.o
 
 ## Using Relative Actions in LeRobot
 
-LeRobot provides `RelativeActionsProcessorStep` to convert between absolute and relative actions inside the processor pipeline. This is how pi0, pi0.5, and pi0_fast support relative actions.
+LeRobot provides `RelativeActionsProcessorStep` to convert between absolute and relative actions inside the processor pipeline. ACT and the pi policy family support this path. Set `relative_action_mode=obs_t` for offsets from the current observation or `relative_action_mode=sequential` for a first state-relative action followed by action-to-action deltas.
 
 > **Note:** All pi models (pi0, pi0.5, pi0*fast) apply relative conversion \_before* normalization (`relative → normalize`), so the normalizer always sees delta (relative) values. This means **relative action stats are required** for all of them when training with `use_relative_actions=true`. In pi0_fast the `RelativeActionsProcessorStep` only modifies the action — the state observation is unchanged — so `NormalizerProcessorStep` still runs before the state tokenizer and the tokenizer continues to receive normalized state as expected.
 
@@ -174,9 +174,14 @@ For example, `{"arm": ["shoulder", "elbow"], "hand": ["gripper"]}` becomes `["sh
 Group insertion order and within-group order are preserved, so declare names in the same order as the action vector.
 Legacy name-to-index mappings retain their key-order behavior.
 
+Every non-excluded action channel must have the same name as the state channel at that index.
+Training validates this alignment before computing relative-action statistics. ACT recomputes those
+statistics from the training split by default; set `recompute_relative_action_stats=false` to retain
+existing compatible statistics.
+
 ### Combining relative actions with RTC
 
-[RTC](https://arxiv.org/abs/2506.07339) runs policy inference at high frequency and sends actions to the robot as they are predicted rather than waiting for a full chunk. Relative actions and RTC are fully compatible: because every chunk in relative mode references the **same** current state (captured at the start of inference), each predicted action in the chunk remains a valid offset even if the robot has already moved. No special handling is needed — `RelativeActionsProcessorStep` caches the state once per inference call and `AbsoluteActionsProcessorStep` applies it to every action in the streamed output.
+[RTC](https://arxiv.org/abs/2506.07339) runs policy inference at high frequency and sends actions to the robot as they are predicted rather than waiting for a full chunk. `obs_t` relative actions and RTC are compatible because every chunk references the same current state. Sequential mode is not supported by RTC because RTC prefix replacement requires independent state-relative actions.
 
 ### Combining relative actions with EE space
 

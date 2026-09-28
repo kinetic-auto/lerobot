@@ -343,8 +343,7 @@ def validate_feature_keys(dataset: LeRobotDataset, feature_keys: list[str]) -> N
     ]
     if invalid:
         raise ValueError(
-            f"Feature keys are missing or not 1-D vector features: {invalid}. "
-            f"Plottable keys: {plottable}"
+            f"Feature keys are missing or not 1-D vector features: {invalid}. Plottable keys: {plottable}"
         )
 
 
@@ -498,7 +497,9 @@ def decode_keyframes(
     if episodes is None:
         raise FileNotFoundError(f"Dataset '{dataset.repo_id}' has no episode metadata")
     from_timestamp = float(episodes[episode_index][f"videos/{image_observation_key}/from_timestamp"])
-    video_path = os.path.join(str(dataset.root), str(dataset.meta.get_video_file_path(episode_index, image_observation_key)))
+    video_path = os.path.join(
+        str(dataset.root), str(dataset.meta.get_video_file_path(episode_index, image_observation_key))
+    )
     if not os.path.isfile(video_path):
         raise FileNotFoundError(f"Video not found for {image_observation_key}: {video_path}")
     video_timestamps = [from_timestamp + float(timestamp) for timestamp in keyframe_timestamps]
@@ -665,9 +666,7 @@ def draw_signal_axes(
     plt = _import_pyplot()
     signal_rows: list[tuple[str, str, list[int], list[str]]] = []
     for key in feature_keys:
-        for group_name, dim_indices, series_names in group_feature_dims(
-            signal_names[key], obs_plot_groups
-        ):
+        for group_name, dim_indices, series_names in group_feature_dims(signal_names[key], obs_plot_groups):
             signal_rows.append((key, group_name, dim_indices, series_names))
 
     signal_grid = grid_cell.subgridspec(len(signal_rows), 1, hspace=0.08)

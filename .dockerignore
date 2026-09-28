@@ -18,6 +18,8 @@ tmp
 wandb
 data
 outputs
+model_zoo
+.train_home
 .vscode
 rl
 media

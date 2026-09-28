@@ -133,6 +133,25 @@ def test_create_with_videos_sets_video_path(tmp_path):
     assert "observation.images.laptop" in meta.video_keys
 
 
+def test_exclude_features_updates_live_keys_and_stats(tmp_path):
+    meta = LeRobotDatasetMetadata.create(
+        repo_id="test/video",
+        fps=DEFAULT_FPS,
+        features=VIDEO_FEATURES,
+        root=tmp_path / "exclude_video",
+        use_videos=True,
+    )
+    key = "observation.images.laptop"
+    meta.stats = {key: {"mean": np.zeros(3)}}
+
+    meta.exclude_features([key])
+
+    assert key not in meta.features
+    assert key not in meta.video_keys
+    assert key not in meta.camera_keys
+    assert key not in meta.stats
+
+
 def test_create_without_videos_has_no_video_path(tmp_path):
     """When use_videos=False and no video features, video_path is None."""
     root = tmp_path / "no_video"

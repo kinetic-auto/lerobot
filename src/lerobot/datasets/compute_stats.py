@@ -25,6 +25,7 @@ from lerobot.processor import RelativeActionsProcessorStep
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .io_utils import load_image_as_numpy
+from .utils import flatten_feature_names
 
 DEFAULT_QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 
@@ -697,8 +698,10 @@ def _compute_relative_chunk_batch(
     frame_idx = start_indices[:, None] + offsets[None, :]
     chunks = all_actions[frame_idx].copy()
     states = all_states[start_indices]
-    mask_dim = len(relative_mask)
-    chunks[:, :, :mask_dim] -= states[:, None, :mask_dim] * relative_mask[None, None, :]
+    mask_dim = min(len(relative_mask), all_actions.shape[1], all_states.shape[1])
+    if relative_mask[mask_dim : min(len(relative_mask), all_actions.shape[1])].any():
+        raise ValueError("Relative action dimensions cannot exceed the observation.state width.")
+    chunks[:, :, :mask_dim] -= states[:, None, :mask_dim] * relative_mask[None, None, :mask_dim]
     return chunks.reshape(-1, all_actions.shape[1])
 
 
@@ -738,7 +741,7 @@ def compute_relative_action_stats(
         exclude_joints = []
 
     action_dim = features[ACTION]["shape"][0]
-    action_names = features.get(ACTION, {}).get("names")
+    action_names = flatten_feature_names(features.get(ACTION, {}).get("names"))
     mask_step = RelativeActionsProcessorStep(
         enabled=True,
         exclude_joints=exclude_joints,
@@ -803,3 +806,39 @@ def compute_relative_action_stats(
     )
 
     return stats
+
+
+def compute_sequential_action_stats(
+    hf_dataset,
+    features: dict,
+    exclude_joints: list[str] | None = None,
+) -> dict[str, np.ndarray]:
+    actions = np.asarray(hf_dataset[ACTION], dtype=np.float32)
+    states = np.asarray(hf_dataset[OBS_STATE], dtype=np.float32)
+    episode_indices = np.asarray(hf_dataset["episode_index"])
+    if len(actions) == 0:
+        raise ValueError("Cannot compute sequential action stats for an empty dataset.")
+
+    action_dim = features[ACTION]["shape"][0]
+    mask_step = RelativeActionsProcessorStep(
+        enabled=True,
+        exclude_joints=exclude_joints or [],
+        action_names=flatten_feature_names(features.get(ACTION, {}).get("names")),
+        mode="sequential",
+    )
+    relative_mask = np.asarray(mask_step._build_mask(action_dim), dtype=bool)
+    state_dims = min(len(relative_mask), actions.shape[1], states.shape[1])
+    if relative_mask[state_dims : min(len(relative_mask), actions.shape[1])].any():
+        raise ValueError("Relative action dimensions cannot exceed the observation.state width.")
+
+    sequential = actions.copy()
+    first_frame = np.ones(len(actions), dtype=bool)
+    first_frame[1:] = episode_indices[1:] != episode_indices[:-1]
+    non_first = ~first_frame
+    sequential[non_first] -= actions[:-1][non_first[1:]]
+    sequential[first_frame, :state_dims] -= states[first_frame, :state_dims]
+    sequential = np.where(relative_mask, sequential, actions)
+
+    running_stats = RunningQuantileStats()
+    running_stats.update(sequential)
+    return running_stats.get_statistics()

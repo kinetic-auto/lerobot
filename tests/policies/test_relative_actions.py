@@ -28,8 +28,11 @@ from lerobot.processor.relative_action_processor import (
     AbsoluteActionsProcessorStep,
     RelativeActionsProcessorStep,
     bind_relative_anchor,
+    from_sequential_actions,
     to_absolute_actions,
     to_relative_actions,
+    to_sequential_actions,
+    validate_relative_action_names,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -92,6 +95,60 @@ def test_roundtrip_2d(action_dim):
     mask = [True] * action_dim
     recovered = to_absolute_actions(to_relative_actions(actions, state, mask), state, mask)
     torch.testing.assert_close(recovered, actions)
+
+
+def test_sequential_definition_and_roundtrip():
+    state = torch.tensor([[10.0, 20.0]])
+    actions = torch.tensor([[[11.0, 100.0], [13.0, 200.0], [18.0, 300.0]]])
+    mask = [True, False]
+    sequential = to_sequential_actions(actions, state, mask)
+    torch.testing.assert_close(sequential, torch.tensor([[[1.0, 100.0], [2.0, 200.0], [5.0, 300.0]]]))
+    torch.testing.assert_close(from_sequential_actions(sequential, state, mask), actions)
+
+
+def test_roundtrip_with_excluded_action_only_dimension():
+    state = torch.tensor([[10.0, 20.0]])
+    actions = torch.tensor([[[11.0, 21.0, 0.5], [13.0, 24.0, 0.75]]])
+    mask = [True, True, False]
+
+    relative = to_relative_actions(actions, state, mask)
+    torch.testing.assert_close(to_absolute_actions(relative, state, mask), actions)
+    sequential = to_sequential_actions(actions, state, mask)
+    torch.testing.assert_close(from_sequential_actions(sequential, state, mask), actions)
+    torch.testing.assert_close(relative[..., 2], actions[..., 2])
+    torch.testing.assert_close(sequential[..., 2], actions[..., 2])
+
+
+def test_relative_action_rejects_unmatched_relative_dimension():
+    with pytest.raises(ValueError, match="state width"):
+        to_relative_actions(
+            torch.zeros(1, 3),
+            torch.zeros(1, 2),
+            [True, True, True],
+        )
+
+
+def test_sequential_streaming_integration_reanchors():
+    relative = RelativeActionsProcessorStep(enabled=True, mode="sequential")
+    absolute = AbsoluteActionsProcessorStep(enabled=True, relative_step=relative)
+    first_state = torch.tensor([[10.0, 20.0]])
+    relative(create_transition(observation={OBS_STATE: first_state}))
+    first = absolute(create_transition(action=torch.tensor([[1.0, 2.0]])))[TransitionKey.ACTION]
+    second = absolute(create_transition(action=torch.tensor([[3.0, 4.0]])))[TransitionKey.ACTION]
+    torch.testing.assert_close(first, torch.tensor([[11.0, 22.0]]))
+    torch.testing.assert_close(second, torch.tensor([[14.0, 26.0]]))
+
+    relative(create_transition(observation={OBS_STATE: torch.tensor([[100.0, 200.0]])}))
+    reanchored = absolute(create_transition(action=torch.tensor([[1.0, 2.0]])))[TransitionKey.ACTION]
+    torch.testing.assert_close(reanchored, torch.tensor([[101.0, 202.0]]))
+
+
+def test_relative_action_mode_validation_and_name_alignment():
+    with pytest.raises(ValueError, match="Unknown relative action mode"):
+        RelativeActionsProcessorStep(mode="unknown")
+    with pytest.raises(ValueError, match="align"):
+        validate_relative_action_names(["shoulder", "wrist"], ["shoulder", "elbow"], [True, True])
+    validate_relative_action_names(["shoulder", "gripper"], ["shoulder", "finger"], [True, False])
 
 
 def test_stacked_state_anchors_on_the_current_frame(action_dim):
@@ -383,7 +440,7 @@ def test_cached_anchor_and_queue_binding_not_in_config():
     step(create_transition(observation={OBS_STATE: torch.tensor([[1.0, 2.0, 3.0, 4.0]])}))
     step.bind_action_queue(lambda: 0)
     assert step.get_cached_state() is not None
-    assert set(step.get_config()) == {"enabled", "exclude_joints", "action_names"}
+    assert set(step.get_config()) == {"enabled", "exclude_joints", "action_names", "mode"}
 
 
 # --------------------------------------------------------------------------------------

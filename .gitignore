@@ -165,6 +165,8 @@ wandb/
 # Data folders
 data/
 outputs/
+model_zoo/
+.train_home/
 
 # Translations
 *.mo

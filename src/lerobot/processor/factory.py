@@ -172,6 +172,24 @@ def make_default_pre_post_processors(
     compose `make_default_policy_processor_steps` themselves instead.
     """
     s = make_default_policy_processor_steps(config, dataset_stats, normalizer_device=normalizer_device)
+    if getattr(config, "use_relative_actions", False):
+        relative = RelativeActionsProcessorStep(
+            enabled=True,
+            exclude_joints=getattr(config, "relative_exclude_joints", []),
+            action_names=getattr(config, "action_feature_names", None),
+            mode=getattr(config, "relative_action_mode", "obs_t"),
+        )
+        absolute = AbsoluteActionsProcessorStep(enabled=True, relative_step=relative)
+        return make_policy_processor_pipelines(
+            input_steps=[
+                s.rename_observations,
+                s.add_batch_dim,
+                relative,
+                s.to_device,
+                s.normalize,
+            ],
+            output_steps=[s.unnormalize, absolute, s.to_cpu],
+        )
     return make_policy_processor_pipelines(
         input_steps=[s.rename_observations, s.add_batch_dim, s.to_device, s.normalize],
         output_steps=[s.unnormalize, s.to_cpu],

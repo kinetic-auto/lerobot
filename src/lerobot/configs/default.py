@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 from lerobot.transforms import ImageTransformsConfig
@@ -31,7 +32,7 @@ class DatasetConfig:
     # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
     # "dataset_index" into the returned item. The index mapping is made according to the order in which the
     # datasets are provided.
-    repo_id: str
+    repo_id: str = "local"
     # Hub repository type: "dataset" (default) or "bucket" for an HF Storage Bucket
     # (hf://buckets/). Whether a bucket needs streaming=true depends on the dataset's
     # storage format, so that is checked at load time in the dataset factory.
@@ -42,6 +43,8 @@ class DatasetConfig:
     episodes: list[int] | None = None
     # Episode indices to drop (e.g. corrupt or heterogeneous ones). Applied on top of `episodes`.
     exclude_episodes: list[int] | None = None
+    # Full observation feature keys to drop, e.g. "observation.images.chest".
+    exclude_features: list[str] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
@@ -55,13 +58,23 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # Train/validation/test episode split weights. Two values disable the test split.
+    split_ratio: list[float] | None = None
+    # Replace every sample's task string during training.
+    task_override: str | None = None
 
     def __post_init__(self) -> None:
+        if self.repo_id == "local" and self.root is None:
+            raise ValueError("dataset.root is required when dataset.repo_id is 'local'.")
         if self.repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {self.repo_type!r}")
         if self.eval_split != 0.0 and self.streaming:
             raise ValueError(
                 "eval_split requires map-style datasets and is not supported with dataset.streaming=true."
+            )
+        if self.split_ratio is not None and self.streaming:
+            raise ValueError(
+                "split_ratio requires map-style datasets and is not supported with dataset.streaming=true."
             )
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(
@@ -69,6 +82,31 @@ class DatasetConfig:
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
+        if self.split_ratio is not None:
+            if self.eval_split != 0.0:
+                raise ValueError("dataset.split_ratio and dataset.eval_split are mutually exclusive.")
+            if len(self.split_ratio) not in (2, 3):
+                raise ValueError("split_ratio must contain [train, val] or [train, val, test] weights.")
+            if any(weight < 0 for weight in self.split_ratio):
+                raise ValueError(f"split_ratio weights must be non-negative, got {self.split_ratio}.")
+            if not all(math.isfinite(weight) for weight in self.split_ratio):
+                raise ValueError(f"split_ratio weights must be finite, got {self.split_ratio}.")
+            if sum(self.split_ratio) == 0:
+                raise ValueError("split_ratio weights must not all be zero.")
+            if self.split_ratio[0] == 0:
+                raise ValueError("split_ratio train weight must be greater than zero.")
+        if self.exclude_features is not None:
+            if len(self.exclude_features) != len(set(self.exclude_features)):
+                raise ValueError("exclude_features must not contain duplicates.")
+            invalid_features = [
+                feature for feature in self.exclude_features if not feature.startswith("observation.")
+            ]
+            if invalid_features:
+                raise ValueError(
+                    f"exclude_features entries must start with 'observation.', got {invalid_features}."
+                )
+        if self.task_override == "":
+            raise ValueError("task_override must not be empty.")
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(
@@ -86,13 +124,19 @@ class DatasetConfig:
                 )
                 self.exclude_episodes = [episode for episode in self.exclude_episodes if episode >= 0]
 
+    @property
+    def has_validation_split(self) -> bool:
+        return self.eval_split > 0 or (
+            self.split_ratio is not None and len(self.split_ratio) > 1 and self.split_ratio[1] > 0
+        )
+
 
 @dataclass
 class WandBConfig:
     enable: bool = False
     # Set to true to disable saving an artifact despite training.save_checkpoint=True
-    disable_artifact: bool = False
-    project: str = "lerobot"
+    disable_artifact: bool = True
+    project: str | None = None
     entity: str | None = None
     notes: str | None = None
     run_id: str | None = None

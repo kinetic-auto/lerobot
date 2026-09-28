@@ -421,8 +421,13 @@ def test_actual_trainer_peft_ema_checkpoint_and_resume(tmp_path):
     loader_config = config(cfg, 4)
     loader_config.max_eval_samples = 3
     loaded_dataset = LeRobotDataset("test/so101", root=root)
-    _, eval_loader = make_dataloaders(
-        loader_config, loaded_dataset, loaded_dataset, 0, SimpleNamespace(device_type="cpu", dp_world_size=1)
+    _, eval_loader, _ = make_dataloaders(
+        loader_config,
+        loaded_dataset,
+        loaded_dataset,
+        None,
+        0,
+        SimpleNamespace(device_type="cpu", dp_world_size=1),
     )
     assert len(eval_loader.dataset) == 3
     assert [int(eval_loader.dataset[i]["frame_index"]) for i in range(3)] == [1, 2, 3]

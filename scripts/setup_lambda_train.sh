@@ -317,7 +317,7 @@ prepare_lambda_box() {
         sudo chown -R "${uid}:${gid}" model_zoo .train_home
     fi
 
-    tmux has-session -t train 2>/dev/null || tmux new-session -d -s train
+    tmux has-session -t train 2>/dev/null || sg docker -c 'tmux new-session -d -s train'
 
     build_flag=""
     [[ "${SKIP_BUILD}" != true ]] && build_flag="--build"

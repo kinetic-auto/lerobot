@@ -55,4 +55,10 @@ RUN python3 -m pip install -e ".[${LEROBOT_EXTRAS}]"
 RUN python3 -m pip install nvidia-npp-cu12
 ENV LD_LIBRARY_PATH=/usr/local/lib/python${PYTHON_VERSION}/dist-packages/nvidia/npp/lib:${LD_LIBRARY_PATH}
 
+# Passwd and group entries for compose HOST_UID/HOST_GID.
+ARG HOST_UID=1000
+ARG HOST_GID=1000
+RUN groupadd --gid ${HOST_GID} lerobot \
+    && useradd --uid ${HOST_UID} --gid ${HOST_GID} --no-create-home --shell /bin/bash lerobot
+
 CMD ["bash"]

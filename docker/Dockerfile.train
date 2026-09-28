@@ -51,4 +51,8 @@ COPY pyproject.toml setup.py README.md MANIFEST.in ./
 COPY src ./src
 RUN python3 -m pip install -e ".[${LEROBOT_EXTRAS}]"
 
+# torchcodec prerequires nvidia-npp-cu12
+RUN python3 -m pip install nvidia-npp-cu12
+ENV LD_LIBRARY_PATH=/usr/local/lib/python${PYTHON_VERSION}/dist-packages/nvidia/npp/lib:${LD_LIBRARY_PATH}
+
 CMD ["bash"]

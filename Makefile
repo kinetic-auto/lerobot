@@ -32,6 +32,9 @@ build-user:
 build-internal:
 	docker build -f docker/Dockerfile.internal -t lerobot-internal .
 
+build-train:
+	docker build -f docker/Dockerfile.train -t lerobot-train .
+
 test-end-to-end:
 	${MAKE} DEVICE=$(DEVICE) test-act-ete-train
 	${MAKE} DEVICE=$(DEVICE) test-act-ete-train-resume

@@ -1,0 +1,65 @@
+# GPU training compose for a rented box. Built from docker/Dockerfile.train.
+#
+# First run — create the writable host directories, otherwise Docker creates
+# them as root and the container (running as your uid) cannot write:
+#   mkdir -p model_zoo .train_home
+#
+#   docker compose -f docker/docker-compose.train.yml up --build
+#
+# Paths are as seen INSIDE the container. ${DATA_ROOT:-/var/tmp/lerobot} is
+# mounted at /data. A dataset at /var/tmp/lerobot/datasets/my-session is
+# --dataset.root=/data/datasets/my-session. The final path segment names
+# model_zoo/<name>/... so keep the dataset's own directory name.
+# Host src is bind-mounted over /lerobot/src (editable install).
+#
+# Optional env overrides:
+#   DATA_ROOT      — host tree mounted at /data (default: /var/tmp/lerobot)
+#   IMAGE_TAG      — tag for lerobot-train (default: latest)
+#   LEROBOT_EXTRAS — pip extras at build (default: training,dataset_viz)
+#   SHM_SIZE       — /dev/shm size; DataLoader workers need well above the
+#                    64MB Docker default (default: 16gb)
+#   HOST_UID / HOST_GID — uid:gid owning the output files (default: 1000:1000)
+#   CUDA_VISIBLE_DEVICES — restrict which GPUs the trainer sees
+#   WANDB_MODE     — offline by default so nothing is uploaded; set to "online"
+#                    with WANDB_API_KEY to stream metrics to wandb
+
+name: lerobot-train
+
+services:
+  train:
+    image: lerobot-train:${IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.train
+      args:
+        LEROBOT_EXTRAS: "${LEROBOT_EXTRAS:-training,dataset_viz}"
+    container_name: lerobot-train
+    working_dir: /lerobot
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    stdin_open: true
+    tty: true
+    command: bash
+    shm_size: ${SHM_SIZE:-16gb}
+    environment:
+      - HOME=/lerobot/.train_home
+      - HF_HOME=/lerobot/.train_home/huggingface
+      - HF_LEROBOT_HOME=/lerobot/.train_home/huggingface/lerobot
+      - TORCH_HOME=/lerobot/.train_home/torch
+      - TRITON_CACHE_DIR=/lerobot/.train_home/triton
+      - WANDB_MODE=${WANDB_MODE:-offline}
+      # Passed through only when set on the host. Assigning an empty value here
+      # would hide every GPU from torch instead of leaving the default.
+      - WANDB_API_KEY
+      - CUDA_VISIBLE_DEVICES
+    volumes:
+      - ${DATA_ROOT:-/var/tmp/lerobot}:/data
+      - ../model_zoo:/lerobot/model_zoo
+      - ../.train_home:/lerobot/.train_home
+      - ../src:/lerobot/src:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

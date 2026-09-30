@@ -41,7 +41,8 @@ def parse_urdf_joints(urdf_path: str | Path) -> list[UrdfJoint]:
     """
     root = ET.parse(urdf_path).getroot()  # nosec B314
     joints: list[UrdfJoint] = []
-    for element in root.iter():
+    # Only robot-level joints. Nested <joint> tags (ros2_control, gazebo) are not URDF joints.
+    for element in root:
         if _local_name(element.tag) != "joint":
             continue
         parent_link = _link_attribute(element, "parent")

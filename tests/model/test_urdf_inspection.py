@@ -78,3 +78,28 @@ def test_parse_order_chain_and_kinematics_only_copy(tmp_path):
         "tcp_joint",
         "finger",
     ]
+
+
+def test_parse_skips_nested_ros2_control_joints(tmp_path):
+    source = tmp_path / "nested.urdf"
+    source.write_text(
+        """<?xml version="1.0"?>
+<robot name="nested">
+  <link name="base_link"/>
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+  </joint>
+  <link name="link1"/>
+  <ros2_control name="hw" type="system">
+    <joint name="joint1">
+      <command_interface name="position"/>
+    </joint>
+  </ros2_control>
+</robot>
+"""
+    )
+    joints = parse_urdf_joints(source)
+    assert [joint.name for joint in joints] == ["joint1"]
+    assert joints[0].parent_link == "base_link"
+    assert joints[0].child_link == "link1"

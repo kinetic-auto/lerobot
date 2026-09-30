@@ -199,7 +199,7 @@ def convert_joints_to_cartesian(
     keys_to_convert = list(feature_layouts)
 
     # Resolve the URDF chain, joint map, and arm/gripper split.
-    dataset_joint_names = _union_joint_names(feature_layouts.values())
+    dataset_joint_names = _union_joint_names(list(feature_layouts.values()))
     urdf_joints = parse_urdf_joints(config.urdf)
     kinematic_chain_to_target_frame, joint_map, target_frame = _resolve_frame_and_map(
         urdf_joints, dataset_joint_names, config
@@ -259,6 +259,7 @@ def convert_joints_to_cartesian(
         for key in keys_to_convert:
             feature_layout = feature_layouts[key]
             q_key, q_layout = _resolve_q_feature(key, feature_layout, feature_layouts, position_layouts)
+            uses_sibling_positions = q_key is not None and q_key != key
             converted_vectors[key], converted_names[key] = _convert_joint_matrix(
                 matrices[key],
                 feature_layout,
@@ -266,8 +267,8 @@ def convert_joints_to_cartesian(
                 units,
                 config,
                 kinematic_chain_to_target_frame[0].parent_link,
-                q_matrix=None if q_key in {None, key} else matrices[q_key],
-                q_layout=None if q_key in {None, key} else q_layout,
+                q_matrix=matrices[q_key] if uses_sibling_positions and q_key is not None else None,
+                q_layout=q_layout if uses_sibling_positions else None,
             )
 
         # Evaluate the conversion.

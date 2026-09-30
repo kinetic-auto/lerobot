@@ -618,7 +618,7 @@ def test_remove_nonexistent_feature(sample_dataset, tmp_path):
 
 def test_remove_required_feature(sample_dataset, tmp_path):
     """Test error when trying to remove required features."""
-    with pytest.raises(ValueError, match="Cannot remove required features"):
+    with pytest.raises(ValueError, match="Cannot remove or replace required features"):
         remove_feature(
             sample_dataset,
             feature_names="timestamp",

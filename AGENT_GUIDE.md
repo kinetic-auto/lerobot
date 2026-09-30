@@ -229,6 +229,10 @@ Same grasp, approach vector, and timing. Coherent strategies are much easier to 
 
 See also: [What makes a good dataset](https://huggingface.co/blog/lerobot-datasets#what-makes-a-good-dataset).
 
+### 5.9 Dataset tools
+
+- Convert a joint-space recording to Cartesian end-effector channels with `lerobot-edit-dataset --operation.type joints_to_cartesian` (URDF frame, 6D rotation, gripper channels copied through). Convert only `action` and/or only pose with `--operation.feature_keys` and `--operation.convert_fields`. The source dataset is left unchanged. See [`docs/source/using_dataset_tools.mdx`](./docs/source/using_dataset_tools.mdx).
+
 ---
 
 ## 6. Which policy should I train?

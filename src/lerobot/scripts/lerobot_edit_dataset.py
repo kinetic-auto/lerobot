@@ -20,7 +20,8 @@ Edit LeRobot datasets using various transformation tools.
 Requires: pip install 'lerobot[dataset]'
 
 This script allows you to delete episodes, split datasets, merge datasets,
-remove features, modify tasks, recompute stats, and convert image datasets to video format.
+remove features, modify tasks, recompute stats, convert image datasets to video format,
+and convert joint-space datasets to Cartesian end-effector channels.
 When new_repo_id is specified, creates a new dataset.
 
 Path semantics (v2): --root and --new_root are exact dataset folders containing
@@ -107,6 +108,16 @@ Remove camera feature:
         --repo_id lerobot/pusht \
         --operation.type remove_feature \
         --operation.feature_names "['observation.image']"
+
+Convert joint positions and efforts to a Cartesian frame (writes a new dataset):
+    lerobot-edit-dataset \
+        --repo_id local \
+        --root /path/to/dataset \
+        --new_root /path/to/dataset_cartesian \
+        --operation.type joints_to_cartesian \
+        --operation.urdf /path/to/robot.urdf \
+        --operation.target_frame follower_r_hand_tcp \
+        --operation.interactive false
 
 Modify tasks - set a single task for all episodes (WARNING: modifies in-place):
     lerobot-edit-dataset \
@@ -266,6 +277,7 @@ from lerobot.datasets import (
     remove_feature,
     split_dataset,
 )
+from lerobot.datasets.cartesian_conversion import JointToCartesianConversionConfig
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.utils import init_logging
 
@@ -303,6 +315,12 @@ class MergeConfig(OperationConfig):
 @dataclass
 class RemoveFeatureConfig(OperationConfig):
     feature_names: list[str] | None = None
+
+
+@OperationConfig.register_subclass("joints_to_cartesian")
+@dataclass
+class JointsToCartesianConfig(JointToCartesianConversionConfig, OperationConfig):
+    pass
 
 
 @OperationConfig.register_subclass("modify_tasks")
@@ -562,6 +580,47 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_joints_to_cartesian(cfg: EditDatasetConfig) -> None:
+    from lerobot.utils.import_utils import require_package
+
+    require_package("placo", extra="kinematics")
+    if not isinstance(cfg.operation, JointsToCartesianConfig):
+        raise ValueError("Operation config must be JointsToCartesianConfig")
+    if not cfg.operation.urdf:
+        raise ValueError("urdf must be specified for joints_to_cartesian operation")
+
+    output_repo_id, input_path, output_path = _resolve_io_paths(
+        cfg.repo_id,
+        cfg.new_repo_id,
+        cfg.root,
+        cfg.new_root,
+    )
+    if _is_in_place(input_path, output_path):
+        raise ValueError(
+            "joints_to_cartesian writes a new dataset and refuses in-place edits. "
+            "Set --new_repo_id or --new_root to a different location."
+        )
+
+    from lerobot.datasets.cartesian_conversion import convert_joints_to_cartesian
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    logging.info("Converting %s to Cartesian coordinates at %s", cfg.repo_id, output_path)
+    new_dataset, report = convert_joints_to_cartesian(
+        dataset,
+        cfg.operation,
+        output_dir=output_path,
+        repo_id=output_repo_id,
+    )
+    logging.info("Cartesian dataset saved to %s", new_dataset.root)
+    logging.info("Frames: %s", new_dataset.meta.total_frames)
+    if report.ik_round_trip:
+        logging.info("IK max abs error (rad): %s", report.ik_round_trip["max_abs_error_rad"])
+
+    if cfg.push_to_hub:
+        logging.info("Pushing to hub as %s", output_repo_id)
+        new_dataset.push_to_hub()
 
 
 def handle_modify_tasks(cfg: EditDatasetConfig) -> None:
@@ -855,6 +914,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_merge(cfg)
     elif operation_type == "remove_feature":
         handle_remove_feature(cfg)
+    elif operation_type == "joints_to_cartesian":
+        handle_joints_to_cartesian(cfg)
     elif operation_type == "modify_tasks":
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":

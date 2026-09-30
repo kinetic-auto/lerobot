@@ -15,13 +15,14 @@ LeRobot provides several utilities for manipulating datasets:
 7. **Convert to Video** - Convert image-based datasets to video format for efficient storage (RGB and depth cameras are encoded with separate encoders)
 8. **Re-encode Videos** - Re-encode an existing video dataset's RGB and/or depth streams with new encoder settings
 9. **Show the Info of Datasets** - Show the summary of datasets information such as number of episode etc.
+10. **Joints to Cartesian** - Write a new dataset that expresses joint positions, velocities, and efforts at a URDF frame
 
 The core implementation is in `lerobot.datasets.dataset_tools`.
 An example script detailing how to use the tools API is available in `examples/dataset/use_dataset_tools.py`.
 
 ## Command-Line Tool: lerobot-edit-dataset
 
-`lerobot-edit-dataset` is a command-line script for editing datasets. It can be used to delete episodes, split datasets, merge datasets, add features, remove features, and convert image datasets to video format.
+`lerobot-edit-dataset` is a command-line script for editing datasets. It can be used to delete episodes, split datasets, merge datasets, add features, remove features, convert image datasets to video format, and convert joint-space recordings to Cartesian end-effector channels.
 
 Run `lerobot-edit-dataset --help` for more information on the configuration of each operation.
 
@@ -265,6 +266,67 @@ lerobot-edit-dataset \
 **Parameters:**
 
 - `parameters`: The flag to control show or no show dataset information with feature details.(default=false)
+
+#### Convert joint space to Cartesian space
+
+`joints_to_cartesian` writes a **new** dataset. The source is not modified. Packed `<joint>.<position|velocity|effort>` channels in `observation.state` and/or `action` are rewritten at one URDF frame:
+
+- positions become a translation (metres, URDF base frame) plus the first two columns of the rotation matrix
+- velocities, when present, become a twist
+- efforts become an end-effector wrench, with static gravity torques removed by default
+- joints that are not on the chain to that frame (typically the gripper) are copied through
+- fields you do not convert stay as the original joint channels (for example Cartesian pose with joint torques)
+
+`--operation.feature_keys` selects which of `observation.state` / `action` to rewrite (default: every one present). `--operation.convert_fields` selects `position`, `velocity`, and/or `effort` (default: every packed field on that feature). Pose, twist, and wrench still need joint positions for kinematics: on the feature being converted, or on the other of `observation.state` / `action` if that one still has them. A dataset with only actions, or with no position channels at all, is valid as long as the requested conversion does not need missing kinematics inputs.
+
+Requires `lerobot[kinematics]` (`placo`). URDFs whose meshes use `package://` paths are copied with `<visual>` and `<collision>` removed before load; that copy is stored at `meta/kinematics.urdf`.
+
+Interactive run (prompts for the frame and the joint map):
+
+```bash
+lerobot-edit-dataset \
+    --repo_id local \
+    --root /path/to/dataset \
+    --new_root /path/to/dataset-cartesian \
+    --operation.type joints_to_cartesian \
+    --operation.urdf /path/to/robot.urdf
+```
+
+Scripted run:
+
+```bash
+lerobot-edit-dataset \
+    --repo_id local \
+    --root /path/to/dataset \
+    --new_root /path/to/dataset-cartesian \
+    --operation.type joints_to_cartesian \
+    --operation.urdf /path/to/robot.urdf \
+    --operation.target_frame follower_r_hand_tcp \
+    --operation.joint_map '{"right_joint1": "follower_r_joint1", "right_joint2": "follower_r_joint2"}' \
+    --operation.interactive false
+```
+
+Action pose only, keeping joint torques:
+
+```bash
+lerobot-edit-dataset \
+    --repo_id local \
+    --root /path/to/dataset \
+    --new_root /path/to/dataset-cartesian \
+    --operation.type joints_to_cartesian \
+    --operation.urdf /path/to/robot.urdf \
+    --operation.target_frame follower_r_hand_tcp \
+    --operation.joint_map '{"right_joint1": "follower_r_joint1", "right_joint2": "follower_r_joint2"}' \
+    --operation.feature_keys "['action']" \
+    --operation.convert_fields "['position']" \
+    --operation.interactive false
+```
+
+Converted keys keep their names. Each converted field is one block: the end-effector channels, then the gripper channels (`ee_x.position` … `ee_r21.position`, `right_finger_joint1.position`, then a wrench or twist block when those fields were converted). Unconverted fields stay packed as `<joint>.<field>`. `meta/cartesian_conversion.json` records the URDF hash, frame, joint map, units, selected keys/fields, and an evaluation report (IK round-trip, trajectory jumps, wrench zero-check — skipped for fields that were not converted). Plots for the first episodes are written under `conversion_plots/` when `lerobot[dataset_viz]` is installed.
+
+Training and open-loop eval use the new dataset as-is. At inference, Cartesian actions still have to be turned back into joint commands with inverse kinematics.
+
+In-place output is refused. Pass `--new_root` or a different `--new_repo_id`.
 
 ### Push to Hub
 

@@ -323,18 +323,21 @@ def modify_features(
     dataset: LeRobotDataset,
     add_features: dict[str, tuple[np.ndarray | torch.Tensor | Callable, dict]] | None = None,
     remove_features: str | list[str] | None = None,
+    replace_features: dict[str, tuple[np.ndarray | torch.Tensor | Callable, dict]] | None = None,
     output_dir: str | Path | None = None,
     repo_id: str | None = None,
 ) -> LeRobotDataset:
-    """Modify a LeRobotDataset by adding and/or removing features in a single pass.
+    """Modify a LeRobotDataset by adding, removing, or replacing features in a single pass.
 
     This is the most efficient way to modify features, as it only copies the dataset once
-    regardless of how many features are being added or removed.
+    regardless of how many features are being added, removed, or replaced.
 
     Args:
         dataset: The source LeRobotDataset.
-        add_features: Optional dict mapping feature names to (feature_values, feature_info) tuples.
+        add_features: Optional dict mapping new feature names to (feature_values, feature_info) tuples.
         remove_features: Optional feature name(s) to remove. Can be a single string or list.
+        replace_features: Optional dict mapping existing feature names to replacement
+            (feature_values, feature_info) tuples. The name stays; the column and metadata change.
         output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
         repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
 
@@ -351,46 +354,60 @@ def modify_features(
             output_dir="./output",
         )
     """
-    if add_features is None and remove_features is None:
-        raise ValueError("Must specify at least one of add_features or remove_features")
+    if add_features is None and remove_features is None and replace_features is None:
+        raise ValueError("Must specify at least one of add_features, remove_features, or replace_features")
 
+    add_features = dict(add_features) if add_features else {}
+    replace_features = dict(replace_features) if replace_features else {}
     remove_features_list: list[str] = []
     if remove_features is not None:
         remove_features_list = [remove_features] if isinstance(remove_features, str) else remove_features
 
-    if add_features:
-        required_keys = {"dtype", "shape"}
-        for feature_name, (_, feature_info) in add_features.items():
-            if feature_name in dataset.meta.features:
-                raise ValueError(f"Feature '{feature_name}' already exists in dataset")
+    add_names = set(add_features)
+    replace_names = set(replace_features)
+    remove_names = set(remove_features_list)
+    overlap = (add_names & replace_names) | (add_names & remove_names) | (replace_names & remove_names)
+    if overlap:
+        raise ValueError(
+            "A feature cannot appear in more than one of add_features, replace_features, "
+            f"and remove_features: {sorted(overlap)}"
+        )
 
-            if not required_keys.issubset(feature_info.keys()):
-                raise ValueError(f"feature_info for '{feature_name}' must contain keys: {required_keys}")
+    required_keys = {"dtype", "shape"}
+    for feature_name, (_, feature_info) in add_features.items():
+        if feature_name in dataset.meta.features:
+            raise ValueError(f"Feature '{feature_name}' already exists in dataset")
+        if not required_keys.issubset(feature_info.keys()):
+            raise ValueError(f"feature_info for '{feature_name}' must contain keys: {required_keys}")
+
+    for feature_name, (_, feature_info) in replace_features.items():
+        if feature_name not in dataset.meta.features:
+            raise ValueError(f"Feature '{feature_name}' not found in dataset")
+        if not required_keys.issubset(feature_info.keys()):
+            raise ValueError(f"feature_info for '{feature_name}' must contain keys: {required_keys}")
 
     if remove_features_list:
         for name in remove_features_list:
             if name not in dataset.meta.features:
                 raise ValueError(f"Feature '{name}' not found in dataset")
 
-        required_features = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
-        if any(name in required_features for name in remove_features_list):
-            raise ValueError(f"Cannot remove required features: {required_features}")
+    required_features = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
+    drop_names = remove_features_list + list(replace_features)
+    if any(name in required_features for name in drop_names):
+        raise ValueError(f"Cannot remove or replace required features: {required_features}")
 
     if repo_id is None:
         repo_id = f"{dataset.repo_id}_modified"
     output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
 
     new_features = dataset.meta.features.copy()
+    for name in drop_names:
+        new_features.pop(name, None)
+    write_features = {**add_features, **replace_features}
+    for feature_name, (_, feature_info) in write_features.items():
+        new_features[feature_name] = feature_info
 
-    if remove_features_list:
-        for name in remove_features_list:
-            new_features.pop(name, None)
-
-    if add_features:
-        for feature_name, (_, feature_info) in add_features.items():
-            new_features[feature_name] = feature_info
-
-    video_keys_to_remove = [name for name in remove_features_list if name in dataset.meta.video_keys]
+    video_keys_to_remove = [name for name in drop_names if name in dataset.meta.video_keys]
     remaining_video_keys = [k for k in dataset.meta.video_keys if k not in video_keys_to_remove]
 
     new_meta = LeRobotDatasetMetadata.create(
@@ -405,8 +422,8 @@ def modify_features(
     _copy_data_with_feature_changes(
         dataset=dataset,
         new_meta=new_meta,
-        add_features=add_features,
-        remove_features=remove_features_list if remove_features_list else None,
+        add_features=write_features or None,
+        remove_features=drop_names or None,
     )
 
     if new_meta.video_keys:

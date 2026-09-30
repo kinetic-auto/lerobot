@@ -151,18 +151,27 @@ def get_feature_names(dataset: LeRobotDataset, key: str) -> list[str]:
     return [f"{key}_{d}" for d in range(dim)]
 
 
+_AXIS_SUFFIXES = frozenset({"x", "y", "z", "0", "1", "2", "3", "4", "5"})
+
+
+def _dimension_group_name(name: str) -> str:
+    if "." not in name:
+        return ""
+    prefix, suffix = name.rsplit(".", 1)
+    if suffix in _AXIS_SUFFIXES:
+        return prefix
+    return suffix
+
+
 def group_feature_dims(names: list[str]) -> list[tuple[str, list[int], list[str]]]:
-    """Split feature dimensions into groups by the trailing name suffix.
+    """Split feature dimensions by packed field or Cartesian quantity.
 
-    ``right_joint1.position`` lands in group ``position``. Names without a ``.``
-    stay in a single unnamed group so the original one-plot layout is preserved.
-
-    Returns a list of ``(group_name, indices, series_names)``.
+    Returns:
+        list[tuple[str, list[int], list[str]]]: Group name, indices, and series names.
     """
     groups: dict[str, list[int]] = {}
     for i, name in enumerate(names):
-        suffix = name.rsplit(".", 1)[-1] if "." in name else ""
-        groups.setdefault(suffix, []).append(i)
+        groups.setdefault(_dimension_group_name(name), []).append(i)
 
     ordered = [key for key in PREFERRED_SCALAR_GROUPS if key in groups]
     ordered.extend(key for key in groups if key not in ordered)

@@ -44,11 +44,12 @@ if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
 FIGURE_WIDTH_INCHES = 24.0
-FIGURE_BASE_HEIGHT_INCHES = 12.0
 FIGURE_STRIP_HEIGHT_INCHES = 2.2
+FIGURE_SIGNAL_ROW_HEIGHT_INCHES = 1.35
 NON_PLOTTABLE_DTYPES = ("video", "image")
 DEFAULT_FEATURE_KEYS = (OBS_STATE, ACTION)
 OBS_PLOT_GROUPS = ("position", "velocity", "effort")
+_AXIS_SUFFIXES = frozenset({"x", "y", "z", "0", "1", "2", "3", "4", "5"})
 _pyplot = None
 
 
@@ -192,10 +193,27 @@ def get_feature_names(dataset: LeRobotDataset, key: str) -> list[str]:
     return [f"{key}_{d}" for d in range(dim)]
 
 
+def _dimension_group_name(name: str) -> str:
+    if "." not in name:
+        return ""
+    prefix, suffix = name.rsplit(".", 1)
+    if suffix in _AXIS_SUFFIXES:
+        return prefix
+    return suffix
+
+
+def _series_plot_label(series_name: str, group_name: str) -> str:
+    if group_name and series_name.endswith("." + group_name):
+        return series_name[: -(len(group_name) + 1)]
+    if group_name and series_name.startswith(group_name + "."):
+        return series_name[len(group_name) + 1 :]
+    return series_name
+
+
 def group_feature_dims(
     names: list[str], plot_groups: list[str] | None = None
 ) -> list[tuple[str, list[int], list[str]]]:
-    """Split feature dimensions by trailing name suffix.
+    """Split feature dimensions by packed field or Cartesian quantity.
 
     Args:
         names (list[str]): Dimension names.
@@ -206,8 +224,7 @@ def group_feature_dims(
     """
     groups: dict[str, list[int]] = {}
     for i, name in enumerate(names):
-        suffix = name.rsplit(".", 1)[-1] if "." in name else ""
-        groups.setdefault(suffix, []).append(i)
+        groups.setdefault(_dimension_group_name(name), []).append(i)
     requested = list(OBS_PLOT_GROUPS if plot_groups is None else plot_groups)
     selected = [key for key in requested if key in groups]
     ordered = selected if selected else list(groups)
@@ -558,16 +575,22 @@ def draw_episode_overview(
     """
     plt = _import_pyplot()
     image_keys = list(keyframe_images)
-    figure_height = FIGURE_BASE_HEIGHT_INCHES + FIGURE_STRIP_HEIGHT_INCHES * max(len(image_keys) - 1, 0)
+    signal_rows = _collect_signal_rows(signal_names, feature_keys, obs_plot_groups)
+    n_signal_rows = max(len(signal_rows), 1)
+    figure_height = (
+        FIGURE_STRIP_HEIGHT_INCHES * max(len(image_keys), 1)
+        + FIGURE_SIGNAL_ROW_HEIGHT_INCHES * n_signal_rows
+        + 1.2
+    )
     figure = plt.figure(figsize=(FIGURE_WIDTH_INCHES, figure_height))
     outer_grid = figure.add_gridspec(
         len(image_keys) + 1,
         1,
-        height_ratios=[1.4] * len(image_keys) + [5.0],
-        hspace=0.12,
-        top=0.93,
-        bottom=0.06,
-        left=0.06,
+        height_ratios=[1.4] * len(image_keys) + [FIGURE_SIGNAL_ROW_HEIGHT_INCHES * n_signal_rows],
+        hspace=0.18,
+        top=0.95,
+        bottom=0.04,
+        left=0.05,
         right=0.98,
     )
 
@@ -580,28 +603,18 @@ def draw_episode_overview(
             image_key,
             show_titles=row == 0,
         )
-    signal_axes = draw_signal_axes(
+    draw_signal_axes(
         figure,
         outer_grid[-1],
         timestamps,
         signals,
-        signal_names,
-        feature_keys,
-        obs_plot_groups,
+        signal_rows,
         split_timestamps,
     )
 
     figure.suptitle(
         f"{repo_id}   episode {episode_index}   {len(timestamps)} frames, {timestamps[-1]:.1f}s",
         fontsize=14,
-    )
-    legend_labels = signal_axes[0].get_legend_handles_labels()[1]
-    signal_axes[0].legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.30),
-        ncol=max(len(legend_labels), 1),
-        fontsize=8,
-        frameon=False,
     )
     return figure
 
@@ -638,14 +651,24 @@ def draw_keyframe_strip(
             spine.set_color("0.4")
 
 
+def _collect_signal_rows(
+    signal_names: dict[str, list[str]],
+    feature_keys: list[str],
+    obs_plot_groups: list[str],
+) -> list[tuple[str, str, list[int], list[str]]]:
+    rows: list[tuple[str, str, list[int], list[str]]] = []
+    for key in feature_keys:
+        for group_name, dim_indices, series_names in group_feature_dims(signal_names[key], obs_plot_groups):
+            rows.append((key, group_name, dim_indices, series_names))
+    return rows
+
+
 def draw_signal_axes(
     figure: "Figure",
     grid_cell,
     timestamps: np.ndarray,
     signals: dict[str, np.ndarray],
-    signal_names: dict[str, list[str]],
-    feature_keys: list[str],
-    obs_plot_groups: list[str],
+    signal_rows: list[tuple[str, str, list[int], list[str]]],
     split_timestamps: np.ndarray,
 ) -> list["Axes"]:
     """Draw state-signal axes.
@@ -655,37 +678,31 @@ def draw_signal_axes(
         grid_cell: Gridspec cell.
         timestamps (np.ndarray): Frame timestamps.
         signals (dict[str, np.ndarray]): State signals.
-        signal_names (dict[str, list[str]]): Per-key dimension names.
-        feature_keys (list[str]): Feature keys.
-        obs_plot_groups (list[str]): Dimension groups to plot.
+        signal_rows (list[tuple[str, str, list[int], list[str]]]): Feature, group, indices, names.
         split_timestamps (np.ndarray): Split timestamps.
 
     Returns:
         list[Axes]: Signal axes.
     """
     plt = _import_pyplot()
-    signal_rows: list[tuple[str, str, list[int], list[str]]] = []
-    for key in feature_keys:
-        for group_name, dim_indices, series_names in group_feature_dims(signal_names[key], obs_plot_groups):
-            signal_rows.append((key, group_name, dim_indices, series_names))
-
-    signal_grid = grid_cell.subgridspec(len(signal_rows), 1, hspace=0.08)
+    signal_grid = grid_cell.subgridspec(len(signal_rows), 1, hspace=0.55)
     keyframe_timestamps = select_midpoint_timestamps(split_timestamps)
     axes: list[Axes] = []
     for row, (key, group_name, dim_indices, series_names) in enumerate(signal_rows):
         joint_colors = plt.get_cmap("tab10")(np.arange(len(series_names)) % 10)
         axis = figure.add_subplot(signal_grid[row, 0], sharex=axes[0] if axes else None)
         for joint_index, series_name in enumerate(series_names):
-            label = series_name.rsplit(".", 1)[0] if group_name else series_name
             axis.plot(
                 timestamps,
                 signals[key][:, dim_indices[joint_index]],
                 lw=1.0,
                 color=joint_colors[joint_index],
-                label=label if row == 0 else None,
+                label=_series_plot_label(series_name, group_name),
             )
         draw_interval_markers(axis, split_timestamps, keyframe_timestamps, annotate=row == 0)
-        axis.set_ylabel(f"{key}/{group_name}" if group_name else key, fontsize=9)
+        heading = f"{key} / {group_name}" if group_name else key
+        axis.set_title(heading, fontsize=9, loc="left", pad=4)
+        axis.legend(loc="upper right", fontsize=7, frameon=False, ncol=min(len(series_names), 8))
         axis.grid(True, alpha=0.3)
         axis.tick_params(labelsize=8)
         if row < len(signal_rows) - 1:

@@ -24,6 +24,11 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 from lerobot.datasets.cartesian_conversion import (
     JointSpaceLayout,
     JointToCartesianConversionConfig,
+    _contact_mask,
+    _contact_segments,
+    _force_magnitude_histogram,
+    _free_motion_mask,
+    _wrench_baseline,
     convert_joint_frame,
     convert_joints_to_cartesian,
     propose_joint_map,
@@ -33,6 +38,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.model.cartesian_quantities import (
     CartesianFrameSample,
     FramePoseRot6D,
+    FrameTwist,
     FrameWrench,
     GripperChannels,
 )
@@ -81,9 +87,9 @@ JOINT_MAP = {
 DATASET_JOINTS = ["right_joint1", "right_joint2", "right_finger_joint1"]
 POSE_NAMES = FramePoseRot6D.feature_names()
 WRENCH_NAMES = FrameWrench.feature_names()
-EXPECTED_NAMES = POSE_NAMES + ["right_finger_joint1.position"] + WRENCH_NAMES + ["right_finger_joint1.effort"]
+EXPECTED_NAMES = POSE_NAMES + ["gripper.position.x"] + WRENCH_NAMES
 POSE_KEEP_EFFORT_NAMES = (
-    POSE_NAMES + ["right_finger_joint1.position"] + packed_feature_names(DATASET_JOINTS, ["effort"])
+    POSE_NAMES + ["gripper.position.x"] + packed_feature_names(DATASET_JOINTS, ["effort"])
 )
 
 
@@ -98,6 +104,33 @@ def test_propose_joint_map_matches_suffix_and_rejects_unmatched():
 
 
 def test_pose_round_trip_and_sample_feature_names():
+    assert POSE_NAMES == [
+        "ee.position.x",
+        "ee.position.y",
+        "ee.position.z",
+        "ee.orientation.rot6d.0",
+        "ee.orientation.rot6d.1",
+        "ee.orientation.rot6d.2",
+        "ee.orientation.rot6d.3",
+        "ee.orientation.rot6d.4",
+        "ee.orientation.rot6d.5",
+    ]
+    assert FrameTwist.feature_names() == [
+        "ee.linear.x",
+        "ee.linear.y",
+        "ee.linear.z",
+        "ee.angular.x",
+        "ee.angular.y",
+        "ee.angular.z",
+    ]
+    assert WRENCH_NAMES == [
+        "ee.force.x",
+        "ee.force.y",
+        "ee.force.z",
+        "ee.torque.x",
+        "ee.torque.y",
+        "ee.torque.z",
+    ]
     rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
     pose = FramePoseRot6D(translation=np.array([1.0, 2.0, 3.0]), rotation=rotation)
     restored = FramePoseRot6D.from_vector(pose.to_vector())
@@ -107,14 +140,13 @@ def test_pose_round_trip_and_sample_feature_names():
     sample = CartesianFrameSample(
         quantities=(
             pose,
-            GripperChannels(("right_finger_joint1",), np.array([0.1]), "position"),
+            GripperChannels(("gripper.position.x",), np.array([0.1]), "position"),
             FrameWrench(force=np.array([1.0, 0.0, 0.0]), torque=np.zeros(3)),
-            GripperChannels(("right_finger_joint1",), np.array([0.2]), "effort"),
         ),
         fields=("position", "effort"),
     )
     assert sample.feature_names() == EXPECTED_NAMES
-    assert sample.to_vector().shape == (17,)
+    assert sample.to_vector().shape == (16,)
 
 
 def _write_urdf(directory: Path) -> Path:
@@ -214,7 +246,6 @@ def test_convert_joints_to_cartesian(tmp_path, empty_lerobot_dataset_factory):
         joint_map=JOINT_MAP,
         interactive=False,
         plot_episodes=0,
-        evaluation_stride=4,
     )
     converted, _report = convert_joints_to_cartesian(
         dataset,
@@ -240,8 +271,21 @@ def test_convert_joints_to_cartesian(tmp_path, empty_lerobot_dataset_factory):
     assert len(stats[ACTION]["mean"]) == len(EXPECTED_NAMES)
     episodes = pd.read_parquet(converted.root / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
     assert len(episodes["stats/observation.state/mean"].iloc[0]) == len(EXPECTED_NAMES)
-    rmse = provenance["evaluation"]["ik_round_trip"]["per_joint_rmse_rad"]
-    assert max(rmse.values()) < 0.01
+    assert "fk_residual" not in provenance["evaluation"]
+    ik_round_trip = provenance["evaluation"]["ik_round_trip"]
+    for key in (OBS_STATE, ACTION):
+        per_joint = ik_round_trip[key]["per_joint_abs_error_rad"]
+        assert per_joint
+        for summary in per_joint.values():
+            assert set(summary) >= {"mean", "median", "min", "max"}
+            assert summary["max"] < 0.01
+    wrench_stats = provenance["evaluation"]["wrench_stats"]
+    for key in (OBS_STATE, ACTION):
+        stats = wrench_stats[key]
+        regimes = stats["regimes"]
+        assert regimes["free"]["frames"] + regimes["contact"]["frames"] == 24
+        assert stats["baseline"]["frames"] > 0
+        assert sum(item["fraction"] for item in stats["force_histogram"]) == pytest.approx(1.0)
     reloaded = LeRobotDataset(converted.repo_id, root=converted.root)
     assert len(reloaded) == 24
     assert reloaded.meta.features[OBS_STATE]["names"] == EXPECTED_NAMES
@@ -254,7 +298,6 @@ def _conversion_config(tmp_path, **overrides):
         "joint_map": JOINT_MAP,
         "interactive": False,
         "plot_episodes": 0,
-        "evaluation_stride": 4,
     }
     config.update(overrides)
     return JointToCartesianConversionConfig(**config)
@@ -273,8 +316,10 @@ def test_convert_position_keeps_joint_effort(tmp_path, empty_lerobot_dataset_fac
         assert converted.meta.features[key]["names"] == POSE_KEEP_EFFORT_NAMES
     provenance = json.loads((converted.root / "meta" / "cartesian_conversion.json").read_text())
     assert provenance["convert_fields"] == ["position"]
-    assert provenance["evaluation"]["ik_round_trip"]["per_joint_rmse_rad"]
-    assert provenance["evaluation"]["wrench_zero_check"] == {}
+    for key in (OBS_STATE, ACTION):
+        per_joint = provenance["evaluation"]["ik_round_trip"][key]["per_joint_abs_error_rad"]
+        assert max(summary["max"] for summary in per_joint.values()) < 0.01
+    assert provenance["evaluation"]["wrench_stats"] == {}
 
 
 def test_convert_action_only_leaves_state(tmp_path, empty_lerobot_dataset_factory):
@@ -330,7 +375,7 @@ def test_convert_state_effort_uses_action_positions(tmp_path, empty_lerobot_data
         output_dir=tmp_path / "cartesian-effort-state",
         repo_id="local/cartesian-effort-state",
     )
-    assert converted.meta.features[OBS_STATE]["names"] == WRENCH_NAMES + ["right_finger_joint1.effort"]
+    assert converted.meta.features[OBS_STATE]["names"] == WRENCH_NAMES
     assert converted.meta.features[ACTION]["names"] == EXPECTED_NAMES
 
 
@@ -349,3 +394,108 @@ def test_interactive_false_without_frame_raises(tmp_path, empty_lerobot_dataset_
             output_dir=tmp_path / "cartesian",
             repo_id="local/cartesian",
         )
+
+
+def _contact_config(**overrides) -> JointToCartesianConversionConfig:
+    values = {
+        "interactive": False,
+        "plot_episodes": 0,
+        "evaluate": False,
+    }
+    values.update(overrides)
+    return JointToCartesianConversionConfig(**values)
+
+
+def test_gripper_open_side_rejects_invalid():
+    with pytest.raises(ValueError, match="gripper_open_side"):
+        JointToCartesianConversionConfig(gripper_open_side="left")
+
+
+def test_contact_mask_removes_short_runs_and_stays_in_episode():
+    force = np.zeros(18)
+    force[3:6] = 5.0
+    force[8] = 5.0
+    force[9] = 5.0
+    episode = np.repeat([0, 1], 9)
+    mask = _contact_mask(force, 1.0, 3, episode)
+    expected = np.zeros(18, dtype=bool)
+    expected[3:6] = True
+    np.testing.assert_array_equal(mask, expected)
+
+
+def test_contact_mask_fills_short_free_gaps():
+    force = np.array([5.0, 5.0, 5.0, 0.0, 5.0, 5.0, 5.0, 5.0])
+    episode = np.zeros(8, dtype=np.int64)
+    mask = _contact_mask(force, 1.0, 2, episode)
+    np.testing.assert_array_equal(mask, np.ones(8, dtype=bool))
+
+
+def test_free_motion_mask_picks_still_and_open_frames():
+    config = _contact_config(
+        free_motion_speed_threshold_m_s=0.02,
+        contact_min_frames=2,
+        gripper_open_side="max",
+        gripper_open_tolerance=0.1,
+    )
+    translation = np.zeros((10, 3))
+    translation[:, 0] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0]
+    gripper = np.ones(10)
+    episode = np.zeros(10, dtype=np.int64)
+    mask, source = _free_motion_mask(translation, gripper, episode, 10.0, config)
+    assert source == "still_and_open"
+    expected = np.array([True, True, True, True, True, True, False, False, False, True])
+    np.testing.assert_array_equal(mask, expected)
+
+
+def test_free_motion_mask_falls_back_to_episode_start():
+    config = _contact_config(
+        free_motion_speed_threshold_m_s=0.02,
+        contact_min_frames=2,
+        gripper_open_side="max",
+        gripper_open_tolerance=0.1,
+    )
+    translation = np.zeros((10, 3))
+    translation[:, 0] = np.arange(10, dtype=np.float64)
+    gripper = np.zeros(10)
+    episode = np.zeros(10, dtype=np.int64)
+    mask, source = _free_motion_mask(translation, gripper, episode, 10.0, config)
+    assert source == "episode_start"
+    np.testing.assert_array_equal(mask, np.array([True] * 6 + [False] * 4))
+
+
+def test_wrench_baseline_percentiles_on_known_array():
+    force = np.zeros((20, 3))
+    force[:, 0] = 4.0
+    torque = np.zeros((20, 3))
+    torque[:, 0] = 2.0
+    mask = np.ones(20, dtype=bool)
+    baseline = _wrench_baseline(force, torque, mask)
+    assert baseline["frames"] == 20
+    np.testing.assert_allclose(baseline["mean_force_vector_n"], [4.0, 0.0, 0.0])
+    assert baseline["force_median_n"] == pytest.approx(4.0)
+    assert baseline["force_p95_n"] == pytest.approx(4.0)
+    assert baseline["torque_median_nm"] == pytest.approx(2.0)
+    assert baseline["torque_p95_nm"] == pytest.approx(2.0)
+
+
+def test_contact_segments_counts_runs_and_seconds():
+    contact = np.array([False, False, True, True, True, False, True, True] + [False] * 8)
+    episode = np.repeat([0, 1], 8)
+    stats = _contact_segments(contact, episode, 10.0)
+    assert stats["total"] == 2
+    assert stats["with_contact"] == 1
+    assert stats["segments_total"] == 2
+    assert stats["segment_seconds"]["mean"] == pytest.approx(0.25)
+    assert stats["segments_per_episode"]["mean"] == pytest.approx(1.0)
+
+
+def test_force_magnitude_histogram_edges_and_fractions():
+    magnitude = np.array([0.0, 4.9, 5.0, 12.0, 25.0, 40.0, 80.0])
+    items = _force_magnitude_histogram(magnitude)
+    assert [item["range_n"] for item in items] == ["0-5", "5-10", "10-15", "15-20", "20-30", "30-50", ">50"]
+    assert sum(item["frames"] for item in items) == 7
+    assert sum(item["fraction"] for item in items) == pytest.approx(1.0)
+    by_range = {item["range_n"]: item["frames"] for item in items}
+    assert by_range["0-5"] == 2
+    assert by_range["5-10"] == 1
+    assert by_range[">50"] == 1

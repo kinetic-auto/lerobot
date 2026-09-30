@@ -35,6 +35,7 @@ from lerobot.model.cartesian_quantities import (
     FrameTwist,
     FrameWrench,
     GripperChannels,
+    gripper_position_channel_names,
 )
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.model.urdf_inspection import (
@@ -57,15 +58,9 @@ from .utils import DATA_DIR, DEFAULT_EPISODES_PATH
 _EE_NAME_HINTS = ("tcp", "hand", "ee", "wrist")
 _JOINT_ANGLE_UNITS = ("rad", "deg")
 _JACOBIAN_FRAME_REFERENCES = ("local", "world", "local_world_aligned")
-_MAX_STILL_JOINT_DELTA_RAD = 1e-2
+_GRIPPER_OPEN_SIDES = ("max", "min")
 _SINGULAR_JACOBIAN_COND_THRESHOLD = 1e3
-_MAX_IK_JOINT_ERROR_RAD = float(np.deg2rad(1.0))
-
-# Default IK uses a tiny orientation weight and 8 iterations, which leaves a joint
-# residual above the round-trip tolerance even when the pose came from those joints.
-_IK_POSITION_WEIGHT = 1.0
-_IK_ORIENTATION_WEIGHT = 1.0
-_IK_MAX_ITERS = 30
+_FORCE_HISTOGRAM_EDGES_N = (0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, float("inf"))
 
 _CONVERTIBLE_FEATURE_KEYS = (OBS_STATE, ACTION)
 _JOINT_FEATURE_KEYS = {OBS_STATE: "observation.joint_state", ACTION: "action.joints"}
@@ -87,10 +82,24 @@ class JointToCartesianConversionConfig:
     subtract_gravity: bool = True
     # Prompt for the frame and joint map when they are not set.
     interactive: bool = True
-    # Write the IK round-trip and trajectory report.
+    # Write the IK round-trip, EE pose frame-delta, and wrench stats.
     evaluate: bool = True
-    # Frames between IK round-trip samples.
+    # Sample every N frames for IK round-trip.
     evaluation_stride: int = 10
+    # placo IK frame-task weights and Newton steps.
+    ik_position_weight: float = 1.0
+    ik_orientation_weight: float = 1.0
+    ik_max_iters: int = 30
+    # Contact when |F| > factor * baseline_p95_force_n.
+    contact_threshold_factor: float = 1.5
+    # Hysteresis: a regime change needs this many consecutive frames.
+    contact_min_frames: int = 6
+    # EE slower than this counts as still when estimating the baseline.
+    free_motion_speed_threshold_m_s: float = 0.02
+    # Which end of the observed gripper range is the open jaw.
+    gripper_open_side: str = "max"
+    # Fraction of the gripper range around the open end that still counts as open.
+    gripper_open_tolerance: float = 0.1
     # Episodes of the new dataset to plot. Zero skips plotting.
     plot_episodes: int = 3
     # Also store the original joint vectors as observation.joint_state and action.joints.
@@ -99,6 +108,10 @@ class JointToCartesianConversionConfig:
     feature_keys: list[str] | None = None
     # position, velocity, and/or effort. Default: every packed field on that feature.
     convert_fields: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.gripper_open_side not in _GRIPPER_OPEN_SIDES:
+            raise ValueError(f"gripper_open_side must be one of {_GRIPPER_OPEN_SIDES}.")
 
 
 @dataclass
@@ -152,14 +165,14 @@ class JointSpaceLayout:
 @dataclass(frozen=True)
 class JointToCartesianConversionReport:
     ik_round_trip: dict[str, Any]
-    trajectory: dict[str, Any]
-    wrench_zero_check: dict[str, Any]
+    ee_pose_frame_delta: dict[str, Any]
+    wrench_stats: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ik_round_trip": self.ik_round_trip,
-            "trajectory": self.trajectory,
-            "wrench_zero_check": self.wrench_zero_check,
+            "ee_pose_frame_delta": self.ee_pose_frame_delta,
+            "wrench_stats": self.wrench_stats,
         }
 
 
@@ -241,7 +254,14 @@ def convert_joints_to_cartesian(
             raise ValueError(f"{key} and episode_index have different lengths.")
 
     units = config.joint_units
-    logging.info("Using joint units: %s", units)
+    first_layout = next(iter(feature_layouts.values()))
+    _log_section("Conversion")
+    logging.info("Target frame: %s", target_frame)
+    logging.info("Joint units: %s", units)
+    logging.info("Arm joints: %s", ", ".join(arm_joints))
+    if first_layout.gripper_joints:
+        logging.info("Gripper joints: %s", ", ".join(first_layout.gripper_joints))
+    logging.info("Joint map: %s", joint_map)
 
     # Convert the features and write the new dataset.
     with tempfile.TemporaryDirectory() as tmp:
@@ -260,6 +280,18 @@ def convert_joints_to_cartesian(
             feature_layout = feature_layouts[key]
             q_key, q_layout = _resolve_q_feature(key, feature_layout, feature_layouts, position_layouts)
             uses_sibling_positions = q_key is not None and q_key != key
+            convert_fields = feature_layout.resolve_convert_fields()
+            kept_fields = [
+                field_name for field_name in feature_layout.fields if field_name not in convert_fields
+            ]
+            logging.info(
+                "Converting %s fields %s%s",
+                key,
+                convert_fields,
+                f"; keeping joint {kept_fields}" if kept_fields else "",
+            )
+            if uses_sibling_positions:
+                logging.info("Using joint positions from %s", q_key)
             converted_vectors[key], converted_names[key] = _convert_joint_matrix(
                 matrices[key],
                 feature_layout,
@@ -269,10 +301,12 @@ def convert_joints_to_cartesian(
                 kinematic_chain_to_target_frame[0].parent_link,
                 q_matrix=matrices[q_key] if uses_sibling_positions and q_key is not None else None,
                 q_layout=q_layout if uses_sibling_positions else None,
+                feature_key=key,
             )
+            logging.info("%s output channels: %s", key, converted_names[key])
 
         # Evaluate the conversion.
-        report = JointToCartesianConversionReport(ik_round_trip={}, trajectory={}, wrench_zero_check={})
+        report = JointToCartesianConversionReport(ik_round_trip={}, ee_pose_frame_delta={}, wrench_stats={})
         if config.evaluate:
             report = evaluate_conversion(
                 kinematics,
@@ -283,10 +317,15 @@ def convert_joints_to_cartesian(
                 },
                 converted_vectors,
                 next(iter(feature_layouts.values())),
-                config.evaluation_stride,
+                stride=config.evaluation_stride,
                 episode_indices=episode_index,
                 jacobian_frame_reference=config.jacobian_frame_reference,
                 feature_layouts=feature_layouts,
+                ik_position_weight=config.ik_position_weight,
+                ik_orientation_weight=config.ik_orientation_weight,
+                ik_max_iters=config.ik_max_iters,
+                fps=float(dataset.meta.fps),
+                config=config,
             )
             _log_report(report)
 
@@ -321,6 +360,15 @@ def convert_joints_to_cartesian(
         report if config.evaluate else None,
     )
     _plot_episodes(new_dataset, config.plot_episodes)
+    _plot_contact_profiles(
+        converted_vectors,
+        converted_names,
+        report.wrench_stats,
+        episode_index,
+        float(dataset.meta.fps),
+        Path(new_dataset.root) / "conversion_plots",
+        config.plot_episodes,
+    )
     return new_dataset, report
 
 
@@ -339,10 +387,14 @@ def _validate_config(
         raise ValueError(
             f"jacobian_frame_reference must be one of {_JACOBIAN_FRAME_REFERENCES}, got {config.jacobian_frame_reference!r}."
         )
-    if config.evaluation_stride < 1:
-        raise ValueError("evaluation_stride must be >= 1.")
     if config.plot_episodes < 0:
         raise ValueError("plot_episodes must be >= 0.")
+    if config.evaluation_stride < 1:
+        raise ValueError("evaluation_stride must be >= 1.")
+    if config.ik_max_iters < 1:
+        raise ValueError("ik_max_iters must be >= 1.")
+    if config.ik_position_weight < 0 or config.ik_orientation_weight < 0:
+        raise ValueError("IK weights must be >= 0.")
     output = Path(output_dir)
     if output.exists():
         raise FileExistsError(f"Output dataset directory already exists: {output}")
@@ -709,13 +761,15 @@ def _convert_joint_matrix(
     base_frame: str,
     q_matrix: np.ndarray | None = None,
     q_layout: JointSpaceLayout | None = None,
+    feature_key: str = "",
 ) -> tuple[np.ndarray, list[str]]:
     convert_set = set(layout.resolve_convert_fields())
     names: list[str] | None = None
     vectors: list[np.ndarray] = []
 
     # Convert each packed joint row.
-    for index, row in enumerate(tqdm(matrix, desc="Converting joint frames")):
+    progress_desc = f"Converting {feature_key}" if feature_key else "Converting joint frames"
+    for index, row in enumerate(tqdm(matrix, desc=progress_desc)):
         q_row = None if q_matrix is None else q_matrix[index]
         sample = convert_joint_frame(
             kinematics,
@@ -724,8 +778,9 @@ def _convert_joint_matrix(
             _gather_optional_field(row, layout, "effort") if "effort" in convert_set else None,
             layout,
             gripper_by_field={
-                field_name: _gather_joint_values(row, layout, field_name, layout.gripper_joints)
-                for field_name in convert_set
+                "position": _gather_joint_values(row, layout, "position", layout.gripper_joints)
+                if "position" in layout.fields
+                else np.zeros(0, dtype=np.float64)
             },
             kept_by_field={
                 field_name: _gather_joint_values(row, layout, field_name, layout.joint_names)
@@ -830,7 +885,7 @@ def convert_joint_frame(
     subtract_gravity: bool = True,
     base_frame: str | None = None,
 ) -> CartesianFrameSample:
-    """Map one joint sample to pose, twist, wrench, and copied joint channels.
+    """Map one joint sample to pose, twist, wrench, and gripper positions.
 
     Args:
         kinematics (RobotKinematics): Chain kinematics.
@@ -879,7 +934,7 @@ def convert_joint_frame(
                 raise ValueError(f"Unconverted field {field_name!r} has no joint values to copy.")
             quantities.append(
                 GripperChannels(
-                    names=tuple(layout.joint_names),
+                    names=tuple(f"{joint}.{field_name}" for joint in layout.joint_names),
                     values=np.asarray(kept[field_name], dtype=np.float64),
                     entity_type=field_name,
                 )
@@ -908,13 +963,15 @@ def convert_joint_frame(
             quantities.append(FrameWrench(force=solved[:3], torque=solved[3:]))
         else:
             raise ValueError(f"Unsupported joint field {field_name!r}.")
-        passed = gripper_by_field.get(field_name, np.zeros(0))
+        if field_name != "position":
+            continue
+        passed = gripper_by_field.get("position", np.zeros(0))
         if passed.size:
             quantities.append(
                 GripperChannels(
-                    names=tuple(layout.gripper_joints),
+                    names=tuple(gripper_position_channel_names(len(layout.gripper_joints))),
                     values=np.asarray(passed, dtype=np.float64),
-                    entity_type=field_name,
+                    entity_type="position",
                 )
             )
     return CartesianFrameSample(quantities=tuple(quantities), fields=tuple(layout.fields))
@@ -991,20 +1048,24 @@ def evaluate_conversion(
     joint_space_features: dict[str, np.ndarray],
     cartesian_features: dict[str, np.ndarray],
     layout: JointSpaceLayout,
-    stride: int,
     *,
+    stride: int = 10,
     episode_indices: np.ndarray | None = None,
     jacobian_frame_reference: str = "local_world_aligned",
     feature_layouts: dict[str, JointSpaceLayout] | None = None,
+    ik_position_weight: float = 1.0,
+    ik_orientation_weight: float = 1.0,
+    ik_max_iters: int = 30,
+    fps: float = 30.0,
+    config: JointToCartesianConversionConfig | None = None,
 ) -> JointToCartesianConversionReport:
-    """Compare converted frames with an IK round-trip and trajectory checks.
+    """Report IK round-trip, EE pose frame-delta, and wrench contact stats.
 
     Args:
         kinematics (RobotKinematics): Chain kinematics.
         joint_space_features (dict[str, np.ndarray]): Original joint rows, radians.
         cartesian_features (dict[str, np.ndarray]): Converted rows.
-        layout (JointSpaceLayout): Layout used for trajectory checks.
-        stride (int): IK sample period.
+        layout (JointSpaceLayout): Layout used for EE pose frame-delta checks.
 
     Returns:
         JointToCartesianConversionReport: Evaluation summary.
@@ -1012,8 +1073,13 @@ def evaluate_conversion(
     per_feature = (
         feature_layouts if feature_layouts is not None else dict.fromkeys(joint_space_features, layout)
     )
+    if config is None:
+        config = JointToCartesianConversionConfig()
+    if episode_indices is None:
+        n_frames = len(next(iter(cartesian_features.values()))) if cartesian_features else 0
+        episode_indices = np.zeros(n_frames, dtype=np.int64)
 
-    # Evaluate IK round-trip and trajectory on converted pose features.
+    # Evaluate IK round-trip and EE pose frame-delta on converted pose features.
     pose_keys = [
         key
         for key, feature_layout in per_feature.items()
@@ -1023,64 +1089,60 @@ def evaluate_conversion(
         and "position" in feature_layout.fields
     ]
     if pose_keys:
-        errors, position_errors_mm = _compute_ik_errors(
+        ik_errors = _compute_ik_errors(
             kinematics,
             {key: joint_space_features[key] for key in pose_keys},
             {key: cartesian_features[key] for key in pose_keys},
             {key: per_feature[key] for key in pose_keys},
             stride,
+            ik_position_weight,
+            ik_orientation_weight,
+            ik_max_iters,
         )
-        error_array = np.stack(errors)
-        rmse = np.sqrt(np.mean(np.square(error_array), axis=0))
-        ik_round_trip = {
+        ik_round_trip: dict[str, Any] = {
             "stride": stride,
-            "per_joint_rmse_rad": {
-                name: float(value)
-                for name, value in zip(per_feature[pose_keys[0]].arm_joints, rmse, strict=True)
-            },
-            "max_abs_error_rad": float(np.max(np.abs(error_array))),
-            "fraction_above_1deg": float(
-                np.mean(np.any(np.abs(error_array) > _MAX_IK_JOINT_ERROR_RAD, axis=1))
-            ),
-            "fk_recheck_position_rmse_mm": float(np.sqrt(np.mean(np.square(position_errors_mm)))),
+            "position_weight": ik_position_weight,
+            "orientation_weight": ik_orientation_weight,
+            "max_iters": ik_max_iters,
         }
-        key = OBS_STATE if OBS_STATE in pose_keys else pose_keys[0]
-        feature_layout = per_feature[key]
-        if episode_indices is None:
-            episode_indices = np.zeros(len(cartesian_features[key]), dtype=np.int64)
-        trajectory = _compute_trajectory_report(
-            kinematics,
-            joint_space_features[key],
-            cartesian_features[key],
-            feature_layout,
-            episode_indices,
-            jacobian_frame_reference,
-        )
+        for key, errors in ik_errors.items():
+            ik_round_trip[key] = _summarize_ik_feature(errors, per_feature[key].arm_joints)
+        ee_pose_frame_delta = {
+            key: _compute_ee_pose_frame_deltas(
+                kinematics,
+                joint_space_features[key],
+                cartesian_features[key],
+                per_feature[key],
+                episode_indices,
+                jacobian_frame_reference,
+            )
+            for key in pose_keys
+        }
     else:
         ik_round_trip = {}
-        trajectory = {}
+        ee_pose_frame_delta = {}
 
-    # Evaluate wrench zero-check on converted effort features.
+    # Evaluate wrench stats on converted effort features.
     effort_keys = [
         key
         for key, feature_layout in per_feature.items()
         if key in cartesian_features
-        and key in joint_space_features
         and "effort" in feature_layout.resolve_convert_fields()
         and "effort" in feature_layout.fields
-        and "position" in feature_layout.fields
     ]
     if effort_keys:
-        key = OBS_STATE if OBS_STATE in effort_keys else effort_keys[0]
-        if episode_indices is None:
-            episode_indices = np.zeros(len(cartesian_features[key]), dtype=np.int64)
-        wrench_zero_check = _compute_wrench_zero_check(
-            joint_space_features[key], cartesian_features[key], per_feature[key], episode_indices
-        )
+        wrench_stats = {
+            key: _compute_wrench_stats(
+                cartesian_features[key], per_feature[key], episode_indices, fps, config
+            )
+            for key in effort_keys
+        }
     else:
-        wrench_zero_check = {}
+        wrench_stats = {}
     return JointToCartesianConversionReport(
-        ik_round_trip=ik_round_trip, trajectory=trajectory, wrench_zero_check=wrench_zero_check
+        ik_round_trip=ik_round_trip,
+        ee_pose_frame_delta=ee_pose_frame_delta,
+        wrench_stats=wrench_stats,
     )
 
 
@@ -1090,52 +1152,80 @@ def _compute_ik_errors(
     cartesian_features: dict[str, np.ndarray],
     feature_layouts: dict[str, JointSpaceLayout],
     stride: int,
-) -> tuple[list[np.ndarray], list[float]]:
-    errors: list[np.ndarray] = []
-    position_errors_mm: list[float] = []
+    position_weight: float,
+    orientation_weight: float,
+    max_iters: int,
+) -> dict[str, np.ndarray]:
+    per_feature: dict[str, np.ndarray] = {}
 
     # Solve IK from each converted pose and compare to the recorded joints.
     for key, joints in joint_space_features.items():
         feature_layout = feature_layouts[key]
         names = _list_converted_channel_names(feature_layout)
-        pose_slice = _slice_ee_channels(names, ".position", 9)
+        pose_slice = _slice_cartesian_channels(names, "position")
         arm_columns = [feature_layout.index[(name, "position")] for name in feature_layout.arm_joints]
         recorded = joints[:, arm_columns]
         cartesian = cartesian_features[key]
+        errors: list[np.ndarray] = []
         for frame in range(0, len(recorded), stride):
             seed = recorded[frame - 1] if frame > 0 else recorded[frame]
             target = _build_pose_matrix(cartesian[frame, pose_slice])
             solved_deg = kinematics.inverse_kinematics(
                 np.rad2deg(seed),
                 target,
-                position_weight=_IK_POSITION_WEIGHT,
-                orientation_weight=_IK_ORIENTATION_WEIGHT,
-                max_iters=_IK_MAX_ITERS,
+                position_weight=position_weight,
+                orientation_weight=orientation_weight,
+                max_iters=max_iters,
             )
             solved_rad = np.deg2rad(np.asarray(solved_deg[: len(arm_columns)], dtype=np.float64))
             errors.append(solved_rad - recorded[frame])
-            achieved = kinematics.forward_kinematics(solved_deg)
-            position_errors_mm.append(float(np.linalg.norm(achieved[:3, 3] - target[:3, 3]) * 1000.0))
-    if not errors:
+        if not errors:
+            raise ValueError(f"IK round-trip for {key} had no frames to evaluate.")
+        per_feature[key] = np.stack(errors)
+    if not per_feature:
         raise ValueError("IK round-trip had no frames to evaluate.")
-    return errors, position_errors_mm
+    return per_feature
+
+
+def _summarize_ik_feature(errors: np.ndarray, arm_joints: Sequence[str]) -> dict[str, Any]:
+    abs_errors = np.abs(errors)
+    return {
+        "frames": int(len(errors)),
+        "per_joint_abs_error_rad": {
+            name: _value_summary(abs_errors[:, index]) for index, name in enumerate(arm_joints)
+        },
+    }
+
+
+def _value_summary(values: np.ndarray) -> dict[str, float]:
+    # Mean, median, min, and max of a flattened error vector.
+    flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    if flat.size == 0:
+        return {"mean": 0.0, "median": 0.0, "min": 0.0, "max": 0.0}
+    return {
+        "mean": float(np.mean(flat)),
+        "median": float(np.median(flat)),
+        "min": float(np.min(flat)),
+        "max": float(np.max(flat)),
+    }
 
 
 def _list_converted_channel_names(layout: JointSpaceLayout) -> list[str]:
-    # Match convert_joint_frame block order: converted quantity then gripper, or original joints.
+    # Match convert_joint_frame block order: converted quantity, gripper.position after pose, or original joints.
     names: list[str] = []
     convert_set = set(layout.resolve_convert_fields())
     for field_name in layout.fields:
         if field_name in convert_set:
             names.extend(_list_cartesian_field_names(field_name))
-            names.extend(f"{joint}.{field_name}" for joint in layout.gripper_joints)
+            if field_name == "position":
+                names.extend(gripper_position_channel_names(len(layout.gripper_joints)))
         else:
             names.extend(f"{joint}.{field_name}" for joint in layout.joint_names)
     return names
 
 
 def _list_cartesian_field_names(field_name: str) -> list[str]:
-    # Return ee_ channel names for one converted field.
+    # Return Cartesian channel names for one converted field.
     if field_name == "position":
         return FramePoseRot6D.feature_names()
     if field_name == "velocity":
@@ -1145,12 +1235,17 @@ def _list_cartesian_field_names(field_name: str) -> list[str]:
     raise ValueError(f"Unsupported joint field {field_name!r}.")
 
 
-def _slice_ee_channels(names: list[str], suffix: str, count: int) -> slice:
-    # Slice consecutive ee_ channels that share a suffix.
-    indices = [index for index, name in enumerate(names) if name.startswith("ee_") and name.endswith(suffix)]
-    if len(indices) < count:
-        raise ValueError(f"Expected at least {count} '{suffix}' channels, found {len(indices)}.")
-    return slice(indices[0], indices[0] + count)
+def _slice_cartesian_channels(names: list[str], field_name: str) -> slice:
+    # Slice the converted Cartesian block for one field.
+    expected = _list_cartesian_field_names(field_name)
+    try:
+        start = names.index(expected[0])
+    except ValueError as exc:
+        raise ValueError(f"Missing Cartesian channel {expected[0]!r}.") from exc
+    got = names[start : start + len(expected)]
+    if got != expected:
+        raise ValueError(f"Expected Cartesian channels {expected}, found {got}.")
+    return slice(start, start + len(expected))
 
 
 def _build_pose_matrix(values: np.ndarray) -> np.ndarray:
@@ -1162,7 +1257,7 @@ def _build_pose_matrix(values: np.ndarray) -> np.ndarray:
     return transform
 
 
-def _compute_trajectory_report(
+def _compute_ee_pose_frame_deltas(
     kinematics: RobotKinematics,
     joints: np.ndarray,
     cartesian: np.ndarray,
@@ -1171,20 +1266,19 @@ def _compute_trajectory_report(
     jacobian_frame_reference: str,
 ) -> dict[str, Any]:
     names = _list_converted_channel_names(layout)
-    pose = cartesian[:, _slice_ee_channels(names, ".position", 9)]
+    pose = cartesian[:, _slice_cartesian_channels(names, "position")]
     translations = pose[:, :3]
     rotations = _extract_rotations_from_pose(pose)
 
-    # Measure the largest translation and rotation jump in each episode.
-    max_translation = 0.0
-    max_rotation = 0.0
+    # Measure EE pose change between consecutive frames in each episode.
+    position_deltas_m: list[float] = []
+    orientation_deltas_deg: list[float] = []
     for episode in np.unique(episode_indices):
         indices = np.flatnonzero(episode_indices == episode)
         if len(indices) < 2:
             continue
-        jumps = np.linalg.norm(np.diff(translations[indices], axis=0), axis=1)
-        max_translation = max(max_translation, float(jumps.max()))
-        max_rotation = max(max_rotation, _compute_max_rotation_jump_deg(rotations[indices]))
+        position_deltas_m.extend(np.linalg.norm(np.diff(translations[indices], axis=0), axis=1))
+        orientation_deltas_deg.extend(_compute_ee_orientation_delta_deg(rotations[indices]))
 
     # Count near-singular frames and frames outside joint limits.
     arm_columns = [layout.index[(name, "position")] for name in layout.arm_joints]
@@ -1199,8 +1293,8 @@ def _compute_trajectory_report(
         if _exceeds_joint_limits(position, limits):
             outside_limits += 1
     return {
-        "max_translation_jump_m": max_translation,
-        "max_rotation_jump_deg": max_rotation,
+        "ee_position_delta_m": _value_summary(np.asarray(position_deltas_m, dtype=np.float64)),
+        "ee_orientation_delta_deg": _value_summary(np.asarray(orientation_deltas_deg, dtype=np.float64)),
         "workspace_min_m": [float(value) for value in translations.min(axis=0)],
         "workspace_max_m": [float(value) for value in translations.max(axis=0)],
         "near_singular_frames": near_singular,
@@ -1219,12 +1313,12 @@ def _extract_rotations_from_pose(pose: np.ndarray) -> np.ndarray:
     return np.stack([column_0, column_1, column_2], axis=-1)
 
 
-def _compute_max_rotation_jump_deg(rotations: np.ndarray) -> float:
-    # Return the largest geodesic rotation between consecutive frames.
+def _compute_ee_orientation_delta_deg(rotations: np.ndarray) -> np.ndarray:
+    # Geodesic EE orientation change between consecutive frames.
     relative = np.einsum("nji,njk->nik", rotations[:-1], rotations[1:])
     traces = relative[:, 0, 0] + relative[:, 1, 1] + relative[:, 2, 2]
     cosines = np.clip((traces - 1.0) / 2.0, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cosines)).max())
+    return np.degrees(np.arccos(cosines))
 
 
 def _exceeds_joint_limits(position: np.ndarray, limits: list[np.ndarray]) -> bool:
@@ -1237,89 +1331,352 @@ def _exceeds_joint_limits(position: np.ndarray, limits: list[np.ndarray]) -> boo
     return False
 
 
-def _compute_wrench_zero_check(
-    joints: np.ndarray,
+def _compute_wrench_stats(
     cartesian: np.ndarray,
     layout: JointSpaceLayout,
-    episode_indices: np.ndarray,
+    episode_index: np.ndarray,
+    fps: float,
+    config: JointToCartesianConversionConfig,
 ) -> dict[str, Any]:
-    empty = {"frames": 0, "mean_force_n": 0.0, "mean_torque_nm": 0.0}
-    if "effort" not in layout.fields:
-        return empty
-
-    # Average wrench on still frames with an open gripper.
     names = _list_converted_channel_names(layout)
-    wrench = cartesian[:, _slice_ee_channels(names, ".effort", 6)]
-    arm_columns = [layout.index[(name, "position")] for name in layout.arm_joints]
-    recorded = joints[:, arm_columns]
-    still = _mask_still_frames(joints, recorded, layout, episode_indices)
-    gripper_open = _mask_open_gripper(joints, layout)
-    mask = still & gripper_open
-    count = int(np.count_nonzero(mask))
-    if count == 0:
-        return empty
+    wrench = cartesian[:, _slice_cartesian_channels(names, "effort")]
+    force = wrench[:, :3]
+    torque = wrench[:, 3:]
+    force_magnitude = np.linalg.norm(force, axis=1)
+    torque_magnitude = np.linalg.norm(torque, axis=1)
+
+    translation = None
+    pose_names = _list_cartesian_field_names("position")
+    if pose_names[0] in names:
+        translation = cartesian[:, _slice_cartesian_channels(names, "position")][:, :3]
+    gripper = None
+    if "gripper.position.x" in names:
+        gripper = cartesian[:, names.index("gripper.position.x")]
+
+    free_mask, source = _free_motion_mask(translation, gripper, episode_index, fps, config)
+    if int(np.count_nonzero(free_mask)) == 0:
+        free_mask = np.ones(len(force), dtype=bool)
+        source = "episode_start"
+    baseline = _wrench_baseline(force, torque, free_mask)
+    baseline["source"] = source
+    threshold = config.contact_threshold_factor * baseline["force_p95_n"]
+    contact = _contact_mask(force_magnitude, threshold, config.contact_min_frames, episode_index)
+    n_frames = int(len(force_magnitude))
+    regimes: dict[str, Any] = {}
+    for regime_name, mask in (("free", ~contact), ("contact", contact)):
+        count = int(np.count_nonzero(mask))
+        regimes[regime_name] = {
+            "frames": count,
+            "fraction": float(count / n_frames) if n_frames else 0.0,
+            "force": _value_summary(force_magnitude[mask]),
+            "torque": _value_summary(torque_magnitude[mask]),
+        }
     return {
-        "frames": count,
-        "mean_force_n": float(np.mean(np.linalg.norm(wrench[mask, :3], axis=1))),
-        "mean_torque_nm": float(np.mean(np.linalg.norm(wrench[mask, 3:], axis=1))),
+        "baseline": baseline,
+        "contact_threshold_n": float(threshold),
+        "contact_min_frames": int(config.contact_min_frames),
+        "regimes": regimes,
+        "episodes": _contact_segments(contact, episode_index, fps),
+        "force_histogram": _force_magnitude_histogram(force_magnitude),
     }
 
 
-def _mask_still_frames(
-    joints: np.ndarray,
-    recorded: np.ndarray,
-    layout: JointSpaceLayout,
-    episode_indices: np.ndarray,
+def _free_motion_mask(
+    translation: np.ndarray | None,
+    gripper: np.ndarray | None,
+    episode_index: np.ndarray,
+    fps: float,
+    config: JointToCartesianConversionConfig,
+) -> tuple[np.ndarray, str]:
+    n_frames = int(episode_index.size)
+    episodes = np.unique(episode_index)
+    if translation is None:
+        still = np.ones(n_frames, dtype=bool)
+    else:
+        still = np.zeros(n_frames, dtype=bool)
+        for episode in episodes:
+            indices = np.flatnonzero(episode_index == episode)
+            if indices.size == 1:
+                still[indices] = True
+                continue
+            speed = np.linalg.norm(np.diff(translation[indices], axis=0), axis=1) * fps
+            still[indices[1:]] = speed < config.free_motion_speed_threshold_m_s
+            still[indices[0]] = still[indices[1]]
+
+    if gripper is None:
+        opened = np.ones(n_frames, dtype=bool)
+    else:
+        values = np.asarray(gripper, dtype=np.float64).reshape(-1)
+        low = float(np.min(values))
+        high = float(np.max(values))
+        span = high - low
+        if span <= 0.0:
+            opened = np.ones(n_frames, dtype=bool)
+        else:
+            normalized = (values - low) / span
+            if config.gripper_open_side == "max":
+                opened = normalized >= 1.0 - config.gripper_open_tolerance
+            else:
+                opened = normalized <= config.gripper_open_tolerance
+
+    mask = still & opened
+    if int(np.count_nonzero(mask)) >= config.contact_min_frames:
+        return mask, "still_and_open"
+
+    fallback = np.zeros(n_frames, dtype=bool)
+    n_start = 3 * config.contact_min_frames
+    for episode in episodes:
+        indices = np.flatnonzero(episode_index == episode)
+        fallback[indices[:n_start]] = True
+    return fallback, "episode_start"
+
+
+def _wrench_baseline(force: np.ndarray, torque: np.ndarray, mask: np.ndarray) -> dict[str, Any]:
+    selected_force = force[mask]
+    selected_torque = torque[mask]
+    force_magnitude = np.linalg.norm(selected_force, axis=1)
+    torque_magnitude = np.linalg.norm(selected_torque, axis=1)
+    return {
+        "frames": int(np.count_nonzero(mask)),
+        "mean_force_vector_n": [float(value) for value in selected_force.mean(axis=0)],
+        "force_median_n": float(np.median(force_magnitude)),
+        "force_p95_n": float(np.percentile(force_magnitude, 95)),
+        "torque_median_nm": float(np.median(torque_magnitude)),
+        "torque_p95_nm": float(np.percentile(torque_magnitude, 95)),
+    }
+
+
+def _contact_mask(
+    force_magnitude: np.ndarray,
+    threshold: float,
+    min_frames: int,
+    episode_index: np.ndarray,
 ) -> np.ndarray:
-    # Use recorded velocity when present.
-    if "velocity" in layout.fields:
-        columns = [layout.index[(name, "velocity")] for name in layout.arm_joints]
-        return np.max(np.abs(joints[:, columns]), axis=1) <= _MAX_STILL_JOINT_DELTA_RAD
-
-    # Fall back to per-episode joint deltas.
-    still = np.zeros(len(recorded), dtype=bool)
-    for episode in np.unique(episode_indices):
-        indices = np.flatnonzero(episode_indices == episode)
-        if len(indices) < 2:
+    raw = np.asarray(force_magnitude, dtype=np.float64) > threshold
+    if min_frames <= 1:
+        return raw
+    result = raw.copy()
+    for episode in np.unique(episode_index):
+        indices = np.flatnonzero(episode_index == episode)
+        flags = result[indices]
+        if flags.size < min_frames:
             continue
-        delta = np.max(np.abs(np.diff(recorded[indices], axis=0)), axis=1)
-        still[indices[1:]] = delta <= _MAX_STILL_JOINT_DELTA_RAD
-    return still
+        starts, ends, values = _boolean_run_bounds(flags)
+        keep = flags.copy()
+        for start, end, value in zip(starts, ends, values, strict=True):
+            if value and (end - start) < min_frames:
+                keep[start:end] = False
+        starts, ends, values = _boolean_run_bounds(keep)
+        for start, end, value in zip(starts, ends, values, strict=True):
+            if (not value) and (end - start) < min_frames:
+                keep[start:end] = True
+        result[indices] = keep
+    return result
 
 
-def _mask_open_gripper(joints: np.ndarray, layout: JointSpaceLayout) -> np.ndarray:
-    # Treat values above the gripper midpoint as open.
-    if "position" not in layout.fields or not layout.gripper_joints:
-        return np.ones(len(joints), dtype=bool)
-    column = layout.index[(layout.gripper_joints[0], "position")]
-    gripper = joints[:, column]
-    if float(gripper.max() - gripper.min()) < 1e-6:
-        return np.ones(len(gripper), dtype=bool)
-    midpoint = float(gripper.min() + gripper.max()) / 2.0
-    return gripper >= midpoint
+def _boolean_run_bounds(flags: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if flags.size == 0:
+        empty = np.array([], dtype=np.int64)
+        return empty, empty, np.array([], dtype=bool)
+    change = np.diff(flags.astype(np.int8)) != 0
+    starts = np.concatenate(([0], np.flatnonzero(change) + 1))
+    ends = np.concatenate((starts[1:], [flags.size]))
+    return starts, ends, flags[starts]
+
+
+def _contact_segments(contact: np.ndarray, episode_index: np.ndarray, fps: float) -> dict[str, Any]:
+    fractions: list[float] = []
+    segments_per_episode: list[float] = []
+    segment_seconds: list[float] = []
+    with_contact = 0
+    unique_episodes = np.unique(episode_index)
+    duration = fps if fps > 0.0 else 1.0
+    for episode in unique_episodes:
+        indices = np.flatnonzero(episode_index == episode)
+        flags = contact[indices]
+        fractions.append(float(np.mean(flags)) if flags.size else 0.0)
+        starts, ends, values = _boolean_run_bounds(flags)
+        contact_runs = [(start, end) for start, end, value in zip(starts, ends, values, strict=True) if value]
+        segments_per_episode.append(float(len(contact_runs)))
+        if contact_runs:
+            with_contact += 1
+            segment_seconds.extend((end - start) / duration for start, end in contact_runs)
+    return {
+        "total": int(unique_episodes.size),
+        "with_contact": int(with_contact),
+        "contact_fraction": _value_summary(np.asarray(fractions, dtype=np.float64)),
+        "segments_per_episode": _value_summary(np.asarray(segments_per_episode, dtype=np.float64)),
+        "segments_total": int(sum(segments_per_episode)),
+        "segment_seconds": _value_summary(np.asarray(segment_seconds, dtype=np.float64)),
+    }
+
+
+def _force_magnitude_histogram(force_magnitude: np.ndarray) -> list[dict[str, Any]]:
+    edges = np.asarray(_FORCE_HISTOGRAM_EDGES_N, dtype=np.float64)
+    counts, _ = np.histogram(force_magnitude, bins=edges)
+    total = int(force_magnitude.size)
+    items: list[dict[str, Any]] = []
+    for index, count in enumerate(counts):
+        low = edges[index]
+        high = edges[index + 1]
+        range_n = f"{int(low)}-{int(high)}" if np.isfinite(high) else f">{int(low)}"
+        items.append(
+            {
+                "range_n": range_n,
+                "frames": int(count),
+                "fraction": float(count / total) if total else 0.0,
+            }
+        )
+    return items
 
 
 def _log_report(report: JointToCartesianConversionReport) -> None:
-    ik = report.ik_round_trip
+    if report.ik_round_trip:
+        solver = []
+        rows: list[list[str]] = []
+        for name, value in report.ik_round_trip.items():
+            if _is_value_summary(value) or not isinstance(value, dict):
+                solver.append(f"{name}={value}")
+                continue
+            frames = str(value.get("frames", ""))
+            for joint_name, summary in value.get("per_joint_abs_error_rad", {}).items():
+                if _is_value_summary(summary):
+                    rows.append([name, frames, joint_name, *_summary_cells(summary)])
+        _log_section("IK round-trip")
+        if solver:
+            logging.info("%s", "  ".join(solver))
+        _log_table(["feature", "frames", "metric", "mean", "median", "min", "max"], rows)
 
-    if ik:
-        logging.info("IK round-trip (stride=%s)", ik["stride"])
-        logging.info("  %-24s %s", "joint", "rmse_rad")
-        for name, value in ik["per_joint_rmse_rad"].items():
-            logging.info("  %-24s %.6g", name, value)
-        logging.info("  %-24s %.6g", "max_abs_error_rad", ik["max_abs_error_rad"])
-        logging.info("  %-24s %.6g", "fraction_above_1deg", ik["fraction_above_1deg"])
-        logging.info("  %-24s %.6g", "fk_recheck_position_rmse_mm", ik["fk_recheck_position_rmse_mm"])
+    if report.ee_pose_frame_delta:
+        rows = []
+        extras: list[str] = []
+        for name, value in report.ee_pose_frame_delta.items():
+            if not isinstance(value, dict):
+                continue
+            if _is_value_summary(value.get("ee_position_delta_m")):
+                rows.append([name, "ee_position_delta_m", *_summary_cells(value["ee_position_delta_m"])])
+            if _is_value_summary(value.get("ee_orientation_delta_deg")):
+                rows.append(
+                    [name, "ee_orientation_delta_deg", *_summary_cells(value["ee_orientation_delta_deg"])]
+                )
+            extras.append(
+                f"{name}  workspace_min_m={value.get('workspace_min_m')}  "
+                f"workspace_max_m={value.get('workspace_max_m')}  "
+                f"near_singular={value.get('near_singular_frames')}  "
+                f"outside_limits={value.get('frames_outside_joint_limits')}"
+            )
+        _log_section("EE pose delta between consecutive frames")
+        _log_table(["feature", "metric", "mean", "median", "min", "max"], rows)
+        for line in extras:
+            logging.info("%s", line)
 
-    if report.trajectory:
-        logging.info("Trajectory")
-        for name, value in report.trajectory.items():
-            logging.info("  %-24s %s", name, value)
+    if report.wrench_stats:
+        _log_section("Wrench stats")
+        for name, value in report.wrench_stats.items():
+            if not isinstance(value, dict):
+                continue
+            baseline = value.get("baseline", {})
+            mean_vector = baseline.get("mean_force_vector_n", [])
+            vector_text = " ".join(f"{item:.6g}" for item in mean_vector)
+            p95 = float(baseline.get("force_p95_n", 0.0))
+            threshold = float(value.get("contact_threshold_n", 0.0))
+            factor = threshold / p95 if p95 else 0.0
+            logging.info(
+                "baseline(source=%s, frames=%s): |F| median %.6g N, p95 %.6g N, "
+                "mean vector [%s] N; contact threshold %.6g N (%.4g x p95), min run %s frames",
+                baseline.get("source"),
+                baseline.get("frames"),
+                baseline.get("force_median_n", 0.0),
+                p95,
+                vector_text,
+                threshold,
+                factor,
+                value.get("contact_min_frames"),
+            )
+            rows = []
+            for regime_name in ("free", "contact"):
+                regime = value.get("regimes", {}).get(regime_name, {})
+                force_summary = regime.get("force", {})
+                torque_summary = regime.get("torque", {})
+                rows.append(
+                    [
+                        name,
+                        regime_name,
+                        str(regime.get("frames", "")),
+                        f"{regime.get('fraction', 0.0):.6g}",
+                        f"{force_summary.get('mean', 0.0):.6g}",
+                        f"{force_summary.get('median', 0.0):.6g}",
+                        f"{force_summary.get('max', 0.0):.6g}",
+                        f"{torque_summary.get('median', 0.0):.6g}",
+                    ]
+                )
+            _log_table(
+                [
+                    "feature",
+                    "regime",
+                    "frames",
+                    "fraction",
+                    "force_mean_n",
+                    "force_median_n",
+                    "force_max_n",
+                    "torque_median_nm",
+                ],
+                rows,
+            )
+            episodes = value.get("episodes", {})
+            contact_fraction = episodes.get("contact_fraction", {})
+            segments = episodes.get("segments_per_episode", {})
+            lengths = episodes.get("segment_seconds", {})
+            logging.info(
+                "episodes: %s/%s with contact; contact fraction mean %.6g (min %.6g, max %.6g); "
+                "segments per episode mean %.6g; segment length mean %.6g s (max %.6g s)",
+                episodes.get("with_contact"),
+                episodes.get("total"),
+                contact_fraction.get("mean", 0.0),
+                contact_fraction.get("min", 0.0),
+                contact_fraction.get("max", 0.0),
+                segments.get("mean", 0.0),
+                lengths.get("mean", 0.0),
+                lengths.get("max", 0.0),
+            )
+            histogram = " | ".join(
+                f"{item['range_n']} {100.0 * item['fraction']:.1f}%"
+                for item in value.get("force_histogram", [])
+            )
+            if histogram:
+                logging.info("|F| N: %s", histogram)
 
-    if report.wrench_zero_check:
-        logging.info("Wrench zero-check")
-        for name, value in report.wrench_zero_check.items():
-            logging.info("  %-24s %s", name, value)
+
+_LOG_SECTION_WIDTH = 72
+
+
+def _log_section(title: str) -> None:
+    bar = "=" * _LOG_SECTION_WIDTH
+    logging.info("%s", bar)
+    logging.info("%s", title.center(_LOG_SECTION_WIDTH))
+    logging.info("%s", bar)
+
+
+def _log_table(headers: list[str], rows: list[list[str]]) -> None:
+    if not rows:
+        return
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+    fmt = "  ".join([f"{{:<{widths[0]}}}"] + [f"{{:>{width}}}" for width in widths[1:]])
+    logging.info("%s", fmt.format(*headers))
+    logging.info("%s", "  ".join("-" * width for width in widths))
+    for row in rows:
+        logging.info("%s", fmt.format(*row))
+
+
+def _summary_cells(summary: Mapping[str, float]) -> list[str]:
+    return [f"{summary[name]:.6g}" for name in ("mean", "median", "min", "max")]
+
+
+def _is_value_summary(value: Any) -> bool:
+    return isinstance(value, dict) and set(value) >= {"mean", "median", "min", "max"}
 
 
 def _rewrite_episode_stats(
@@ -1382,7 +1739,7 @@ def _write_provenance(
     gripper_channels = []
     for names in channel_names.values():
         for name in names:
-            if not name.startswith("ee_") and name not in gripper_channels:
+            if name.startswith("gripper.") and name not in gripper_channels:
                 gripper_channels.append(name)
     payload = {
         "urdf": {"name": Path(config.urdf).name, "sha256": _sha256(config.urdf)},
@@ -1457,3 +1814,86 @@ def _plot_episodes(dataset: LeRobotDataset, plot_episodes: int) -> None:
             130,
             1e-4,
         )
+
+
+def _plot_contact_profiles(
+    cartesian_features: dict[str, np.ndarray],
+    channel_names: dict[str, list[str]],
+    wrench_stats: dict[str, Any],
+    episode_index: np.ndarray,
+    fps: float,
+    output_dir: str | Path,
+    plot_episodes: int,
+) -> None:
+    if plot_episodes <= 0 or not wrench_stats:
+        return
+    try:
+        from lerobot.scripts.lerobot_dataset_plot import _import_pyplot
+
+        plt = _import_pyplot()
+    except ImportError as exc:
+        logging.warning("Skipping contact plots: %s", exc)
+        return
+
+    feature_key = next(iter(wrench_stats))
+    if feature_key not in cartesian_features or feature_key not in channel_names:
+        return
+    cartesian = cartesian_features[feature_key]
+    names = channel_names[feature_key]
+    wrench = cartesian[:, _slice_cartesian_channels(names, "effort")]
+    force_magnitude = np.linalg.norm(wrench[:, :3], axis=1)
+    gripper = None
+    if "gripper.position.x" in names:
+        gripper = cartesian[:, names.index("gripper.position.x")]
+    stats = wrench_stats[feature_key]
+    threshold = float(stats.get("contact_threshold_n", 0.0))
+    min_frames = int(stats.get("contact_min_frames", 1))
+    p95 = float(stats.get("baseline", {}).get("force_p95_n", 0.0))
+    contact = _contact_mask(force_magnitude, threshold, min_frames, episode_index)
+    duration = fps if fps > 0.0 else 1.0
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    episodes = np.unique(episode_index)[:plot_episodes]
+    for episode in episodes:
+        indices = np.flatnonzero(episode_index == episode)
+        if indices.size == 0:
+            continue
+        time_s = np.arange(indices.size, dtype=np.float64) / duration
+        figure, axis = plt.subplots(figsize=(10, 4))
+        axis.plot(time_s, force_magnitude[indices], color="tab:blue", label="|F|")
+        axis.axhline(p95, color="tab:orange", linestyle="--", label="baseline p95")
+        axis.axhline(threshold, color="tab:red", linestyle="--", label="contact threshold")
+        starts, ends, values = _boolean_run_bounds(contact[indices])
+        labeled = False
+        for start, end, value in zip(starts, ends, values, strict=True):
+            if not value:
+                continue
+            axis.axvspan(
+                start / duration,
+                end / duration,
+                color="tab:red",
+                alpha=0.2,
+                label="contact" if not labeled else None,
+            )
+            labeled = True
+        axis.set_xlabel("time (s)")
+        axis.set_ylabel("|F| (N)")
+        axis.set_title(f"{feature_key} episode {int(episode)}")
+        if gripper is not None:
+            twin = axis.twinx()
+            values = np.asarray(gripper[indices], dtype=np.float64)
+            low = float(np.min(gripper))
+            high = float(np.max(gripper))
+            span = high - low
+            normalized = (values - low) / span if span > 0.0 else values
+            twin.plot(time_s, normalized, color="tab:green", label="gripper")
+            twin.set_ylabel("gripper (normalized)")
+            twin.set_ylim(-0.05, 1.05)
+            handles, labels = axis.get_legend_handles_labels()
+            extra_handles, extra_labels = twin.get_legend_handles_labels()
+            axis.legend(handles + extra_handles, labels + extra_labels, loc="upper right")
+        else:
+            axis.legend(loc="upper right")
+        figure.tight_layout()
+        figure.savefig(output / f"contact_episode_{int(episode)}.png")
+        plt.close(figure)

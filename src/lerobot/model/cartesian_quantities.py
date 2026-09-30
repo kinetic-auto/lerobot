@@ -36,7 +36,7 @@ class CartesianQuantity(ABC):
 
     @classmethod
     def feature_names(cls) -> list[str]:
-        return [f"{name}.{cls.entity_type}" for name in cls.channel_names]
+        return list(cls.channel_names)
 
 
 @dataclass(frozen=True, eq=False)
@@ -44,7 +44,17 @@ class FramePoseRot6D(CartesianQuantity):
     translation: np.ndarray
     rotation: np.ndarray
     entity_type: str = "position"
-    channel_names: Any = ("ee_x", "ee_y", "ee_z", "ee_r00", "ee_r10", "ee_r20", "ee_r01", "ee_r11", "ee_r21")
+    channel_names: Any = (
+        "ee.position.x",
+        "ee.position.y",
+        "ee.position.z",
+        "ee.orientation.rot6d.0",
+        "ee.orientation.rot6d.1",
+        "ee.orientation.rot6d.2",
+        "ee.orientation.rot6d.3",
+        "ee.orientation.rot6d.4",
+        "ee.orientation.rot6d.5",
+    )
 
     def to_vector(self) -> np.ndarray:
         rotation = np.asarray(self.rotation, dtype=np.float64)
@@ -90,7 +100,14 @@ class FrameTwist(CartesianQuantity):
     linear: np.ndarray
     angular: np.ndarray
     entity_type: str = "velocity"
-    channel_names: Any = ("ee_vx", "ee_vy", "ee_vz", "ee_wx", "ee_wy", "ee_wz")
+    channel_names: Any = (
+        "ee.linear.x",
+        "ee.linear.y",
+        "ee.linear.z",
+        "ee.angular.x",
+        "ee.angular.y",
+        "ee.angular.z",
+    )
 
     def to_vector(self) -> np.ndarray:
         return np.concatenate(
@@ -113,7 +130,14 @@ class FrameWrench(CartesianQuantity):
     force: np.ndarray
     torque: np.ndarray
     entity_type: str = "effort"
-    channel_names: Any = ("ee_fx", "ee_fy", "ee_fz", "ee_tx", "ee_ty", "ee_tz")
+    channel_names: Any = (
+        "ee.force.x",
+        "ee.force.y",
+        "ee.force.z",
+        "ee.torque.x",
+        "ee.torque.y",
+        "ee.torque.z",
+    )
 
     def to_vector(self) -> np.ndarray:
         return np.concatenate(
@@ -146,7 +170,18 @@ class GripperChannels(CartesianQuantity):
         raise ValueError("GripperChannels needs channel names; use the constructor.")
 
     def channel_feature_names(self) -> list[str]:
-        return [f"{name}.{self.entity_type}" for name in self.names]
+        return list(self.names)
+
+
+_GRIPPER_AXES = ("x", "y", "z")
+
+
+def gripper_position_channel_names(count: int) -> list[str]:
+    names: list[str] = []
+    for index in range(count):
+        axis = _GRIPPER_AXES[index] if index < len(_GRIPPER_AXES) else str(index)
+        names.append(f"gripper.position.{axis}")
+    return names
 
 
 @dataclass(frozen=True, eq=False)

@@ -274,7 +274,7 @@ lerobot-edit-dataset \
 - positions become a translation (metres, URDF base frame) plus the first two columns of the rotation matrix
 - velocities, when present, become a twist
 - efforts become an end-effector wrench, with static gravity torques removed by default
-- joints that are not on the chain to that frame (typically the gripper) are copied through
+- gripper joint positions become `gripper.position.x` (then `y`, `z` for extra fingers); gripper velocity and effort are dropped
 - fields you do not convert stay as the original joint channels (for example Cartesian pose with joint torques)
 
 `--operation.feature_keys` selects which of `observation.state` / `action` to rewrite (default: every one present). `--operation.convert_fields` selects `position`, `velocity`, and/or `effort` (default: every packed field on that feature). Pose, twist, and wrench still need joint positions for kinematics: on the feature being converted, or on the other of `observation.state` / `action` if that one still has them. A dataset with only actions, or with no position channels at all, is valid as long as the requested conversion does not need missing kinematics inputs.
@@ -322,7 +322,7 @@ lerobot-edit-dataset \
     --operation.interactive false
 ```
 
-Converted keys keep their names. Each converted field is one block: the end-effector channels, then the gripper channels (`ee_x.position` … `ee_r21.position`, `right_finger_joint1.position`, then a wrench or twist block when those fields were converted). Unconverted fields stay packed as `<joint>.<field>`. `meta/cartesian_conversion.json` records the URDF hash, frame, joint map, units, selected keys/fields, and an evaluation report (IK round-trip, trajectory jumps, wrench zero-check — skipped for fields that were not converted). Plots for the first episodes are written under `conversion_plots/` when `lerobot[dataset_viz]` is installed.
+Converted keys keep their names. Each converted field is one block: `ee.position.*` and `ee.orientation.rot6d.*`, then `gripper.position.x` (position only), then `ee.linear.*` / `ee.angular.*` or `ee.force.*` / `ee.torque.*` when those fields were converted. Unconverted fields stay packed as `<joint>.<field>`. `meta/cartesian_conversion.json` records the URDF hash, frame, joint map, units, selected keys/fields, and an evaluation report per converted feature (IK round-trip, EE pose delta between consecutive frames, and a wrench report that splits frames into free motion vs contact — skipped for fields that were not converted). Free-motion frames (slow end-effector and open gripper) set a baseline; contact is `|F|` above `--operation.contact_threshold_factor` times that baseline p95, with `--operation.contact_min_frames` hysteresis. Also tune `--operation.free_motion_speed_threshold_m_s`, `--operation.gripper_open_side`, and `--operation.gripper_open_tolerance`. The baseline mean force vector is the gravity-model residual and should be near zero on a well-modelled arm. Tune IK with `--operation.ik_position_weight`, `--operation.ik_orientation_weight`, `--operation.ik_max_iters`, and `--operation.evaluation_stride`. Plots for the first episodes are written under `conversion_plots/` (`contact_episode_<i>.png` shades contact runs) when `lerobot[dataset_viz]` is installed.
 
 Training and open-loop eval use the new dataset as-is. At inference, Cartesian actions still have to be turned back into joint commands with inverse kinematics.
 

@@ -169,6 +169,10 @@ class TestOperationTypeParsing:
                 "['action']",
                 "--operation.convert_fields",
                 "['position']",
+                "--operation.ik_max_iters",
+                "50",
+                "--operation.evaluation_stride",
+                "5",
                 "--operation.interactive",
                 "false",
             ]
@@ -176,6 +180,8 @@ class TestOperationTypeParsing:
         assert isinstance(cfg.operation, JointsToCartesianConfig)
         assert cfg.operation.feature_keys == ["action"]
         assert cfg.operation.convert_fields == ["position"]
+        assert cfg.operation.ik_max_iters == 50
+        assert cfg.operation.evaluation_stride == 5
 
 
 class TestDepthEncoderParsing:

@@ -607,7 +607,7 @@ def handle_joints_to_cartesian(cfg: EditDatasetConfig) -> None:
 
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
     logging.info("Converting %s to Cartesian coordinates at %s", cfg.repo_id, output_path)
-    new_dataset, report = convert_joints_to_cartesian(
+    new_dataset, _report = convert_joints_to_cartesian(
         dataset,
         cfg.operation,
         output_dir=output_path,
@@ -615,8 +615,6 @@ def handle_joints_to_cartesian(cfg: EditDatasetConfig) -> None:
     )
     logging.info("Cartesian dataset saved to %s", new_dataset.root)
     logging.info("Frames: %s", new_dataset.meta.total_frames)
-    if report.ik_round_trip:
-        logging.info("IK max abs error (rad): %s", report.ik_round_trip["max_abs_error_rad"])
 
     if cfg.push_to_hub:
         logging.info("Pushing to hub as %s", output_repo_id)

@@ -76,6 +76,18 @@ def test_group_feature_dims_flat_names():
     assert groups == [("", [0, 1], ["joint_0", "joint_1"])]
 
 
+def test_group_feature_dims_cartesian_channels():
+    names = [
+        "ee.position.x",
+        "ee.position.y",
+        "ee.force.x",
+        "ee.force.y",
+        "gripper.position.x",
+    ]
+    groups = group_feature_dims(names)
+    assert [group[0] for group in groups] == ["ee.position", "ee.force", "gripper.position"]
+
+
 def test_scalar_entity_path():
     assert scalar_entity_path("action", "position") == "action/position"
     assert scalar_entity_path("state", "") == "state"

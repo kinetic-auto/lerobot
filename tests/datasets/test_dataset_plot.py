@@ -90,6 +90,33 @@ def test_group_feature_dims_fallback_when_groups_missing():
     assert [group[0] for group in groups] == [""]
 
 
+def test_group_feature_dims_cartesian_channels():
+    names = [
+        "ee.position.x",
+        "ee.position.y",
+        "ee.position.z",
+        "ee.orientation.rot6d.0",
+        "ee.orientation.rot6d.1",
+        "gripper.position.x",
+        "ee.force.x",
+        "ee.force.y",
+        "ee.force.z",
+        "ee.torque.x",
+        "ee.torque.y",
+        "ee.torque.z",
+    ]
+    groups = group_feature_dims(names)
+    assert [group[0] for group in groups] == [
+        "ee.position",
+        "ee.orientation.rot6d",
+        "gripper.position",
+        "ee.force",
+        "ee.torque",
+    ]
+    assert groups[0][2] == ["ee.position.x", "ee.position.y", "ee.position.z"]
+    assert groups[3][2] == ["ee.force.x", "ee.force.y", "ee.force.z"]
+
+
 def test_resolve_obs_plot_groups_default():
     assert resolve_obs_plot_groups(None) == list(OBS_PLOT_GROUPS)
     assert resolve_obs_plot_groups(["position"]) == ["position"]

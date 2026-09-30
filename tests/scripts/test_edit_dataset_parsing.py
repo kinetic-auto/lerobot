@@ -24,6 +24,7 @@ from lerobot.scripts.lerobot_edit_dataset import (
     DeleteEpisodesConfig,
     EditDatasetConfig,
     InfoConfig,
+    JointsToCartesianConfig,
     MergeConfig,
     ModifyTasksConfig,
     OperationConfig,
@@ -121,6 +122,66 @@ class TestOperationTypeParsing:
             "task_0": "pick cube",
             "task_1": "place cube",
         }
+
+    def test_joints_to_cartesian_parses(self):
+        cfg = parse_cfg(
+            [
+                "--repo_id",
+                "local",
+                "--new_root",
+                "/tmp/out",
+                "--operation.type",
+                "joints_to_cartesian",
+                "--operation.urdf",
+                "x.urdf",
+                "--operation.target_frame",
+                "follower_r_link_6",
+                "--operation.joint_map",
+                '{"right_joint1": "follower_r_joint1", "right_joint2": "follower_r_joint2"}',
+                "--operation.interactive",
+                "false",
+            ]
+        )
+        assert isinstance(cfg.operation, JointsToCartesianConfig)
+        assert cfg.operation.urdf == "x.urdf"
+        assert cfg.operation.target_frame == "follower_r_link_6"
+        assert cfg.operation.joint_map == {
+            "right_joint1": "follower_r_joint1",
+            "right_joint2": "follower_r_joint2",
+        }
+        assert cfg.operation.interactive is False
+        assert cfg.operation.feature_keys is None
+        assert cfg.operation.convert_fields is None
+        assert OperationConfig.get_choice_name(type(cfg.operation)) == "joints_to_cartesian"
+
+    def test_joints_to_cartesian_parses_subset(self):
+        cfg = parse_cfg(
+            [
+                "--repo_id",
+                "local",
+                "--new_root",
+                "/tmp/out",
+                "--operation.type",
+                "joints_to_cartesian",
+                "--operation.urdf",
+                "x.urdf",
+                "--operation.feature_keys",
+                "['action']",
+                "--operation.convert_fields",
+                "['position']",
+                "--operation.ik_max_iters",
+                "50",
+                "--operation.evaluation_stride",
+                "5",
+                "--operation.interactive",
+                "false",
+            ]
+        )
+        assert isinstance(cfg.operation, JointsToCartesianConfig)
+        assert cfg.operation.feature_keys == ["action"]
+        assert cfg.operation.convert_fields == ["position"]
+        assert cfg.operation.ik_max_iters == 50
+        assert cfg.operation.evaluation_stride == 5
 
 
 class TestDepthEncoderParsing:

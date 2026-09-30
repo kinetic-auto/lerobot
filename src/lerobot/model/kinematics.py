@@ -95,6 +95,51 @@ class RobotKinematics:
         # Get the transformation matrix
         return self.robot.get_T_world_frame(self.target_frame_name)
 
+    def frame_jacobian(
+        self,
+        joint_pos: np.ndarray,
+        reference: str = "local_world_aligned",
+        use_deg: bool = True,
+    ) -> np.ndarray:
+        """Geometric Jacobian of the target frame.
+
+        Args:
+            joint_pos (np.ndarray): Joint positions.
+            reference (str): Placo velocity reference.
+            use_deg (bool): Convert ``joint_pos`` from degrees to radians.
+
+        Returns:
+            np.ndarray: Shape (6, n), linear rows then angular rows.
+        """
+        # Convert joint positions from degrees to radians if needed.
+        joint_pos_rad = np.asarray(joint_pos, dtype=np.float64)[: len(self.joint_names)]
+        if use_deg:
+            joint_pos_rad = np.deg2rad(joint_pos_rad)
+
+        # Set joint positions in placo robot.
+        for index, joint_name in enumerate(self.joint_names):
+            self.robot.set_joint(joint_name, float(joint_pos_rad[index]))
+        self.robot.update_kinematics()
+
+        # Get the geometric Jacobian.
+        full_jacobian = np.asarray(
+            self.robot.frame_jacobian(self.target_frame_name, reference), dtype=np.float64
+        )
+        joint_columns = [int(self.robot.get_joint_v_offset(name)) for name in self.joint_names]
+
+        return full_jacobian[:, joint_columns]
+
+    def joint_limits(self, name: str) -> np.ndarray:
+        """URDF position limits for one joint.
+
+        Args:
+            name (str): Joint name.
+
+        Returns:
+            np.ndarray: Lower and upper limits.
+        """
+        return np.asarray(self.robot.get_joint_limits(name), dtype=np.float64)
+
     def inverse_kinematics(
         self,
         current_joint_pos: np.ndarray,

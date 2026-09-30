@@ -495,10 +495,54 @@ def test_modify_features_only_remove(sample_dataset, tmp_path):
 
 def test_modify_features_no_changes(sample_dataset, tmp_path):
     """Test error when modify_features is called with no changes."""
-    with pytest.raises(ValueError, match="Must specify at least one of add_features or remove_features"):
+    with pytest.raises(
+        ValueError, match="Must specify at least one of add_features, remove_features, or replace_features"
+    ):
         modify_features(
             sample_dataset,
             output_dir=tmp_path / "modified",
+        )
+
+
+def test_modify_features_replaces_existing_name(sample_dataset, tmp_path):
+    """replace_features overwrites an existing column and its metadata."""
+    new_values = np.arange(50 * 3, dtype=np.float32).reshape(50, 3)
+    feature_info = {"dtype": "float32", "shape": (3,), "names": ["a", "b", "c"]}
+
+    with (
+        patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.side_effect = lambda repo_id, **kwargs: str(kwargs.get("local_dir", tmp_path))
+        modified_dataset = modify_features(
+            sample_dataset,
+            replace_features={"observation.state": (new_values, feature_info)},
+            output_dir=tmp_path / "replaced",
+        )
+
+    assert modified_dataset.meta.features["observation.state"]["names"] == ["a", "b", "c"]
+    loaded = np.stack([np.asarray(value) for value in modified_dataset.hf_dataset["observation.state"]])
+    np.testing.assert_allclose(loaded, new_values)
+
+
+def test_modify_features_add_existing_raises(sample_dataset, tmp_path):
+    feature_info = {"dtype": "float32", "shape": (1,), "names": None}
+    with pytest.raises(ValueError, match="already exists"):
+        modify_features(
+            sample_dataset,
+            add_features={"observation.state": (np.zeros((50, 1), dtype=np.float32), feature_info)},
+            output_dir=tmp_path / "duplicate",
+        )
+
+
+def test_modify_features_replace_missing_raises(sample_dataset, tmp_path):
+    feature_info = {"dtype": "float32", "shape": (1,), "names": None}
+    with pytest.raises(ValueError, match="not found"):
+        modify_features(
+            sample_dataset,
+            replace_features={"reward": (np.zeros((50, 1), dtype=np.float32), feature_info)},
+            output_dir=tmp_path / "missing",
         )
 
 
@@ -574,7 +618,7 @@ def test_remove_nonexistent_feature(sample_dataset, tmp_path):
 
 def test_remove_required_feature(sample_dataset, tmp_path):
     """Test error when trying to remove required features."""
-    with pytest.raises(ValueError, match="Cannot remove required features"):
+    with pytest.raises(ValueError, match="Cannot remove or replace required features"):
         remove_feature(
             sample_dataset,
             feature_names="timestamp",

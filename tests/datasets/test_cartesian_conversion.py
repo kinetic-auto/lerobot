@@ -22,8 +22,8 @@ import pytest
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.datasets.cartesian_conversion import (
-    JointToCartesianConversionConfig,
     JointSpaceLayout,
+    JointToCartesianConversionConfig,
     convert_joint_frame,
     convert_joints_to_cartesian,
     propose_joint_map,

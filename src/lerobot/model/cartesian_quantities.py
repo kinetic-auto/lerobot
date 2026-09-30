@@ -57,7 +57,7 @@ class FramePoseRot6D(CartesianQuantity):
         if values.shape != (9,):
             raise ValueError(f"Pose vector must have 9 values, got shape {values.shape}.")
 
-        # Extract the translation 
+        # Extract the translation
         translation = values[:3]
 
         # Extract the rotation vector in 6D format

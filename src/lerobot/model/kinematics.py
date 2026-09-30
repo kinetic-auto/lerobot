@@ -122,9 +122,11 @@ class RobotKinematics:
         self.robot.update_kinematics()
 
         # Get the geometric Jacobian.
-        full_jacobian = np.asarray(self.robot.frame_jacobian(self.target_frame_name, reference), dtype=np.float64)
+        full_jacobian = np.asarray(
+            self.robot.frame_jacobian(self.target_frame_name, reference), dtype=np.float64
+        )
         joint_columns = [int(self.robot.get_joint_v_offset(name)) for name in self.joint_names]
-        
+
         return full_jacobian[:, joint_columns]
 
     def joint_limits(self, name: str) -> np.ndarray:

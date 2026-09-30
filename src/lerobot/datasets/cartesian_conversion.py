@@ -636,7 +636,7 @@ def _resolve_q_feature(
     # Use the feature being converted as the q source.
     if "position" in layout.fields:
         return key, layout
-    
+
     # Search a sibling feature for a full arm position block.
     for source_key, source_layout in {**feature_layouts, **position_layouts}.items():
         if "position" not in source_layout.fields:
@@ -1009,7 +1009,9 @@ def evaluate_conversion(
     Returns:
         JointToCartesianConversionReport: Evaluation summary.
     """
-    per_feature = feature_layouts if feature_layouts is not None else dict.fromkeys(joint_space_features, layout)
+    per_feature = (
+        feature_layouts if feature_layouts is not None else dict.fromkeys(joint_space_features, layout)
+    )
 
     # Evaluate IK round-trip and trajectory on converted pose features.
     pose_keys = [
@@ -1037,7 +1039,9 @@ def evaluate_conversion(
                 for name, value in zip(per_feature[pose_keys[0]].arm_joints, rmse, strict=True)
             },
             "max_abs_error_rad": float(np.max(np.abs(error_array))),
-            "fraction_above_1deg": float(np.mean(np.any(np.abs(error_array) > _MAX_IK_JOINT_ERROR_RAD, axis=1))),
+            "fraction_above_1deg": float(
+                np.mean(np.any(np.abs(error_array) > _MAX_IK_JOINT_ERROR_RAD, axis=1))
+            ),
             "fk_recheck_position_rmse_mm": float(np.sqrt(np.mean(np.square(position_errors_mm)))),
         }
         key = OBS_STATE if OBS_STATE in pose_keys else pose_keys[0]

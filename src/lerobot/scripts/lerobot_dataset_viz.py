@@ -39,7 +39,7 @@ local$ lerobot-dataset-viz \
     --root /path/to/car-door-opening-20260910 \
     --episode-index 0
 ```
-Opens the Rerun web viewer in a browser.
+Prints a browser link that opens this episode. A bare `http://127.0.0.1:9090` loads Rerun's example instead.
 
 - Visualize a Hub dataset:
 ```
@@ -109,6 +109,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_FOXGLOVE_PORT = 8765
 DEFAULT_RERUN_PORT = 9090
 PREFERRED_SCALAR_GROUPS = ("position", "velocity", "effort")
+
+
+def rerun_browser_url(web_port: int, grpc_connect_url: str, host: str = "127.0.0.1") -> str:
+    """Page that opens the web viewer already connected to this recording.
+
+    Rerun only applies ``connect_to`` when it launches a local browser. A bare
+    ``http://host:port/`` therefore shows Rerun's built-in example. The ``?url=``
+    query is what attaches the page to the gRPC server.
+    """
+    from urllib.parse import quote
+
+    connect_url = grpc_connect_url
+    if host != "127.0.0.1":
+        connect_url = grpc_connect_url.replace("127.0.0.1", host)
+    return f"http://{host}:{web_port}/?url={quote(connect_url, safe='')}"
 
 
 def infer_repo_id(repo_id: str | None, root: str | None) -> str:
@@ -552,9 +567,6 @@ def visualize_dataset(
     local_web_port = web_port if web_port is not None else DEFAULT_RERUN_PORT
     if serve_web:
         server_uri = rr.serve_grpc(grpc_port=grpc_port, server_memory_limit="2GiB")
-        if mode == "distant":
-            logging.info("Connect with: rerun rerun+http://IP:%s/proxy", grpc_port)
-            rr.serve_web_viewer(open_browser=False, web_port=local_web_port, connect_to=server_uri)
 
     logging.info("Logging to Rerun")
     if _can_stream_videos(dataset):
@@ -581,11 +593,14 @@ def visualize_dataset(
         rr.save(rrd_path)
         return rrd_path
 
-    if serve_web and mode == "local":
-        logging.info("Opening Rerun in the browser at http://127.0.0.1:%s", local_web_port)
-        rr.serve_web_viewer(open_browser=True, web_port=local_web_port, connect_to=server_uri)
-
     if serve_web:
+        browser_url = rerun_browser_url(local_web_port, server_uri)
+        rr.serve_web_viewer(open_browser=False, web_port=local_web_port, connect_to=server_uri)
+        print(f"Open in a browser: {browser_url}")
+        if mode == "local":
+            import webbrowser
+
+            webbrowser.open(browser_url)
         logging.info(
             "Logged episode %s. Viewer is open — press play in Rerun, Ctrl-C to exit.", episode_index
         )

@@ -24,11 +24,17 @@ import numpy as np
 from lerobot.scripts.lerobot_dataset_viz import (
     group_feature_dims,
     infer_repo_id,
+    rerun_browser_url,
     resolve_dataset_root,
     scalar_entity_path,
     select_video_frames,
     visualize_dataset,
 )
+
+
+def test_rerun_browser_url_opens_the_recording():
+    url = rerun_browser_url(9090, "rerun+http://127.0.0.1:9876/proxy")
+    assert url == "http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy"
 
 
 def test_infer_repo_id_from_root():

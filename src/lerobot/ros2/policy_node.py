@@ -363,15 +363,27 @@ class LerobotPolicyNode(Node):
         """Pack the latest images and joint values into a policy observation.
         """
         observation: Dict[str, np.ndarray] = {}
+        now = self.get_clock().now()
+        image_logs = []
 
         # Build the image observations
         for name, (height, width) in self._image_sizes.items():
-            payload, _received_at = self._images[name]
-            observation[f"observation.images.{name}"] = resize_image_with_pad(
+            payload, received_at = self._images[name]
+            image = resize_image_with_pad(
                 self._decode_compressed_image(name, payload),
                 height,
                 width,
             )
+            observation[f"observation.images.{name}"] = image
+            age = (now - received_at).nanoseconds / 1e9
+            image_logs.append(
+                f"{name} {len(payload)} jpeg bytes, age {age:.3f}s, "
+                f"shape {tuple(int(dim) for dim in image.shape)}"
+            )
+        self.get_logger().info(
+            "observation images " + "; ".join(image_logs),
+            throttle_duration_sec=5.0,
+        )
 
         # Build the joint state values
         joint_state_values = {}
@@ -379,9 +391,15 @@ class LerobotPolicyNode(Node):
             if joint_state_type not in ("position", "effort", "velocity"):
                 raise ValueError(f"unsupported state block {joint_state_type!r}")
             joint_state_values[joint_state_type] = self._joint_block_in_model_order(joint_state_type)
-        observation["observation.state"] = build_observation_state(
+        state = build_observation_state(
             joint_state_values,
             self._layout.state_types,
+        )
+        observation["observation.state"] = state
+        self.get_logger().info(
+            f"observation state {list(self._layout.state_types)}: "
+            f"{np.array2string(state, precision=3, floatmode='fixed')}",
+            throttle_duration_sec=5.0,
         )
 
         return observation

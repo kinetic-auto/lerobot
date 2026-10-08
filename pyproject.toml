@@ -382,6 +382,7 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-ros2-policy-node="lerobot.ros2.policy_node:main"
 
 # ---------------- Tool Configurations ----------------
 
@@ -470,6 +471,8 @@ ignore = [
 "src/lerobot/policies/**" = ["D"]
 "src/lerobot/processor/**" = ["D"]
 "src/lerobot/rewards/**" = ["D"]
+"src/lerobot/ros2/**" = ["D", "E302", "I001"]
+"tests/ros2/**" = ["E302"]
 "src/lerobot/rl/**" = ["D"]
 "src/lerobot/robots/**" = ["D"]
 "src/lerobot/rollout/**" = ["D"]

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import sys
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,6 +65,7 @@ class LoadedPolicy:
     layout: Any
     image_sizes: Dict[str, Tuple[int, int]]
     task: str
+    checkpoint_dir: str
 
 
 class LerobotPolicyNode(Node):
@@ -112,9 +114,11 @@ class LerobotPolicyNode(Node):
 
         camera_names = self._declare_string_list_parameter("camera_names", DEFAULT_CAMERA_NAMES)
         camera_topics = self._declare_string_list_parameter("camera_topics", DEFAULT_CAMERA_TOPICS)
-        self._subscribe_cameras(camera_names, camera_topics, CompressedImage, qos_profile_sensor_data)
+        camera_subscriptions = self._subscribe_cameras(
+            camera_names, camera_topics, CompressedImage, qos_profile_sensor_data
+        )
 
-        self.create_subscription(
+        joint_state_subscription = self.create_subscription(
             JointState,
             self._declare_text_parameter("joint_state_topic", "joint_states"),
             self._handle_joint_state_callback,
@@ -127,15 +131,35 @@ class LerobotPolicyNode(Node):
             self._declare_text_parameter("policy_action_topic", "policy_action"),
             reliable,
         )
-        self.create_service(Trigger, "~/reset", self._handle_reset_callback)
+        reset_service = self.create_service(Trigger, "~/reset", self._handle_reset_callback)
         self.create_timer(1.0 / control_frequency, self._handle_tick_callback)
 
-        # Logging
-        self.get_logger().info(f"joint names {list(self._layout.joint_names)}")
-        self.get_logger().info(f"image keys {list(self._image_sizes)}")
-
         action_steps = getattr(self._policy.config, "n_action_steps", "unset")
-        self.get_logger().info(f"n_action_steps {action_steps}")
+
+        # Logging
+        self.get_logger().info(
+            "Lerobot Policy Node initialized "
+            f"(Device={self._device}, Control frequency={control_frequency}, "
+            f"Action steps={action_steps}, Task={self._task!r}):"
+        )
+
+        self.get_logger().info(f"Loaded policy checkpoint: {ckpt_policy.checkpoint_dir}")
+        self.get_logger().info(f"Robot joint prefix: {self._robot_prefix}")
+        self.get_logger().info(f"Model joint prefix: {self._model_prefix}")
+        self.get_logger().info(f"Checkpoint joint names: {list(self._layout.joint_names)}")
+        self.get_logger().info(f"Action types: {list(self._layout.action_types)}")
+        image_sizes = ", ".join(
+            f"{name} {height}x{width}" for name, (height, width) in self._image_sizes.items()
+        )
+        self.get_logger().info(f"Checkpoint image sizes: {image_sizes}")
+
+        for subscription in camera_subscriptions:
+            self.get_logger().info(f"Subscribed to camera topic: {subscription.topic_name}")
+        self.get_logger().info(f"Subscribed to joint state topic: {joint_state_subscription.topic_name}")
+        self.get_logger().info(f"Publishing on action topic: {self._action_publisher.topic_name}")
+
+        self.get_logger().info(f"Reset service: {reset_service.srv_name}")
+        self.get_logger().info(f"Tick rate: {control_frequency} Hz")
 
     def _declare_required_text_parameter(self, name: str) -> str:
         """Declare a text parameter that must be set.
@@ -216,7 +240,15 @@ class LerobotPolicyNode(Node):
         # Get the task description
         task_description = task or str(metadata.get("task_description") or "")
 
-        return LoadedPolicy(policy, preprocessor, postprocessor, policy_io_layout, image_sizes, task_description)
+        return LoadedPolicy(
+            policy,
+            preprocessor,
+            postprocessor,
+            policy_io_layout,
+            image_sizes,
+            task_description,
+            ckpt_dir,
+        )
 
     def _validate_state_and_action_lengths(self, config: Any, layout: Any) -> None:
         """Reject a layout whose state or action length differs from the checkpoint.
@@ -272,7 +304,7 @@ class LerobotPolicyNode(Node):
         camera_topics: List[str],
         message_type: type,
         quality_of_service: Any,
-    ) -> None:
+    ) -> List[Any]:
         """Subscribe to each camera the checkpoint requires.
         """
         if len(camera_names) != len(camera_topics):
@@ -284,37 +316,59 @@ class LerobotPolicyNode(Node):
         for name in camera_names:
             if name not in self._image_sizes:
                 self.get_logger().info(
-                    f"camera {name} is not in the checkpoint input features; ignoring it"
+                    f"Camera {name} is not in the checkpoint input features; ignoring it"
                 )
         missing = [name for name in self._image_sizes if name not in topics]
         if missing:
             raise ValueError(
                 f"checkpoint cameras {missing} have no entry in camera_names/camera_topics"
             )
+        subscriptions = []
         for name in self._image_sizes:
-            self.create_subscription(
-                message_type,
-                topics[name],
-                lambda message, camera_name=name: self._handle_img_callback(camera_name, message),
-                quality_of_service,
+            subscriptions.append(
+                self.create_subscription(
+                    message_type,
+                    topics[name],
+                    lambda message, camera_name=name: self._handle_img_callback(camera_name, message),
+                    quality_of_service,
+                )
             )
+        return subscriptions
 
     def _handle_img_callback(self, name: str, message: CompressedImage) -> None:
         """Store the latest compressed frame for one camera.
         """
         self._images[name] = (bytes(message.data), self.get_clock().now())
+        self.get_logger().debug(f"Received frame from camera '{name}' ({len(message.data)} bytes)")
 
     def _handle_joint_state_callback(self, message: JointState) -> None:
         """Store the latest joint state.
         """
         self._joint_state = message
+        joint_names = [str(name) for name in message.name]
+        self.get_logger().debug(f"Received joint state ({len(joint_names)} joints)")
 
     def _handle_reset_callback(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        """Clear the policy action queue.
+        """Clear the policy, processors, and cached observations.
         """
-        self._policy.reset()
-        response.success = True
-        response.message = "policy reset"
+        try:
+            # Reset the node state
+            self._policy.reset()
+            self._preprocessor.reset()
+            self._postprocessor.reset()
+            self._images.clear()
+            self._decoded.clear()
+            self._joint_state = None
+
+            response.success = True
+            response.message = (
+                "Reset policy, preprocessor, postprocessor, images, decoded frames, and joint state"
+            )
+            self.get_logger().info(response.message)
+        except Exception as e:
+            response.success = False
+            response.message = f"Reset failed: {e}"
+            self.get_logger().error(f"{response.message}\n{traceback.format_exc()}")
         return response
 
     def _handle_tick_callback(self) -> None:
@@ -322,12 +376,13 @@ class LerobotPolicyNode(Node):
         """
         # Wait for the cameras
         if any(name not in self._images for name in self._image_sizes):
-            self.get_logger().info("waiting for cameras", throttle_duration_sec=5.0)
+            missing = [name for name in self._image_sizes if name not in self._images]
+            self.get_logger().info(f"Waiting for cameras: {missing}")
             return
 
         # Wait for the joint states
         if self._joint_state is None:
-            self.get_logger().info("waiting for joint_states", throttle_duration_sec=5.0)
+            self.get_logger().info("Waiting for joint states")
             return
 
         # Warn on stale cameras
@@ -335,17 +390,21 @@ class LerobotPolicyNode(Node):
 
         # Build the observation and predict the action
         try:
+            # Predict the action
             observation = self._build_observation()
             action = self._predict_action(observation)
+
+            # Log the observation and action
+            self._log_observation(observation)
+            self._log_action(action)
+
+            # Publish the policy action
+            self._publish_policy_action(action, self._joint_state.header.stamp)
         except Exception as e:
             self.get_logger().error(
-                f"failed to predict policy_action: {e}",
-                throttle_duration_sec=5.0,
+                f"Failed to predict or publish policy_action: {e}\n{traceback.format_exc()}"
             )
             return
-
-        # Publish the policy action
-        self._publish_policy_action(action, self._joint_state.header.stamp)
 
     def _warn_on_stale_cameras(self) -> None:
         """Log when a stored camera frame is older than the timeout.
@@ -354,36 +413,54 @@ class LerobotPolicyNode(Node):
         for name, (_payload, received_at) in self._images.items():
             elapsed_duration = (now - received_at).nanoseconds / 1e9
             if elapsed_duration > self._observation_timeout_seconds:
-                self.get_logger().warning(
-                    f"camera {name} is {elapsed_duration:.2f}s old",
-                    throttle_duration_sec=5.0,
-                )
+                self.get_logger().warning(f"Camera {name} is {elapsed_duration:.2f}s old")
+
+    def _log_observation(self, observation: Dict[str, np.ndarray]) -> None:
+        """Log the image summary and joint state used for one prediction.
+        """
+        now = self.get_clock().now()
+        
+        # Images
+        image_logs = []
+        for name in self._image_sizes:
+            payload, received_at = self._images[name]
+            image = observation[f"observation.images.{name}"]
+            elapsed_duration = (now - received_at).nanoseconds / 1e9
+            image_logs.append(
+                f"{name} {len(payload)} jpeg bytes, elapsed_duration {elapsed_duration:.3f}s, "
+                f"shape {tuple(int(dim) for dim in image.shape)}"
+            )
+        self.get_logger().info("Observation images " + "; ".join(image_logs))
+
+        # State
+        state = observation["observation.state"]
+        self.get_logger().info(
+            f"Observation state {list(self._layout.state_types)}: "
+            f"{np.array2string(state, precision=6, floatmode='fixed')}"
+        )
+
+    def _log_action(self, action: Any) -> None:
+        """Log the action vector from one prediction.
+        """
+        action_values = np.asarray(action.detach().cpu().numpy()).reshape(-1)
+        self.get_logger().info(
+            "Predicted action "
+            f"{np.array2string(action_values, precision=6, floatmode='fixed')}"
+        )
 
     def _build_observation(self) -> Dict[str, np.ndarray]:
         """Pack the latest images and joint values into a policy observation.
         """
         observation: Dict[str, np.ndarray] = {}
-        now = self.get_clock().now()
-        image_logs = []
 
         # Build the image observations
         for name, (height, width) in self._image_sizes.items():
-            payload, received_at = self._images[name]
-            image = resize_image_with_pad(
+            payload, _received_at = self._images[name]
+            observation[f"observation.images.{name}"] = resize_image_with_pad(
                 self._decode_compressed_image(name, payload),
                 height,
                 width,
             )
-            observation[f"observation.images.{name}"] = image
-            age = (now - received_at).nanoseconds / 1e9
-            image_logs.append(
-                f"{name} {len(payload)} jpeg bytes, age {age:.3f}s, "
-                f"shape {tuple(int(dim) for dim in image.shape)}"
-            )
-        self.get_logger().info(
-            "observation images " + "; ".join(image_logs),
-            throttle_duration_sec=5.0,
-        )
 
         # Build the joint state values
         joint_state_values = {}
@@ -391,15 +468,9 @@ class LerobotPolicyNode(Node):
             if joint_state_type not in ("position", "effort", "velocity"):
                 raise ValueError(f"unsupported state block {joint_state_type!r}")
             joint_state_values[joint_state_type] = self._joint_block_in_model_order(joint_state_type)
-        state = build_observation_state(
+        observation["observation.state"] = build_observation_state(
             joint_state_values,
             self._layout.state_types,
-        )
-        observation["observation.state"] = state
-        self.get_logger().info(
-            f"observation state {list(self._layout.state_types)}: "
-            f"{np.array2string(state, precision=3, floatmode='fixed')}",
-            throttle_duration_sec=5.0,
         )
 
         return observation

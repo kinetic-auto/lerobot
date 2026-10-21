@@ -23,6 +23,7 @@ from .fastwam.configuration_fastwam import FastWAMConfig as FastWAMConfig
 from .flux3.configuration_flux3 import Flux3Config as Flux3Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
+from .kinetic_act.configuration_kinetic_act import KineticACTConfig as KineticACTConfig
 from .lawam.configuration_lawam import LaWAMConfig as LaWAMConfig
 from .lingbot_va.configuration_lingbot_va import LingBotVAConfig as LingBotVAConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config as MolmoAct2Config
@@ -53,6 +54,7 @@ __all__ = [
     "GaussianActorConfig",
     "Evo1Config",
     "GrootConfig",
+    "KineticACTConfig",
     "LaWAMConfig",
     "LingBotVAConfig",
     "MolmoAct2Config",

@@ -21,7 +21,11 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACT
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
-from lerobot.policies.kinetic_act.configuration_kinetic_act import KineticACTConfig
+from lerobot.policies.kinetic_act.configuration_kinetic_act import (
+    MISSING_MASK_CELL_VALUE,
+    MISSING_STAGE_LABEL,
+    KineticACTConfig,
+)
 from lerobot.policies.kinetic_act.modeling_kinetic_act import KineticACT, KineticACTPolicy
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
@@ -252,6 +256,89 @@ def test_padded_steps_do_not_contribute_to_the_loss():
 
     torch.testing.assert_close(loss, altered_loss)
     assert loss_dict == altered_loss_dict
+
+
+def evaluate_loss_dict(policy: KineticACTPolicy, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+    with torch.no_grad():
+        _, loss_dict = policy(batch)
+    return loss_dict
+
+
+def test_missing_object_distance_is_left_out_like_padding():
+    policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
+    policy.eval()
+    batch = make_train_batch()
+    missing_batch = {key: value.clone() for key, value in batch.items()}
+    missing_batch[OBJECT_DISTANCE_LABEL_KEY][0, 3] = float("nan")
+    padded_batch = {key: value.clone() for key, value in batch.items()}
+    padded_batch[OBJECT_DISTANCE_LABEL_KEY][0, 3] = 5.0
+    padded_batch[f"{OBJECT_DISTANCE_LABEL_KEY}_is_pad"][0, 3] = True
+
+    missing_loss = evaluate_loss_dict(policy, missing_batch)["object_distance_l1_loss"]
+    padded_loss = evaluate_loss_dict(policy, padded_batch)["object_distance_l1_loss"]
+
+    assert missing_loss == pytest.approx(padded_loss)
+    assert torch.isfinite(torch.tensor(missing_loss))
+
+
+def test_missing_stage_is_left_out_like_padding():
+    policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
+    policy.eval()
+    batch = make_train_batch()
+    missing_batch = {key: value.clone() for key, value in batch.items()}
+    missing_batch[STAGE_LABEL_KEY][1, 2] = MISSING_STAGE_LABEL
+    padded_batch = {key: value.clone() for key, value in batch.items()}
+    padded_batch[f"{STAGE_LABEL_KEY}_is_pad"][1, 2] = True
+
+    missing_loss_dict = evaluate_loss_dict(policy, missing_batch)
+    padded_loss_dict = evaluate_loss_dict(policy, padded_batch)
+
+    assert missing_loss_dict["stage_cross_entropy_loss"] == pytest.approx(
+        padded_loss_dict["stage_cross_entropy_loss"]
+    )
+    assert missing_loss_dict["stage_accuracy"] == pytest.approx(padded_loss_dict["stage_accuracy"])
+
+
+def test_missing_object_mask_sample_is_left_out_of_the_mask_loss():
+    policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
+    policy.eval()
+    batch = make_train_batch(batch_size=2)
+    batch[OBJECT_MASK_LABEL_KEY][0] = MISSING_MASK_CELL_VALUE
+    only_valid_sample = {key: value[1:2].clone() for key, value in batch.items()}
+
+    loss_with_missing_sample = evaluate_loss_dict(policy, batch)["object_mask_binary_cross_entropy_loss"]
+    loss_of_valid_sample = evaluate_loss_dict(policy, only_valid_sample)[
+        "object_mask_binary_cross_entropy_loss"
+    ]
+
+    assert loss_with_missing_sample == pytest.approx(loss_of_valid_sample, abs=1e-5)
+
+
+def test_all_object_masks_missing_gives_zero_mask_loss():
+    policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
+    policy.eval()
+    batch = make_train_batch()
+    batch[OBJECT_MASK_LABEL_KEY][:] = MISSING_MASK_CELL_VALUE
+
+    loss_dict = evaluate_loss_dict(policy, batch)
+
+    assert loss_dict["object_mask_binary_cross_entropy_loss"] == 0.0
+
+
+def test_missing_labels_give_finite_gradients():
+    policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
+    policy.train()
+    batch = make_train_batch()
+    batch[OBJECT_DISTANCE_LABEL_KEY][0, :] = float("nan")
+    batch[STAGE_LABEL_KEY][1, :4] = MISSING_STAGE_LABEL
+    batch[OBJECT_MASK_LABEL_KEY][0] = MISSING_MASK_CELL_VALUE
+
+    loss, _ = policy(batch)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    gradients = [parameter.grad for parameter in policy.parameters() if parameter.grad is not None]
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 def test_single_channel_camera_only():

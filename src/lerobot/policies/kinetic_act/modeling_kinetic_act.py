@@ -26,7 +26,7 @@ from lerobot.policies.act.modeling_act import ACT, ACTPolicy, ACTTemporalEnsembl
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-from .configuration_kinetic_act import KineticACTConfig
+from .configuration_kinetic_act import MISSING_MASK_CELL_VALUE, KineticACTConfig
 
 
 class KineticACTPolicy(ACTPolicy):
@@ -161,9 +161,13 @@ class KineticACTPolicy(ACTPolicy):
         target_distance = (
             batch[object_distance_label_key].to(predicted_distance.dtype).reshape(predicted_distance.shape)
         )
-        absolute_error = F.l1_loss(input=predicted_distance, target=target_distance, reduction="none")
+        is_missing = torch.isnan(target_distance)
+        absolute_error = F.l1_loss(
+            input=predicted_distance, target=target_distance.nan_to_num(0.0), reduction="none"
+        )
 
-        return self._average_over_unpadded_steps(absolute_error, batch[f"{object_distance_label_key}_is_pad"])
+        is_excluded = batch[f"{object_distance_label_key}_is_pad"] | is_missing
+        return self._average_over_valid_steps(absolute_error, is_excluded)
 
     def _compute_stage_cross_entropy_loss(
         self, batch: dict[str, Tensor], auxiliary_outputs: dict[str, Tensor]
@@ -177,14 +181,14 @@ class KineticACTPolicy(ACTPolicy):
         Returns:
             Tensor: Cross-entropy loss.
         """
-        stage_label_key = self.config.stage_label_key
         stage_logits = auxiliary_outputs["stage_logits"]
         target_stage = self._get_stage_labels(batch, stage_logits)
         per_step_cross_entropy = F.cross_entropy(
-            stage_logits.flatten(0, 1), target_stage.flatten(), reduction="none"
+            stage_logits.flatten(0, 1), target_stage.clamp_min(0).flatten(), reduction="none"
         ).reshape(target_stage.shape)
 
-        return self._average_over_unpadded_steps(per_step_cross_entropy, batch[f"{stage_label_key}_is_pad"])
+        is_excluded = self._get_excluded_stage_steps(batch, target_stage)
+        return self._average_over_valid_steps(per_step_cross_entropy, is_excluded)
 
     @torch.no_grad()
     def _compute_stage_accuracy(
@@ -199,14 +203,12 @@ class KineticACTPolicy(ACTPolicy):
         Returns:
             float: Accuracy.
         """
-        stage_label_key = self.config.stage_label_key
         stage_logits = auxiliary_outputs["stage_logits"]
         target_stage = self._get_stage_labels(batch, stage_logits)
         is_prediction_correct = (stage_logits.argmax(dim=-1) == target_stage).float()
 
-        return self._average_over_unpadded_steps(
-            is_prediction_correct, batch[f"{stage_label_key}_is_pad"]
-        ).item()
+        is_excluded = self._get_excluded_stage_steps(batch, target_stage)
+        return self._average_over_valid_steps(is_prediction_correct, is_excluded).item()
 
     def _get_stage_labels(self, batch: dict[str, Tensor], stage_logits: Tensor) -> Tensor:
         """Get the stage labels as class indices.
@@ -219,6 +221,18 @@ class KineticACTPolicy(ACTPolicy):
             Tensor: Stage labels.
         """
         return batch[self.config.stage_label_key].reshape(stage_logits.shape[:2]).long()
+
+    def _get_excluded_stage_steps(self, batch: dict[str, Tensor], target_stage: Tensor) -> Tensor:
+        """Get the stage steps to leave out of the loss, the padded and the missing ones.
+
+        Args:
+            batch (dict[str, Tensor]): Training batch.
+            target_stage (Tensor): Stage labels.
+
+        Returns:
+            Tensor: Mask of the excluded steps.
+        """
+        return batch[f"{self.config.stage_label_key}_is_pad"] | (target_stage < 0)
 
     def _compute_object_mask_binary_cross_entropy_loss(
         self, batch: dict[str, Tensor], auxiliary_outputs: dict[str, Tensor]
@@ -233,30 +247,39 @@ class KineticACTPolicy(ACTPolicy):
             Tensor: Binary cross-entropy loss.
         """
         per_camera_losses = []
+        camera_has_valid_sample = []
         for mask_label_key in self.config.object_mask_label_key_per_camera.values():
             mask_logits = auxiliary_outputs[mask_label_key].float()
             positive_class_weight = mask_logits.new_tensor(self.config.object_mask_positive_class_weight)
+            mask_labels = batch[mask_label_key]
+            is_missing = (mask_labels == MISSING_MASK_CELL_VALUE).flatten(1).any(dim=1)
             target_mask = F.adaptive_avg_pool2d(
-                batch[mask_label_key].float().unsqueeze(1), mask_logits.shape[-2:]
+                mask_labels.masked_fill(is_missing[:, None, None], 0).float().unsqueeze(1),
+                mask_logits.shape[-2:],
             ).squeeze(1)
-            per_camera_losses.append(
-                F.binary_cross_entropy_with_logits(mask_logits, target_mask, pos_weight=positive_class_weight)
+            per_cell_loss = F.binary_cross_entropy_with_logits(
+                mask_logits, target_mask, pos_weight=positive_class_weight, reduction="none"
             )
+            per_camera_losses.append(
+                self._average_over_valid_steps(per_cell_loss.mean(dim=(1, 2)), is_missing)
+            )
+            camera_has_valid_sample.append(~is_missing.all())
 
-        return torch.stack(per_camera_losses).mean()
+        valid_camera_count = torch.stack(camera_has_valid_sample).sum().clamp_min(1)
+        return torch.stack(per_camera_losses).sum() / valid_camera_count
 
     @staticmethod
-    def _average_over_unpadded_steps(values: Tensor, is_pad: Tensor) -> Tensor:
-        """Average the values over the unpadded steps.
+    def _average_over_valid_steps(values: Tensor, is_excluded: Tensor) -> Tensor:
+        """Average the values over the steps that are not excluded.
 
         Args:
             values (Tensor): Per-step values.
-            is_pad (Tensor): Padding mask.
+            is_excluded (Tensor): Mask of the steps to leave out.
 
         Returns:
             Tensor: Mean value.
         """
-        valid_mask = ~is_pad
+        valid_mask = ~is_excluded
         return (values * valid_mask).sum() / valid_mask.sum().clamp_min(1)
 
 

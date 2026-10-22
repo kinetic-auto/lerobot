@@ -15,7 +15,8 @@
 
 Requires: pip install 'lerobot[transformers-dep]' and, for the distance and stage labels, a depth feature
 aligned to the RGB image. Choose the labels with `--labels_to_write`; the stage thresholds are needed
-only for the stage label.
+only for the stage label. Frames where SAM 3 finds no object are marked as missing labels that `kinetic_act`
+leaves out of its losses, unless `--mark_missing_labels false` fills them instead.
 
 Example:
 ```
@@ -48,6 +49,7 @@ from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stat
 from lerobot.datasets.dataset_tools import add_features
 from lerobot.datasets.io_utils import load_stats, write_stats
 from lerobot.datasets.joint_layout import feature_channel_names
+from lerobot.policies.kinetic_act.configuration_kinetic_act import MISSING_MASK_CELL_VALUE
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import _transformers_available, require_package
 from lerobot.utils.utils import init_logging
@@ -101,6 +103,7 @@ class LabelObjectTaskConfig:
     mask_score_threshold: float = 0.4
     mask_downsample_factor: int = 16
     distance_median_filter_frames: int = 5
+    mark_missing_labels: bool = True
     gripper_action_channel_name: str = "gripper.position.x"
     debug_output_directory: str | None = None
     debug_frames_per_episode: int = 6
@@ -278,7 +281,10 @@ def label_episode(
         undetected_frame_count += not measurement.object_found
 
         if config.writes_object_mask:
-            object_masks.append(downsample_mask(measurement.mask, config.mask_downsample_factor))
+            object_mask = downsample_mask(measurement.mask, config.mask_downsample_factor)
+            if config.mark_missing_labels and not measurement.object_found:
+                object_mask = np.full_like(object_mask, MISSING_MASK_CELL_VALUE)
+            object_masks.append(object_mask)
         if stage_channel_indices is not None:
             gripper_channel_index, position_channel_indices = stage_channel_indices
             gripper_commands.append(float(frame[ACTION][gripper_channel_index]))
@@ -341,7 +347,10 @@ def label_object_distance_and_stage(
 
     label_arrays: dict[str, np.ndarray] = {}
     if config.writes_object_distance:
-        label_arrays[OBJECT_DISTANCE_FEATURE_KEY] = object_distance.astype(np.float32)
+        written_distance = object_distance
+        if config.mark_missing_labels:
+            written_distance = np.where(np.isnan(raw_distances), np.nan, object_distance)
+        label_arrays[OBJECT_DISTANCE_FEATURE_KEY] = written_distance.astype(np.float32)
     stage = None
     if config.writes_stage:
         stage = assign_stage_labels(
@@ -532,12 +541,33 @@ def write_label_features(
     )
     # `recompute_stats` cannot index the 2-D mask column of the written parquet, so the stats of
     # the new features are computed from the labels in memory and merged into `stats.json`.
-    label_stats = aggregate_stats(
-        [compute_episode_stats(label_arrays, feature_infos) for label_arrays in label_arrays_per_episode]
-    )
+    episode_stats = [
+        compute_episode_stats(valid_arrays, feature_infos)
+        for valid_arrays in (
+            drop_missing_label_values(label_arrays, config) for label_arrays in label_arrays_per_episode
+        )
+        if valid_arrays
+    ]
+    label_stats = aggregate_stats(episode_stats) if episode_stats else {}
     labelled_dataset.meta.stats = {**(load_stats(labelled_dataset.root) or {}), **label_stats}
     write_stats(labelled_dataset.meta.stats, labelled_dataset.root)
     logging.info("Wrote %s to %s", sorted(label_values), labelled_dataset.root)
+
+
+def drop_missing_label_values(
+    label_arrays: dict[str, np.ndarray], config: LabelObjectTaskConfig
+) -> dict[str, np.ndarray]:
+    valid_arrays = {}
+    for feature_key, values in label_arrays.items():
+        if feature_key == OBJECT_DISTANCE_FEATURE_KEY:
+            is_valid = ~np.isnan(values)
+        elif feature_key == STAGE_FEATURE_KEY:
+            is_valid = values >= 0
+        else:
+            is_valid = ~(values == MISSING_MASK_CELL_VALUE).reshape(len(values), -1).any(axis=1)
+        if is_valid.any():
+            valid_arrays[feature_key] = values[is_valid]
+    return valid_arrays
 
 
 def main() -> None:

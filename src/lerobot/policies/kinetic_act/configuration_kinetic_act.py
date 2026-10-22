@@ -18,6 +18,11 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.utils.constants import OBS_IMAGE, OBS_PREFIX, OBS_STATE
 
+# Constants for missing labels.
+# Missing labels are left out of the losses the same way padded steps are.
+MISSING_STAGE_LABEL = -1
+MISSING_MASK_CELL_VALUE = 255
+
 
 @PreTrainedConfig.register_subclass("kinetic_act")
 @dataclass

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import logging
 
 import pytest
@@ -23,6 +24,7 @@ import torch
 
 import lerobot.scripts.kinetic_label_object_task as label_script
 from lerobot.datasets import LeRobotDataset
+from lerobot.policies.kinetic_act.configuration_kinetic_act import MISSING_MASK_CELL_VALUE
 from lerobot.scripts.kinetic_label_object_task import (
     APPROACH_STAGE,
     GRASP_STAGE,
@@ -240,6 +242,63 @@ def test_label_dataset_logs_the_progress_of_every_episode(tmp_path, monkeypatch,
         )
     assert any(message.startswith("Writing ['observation.object_mask.realsense']") for message in messages)
     assert any(message.startswith("Wrote ['observation.object_mask.realsense']") for message in messages)
+
+
+def make_segmentation_missing_on_calls(missing_calls: set[int]):
+    # The frames are segmented in dataset order, so the call number is the global frame number.
+    call_counter = itertools.count()
+
+    def segment(segmenter, rgb_image, object_text_prompt, mask_score_threshold):
+        if next(call_counter) in missing_calls:
+            return None
+        return fake_segment_object_mask(segmenter, rgb_image, object_text_prompt, mask_score_threshold)
+
+    return segment
+
+
+def test_label_dataset_marks_the_frames_without_a_detection_as_missing(tmp_path, monkeypatch):
+    write_source_dataset(tmp_path / "source")
+    monkeypatch.setattr(label_script, "load_sam3_segmenter", lambda model_name_or_path, device: None)
+    monkeypatch.setattr(label_script, "segment_object_mask", make_segmentation_missing_on_calls({3, 4}))
+
+    label_dataset(make_config(tmp_path))
+
+    labelled = load_labelled_dataset(tmp_path)
+    expected_distance = np.tile(2.0 - 0.1 * np.arange(FRAMES_PER_EPISODE), EPISODE_COUNT)
+    expected_distance[[3, 4]] = np.nan
+    np.testing.assert_allclose(
+        np.asarray(labelled.hf_dataset["observation.object_distance"]).reshape(-1),
+        expected_distance,
+        atol=1e-3,
+        equal_nan=True,
+    )
+    masks = np.asarray(labelled.hf_dataset["observation.object_mask.realsense"])
+    assert (masks[[3, 4]] == MISSING_MASK_CELL_VALUE).all()
+    assert (masks[[0, 5]] != MISSING_MASK_CELL_VALUE).all()
+    expected_stage = np.tile([0] * 6 + [1] * 4 + [2] * 2, EPISODE_COUNT)
+    np.testing.assert_array_equal(
+        np.asarray(labelled.hf_dataset["observation.stage"]).reshape(-1), expected_stage
+    )
+    frame_count = FRAMES_PER_EPISODE * EPISODE_COUNT
+    distance_stats = labelled.meta.stats["observation.object_distance"]
+    assert distance_stats["count"][0] == frame_count - 2
+    assert np.isfinite(distance_stats["mean"]).all()
+    assert labelled.meta.stats["observation.object_mask.realsense"]["max"].max() <= 1
+
+
+def test_label_dataset_fills_the_missing_frames_when_not_marking_them(tmp_path, monkeypatch):
+    write_source_dataset(tmp_path / "source")
+    monkeypatch.setattr(label_script, "load_sam3_segmenter", lambda model_name_or_path, device: None)
+    monkeypatch.setattr(label_script, "segment_object_mask", make_segmentation_missing_on_calls({3, 4}))
+
+    label_dataset(make_config(tmp_path, mark_missing_labels=False))
+
+    labelled = load_labelled_dataset(tmp_path)
+    distance = np.asarray(labelled.hf_dataset["observation.object_distance"]).reshape(-1)
+    np.testing.assert_allclose(distance[[3, 4]], distance[2], atol=1e-3)
+    assert np.isfinite(distance).all()
+    masks = np.asarray(labelled.hf_dataset["observation.object_mask.realsense"])
+    assert (masks[[3, 4]] == 0).all()
 
 
 def test_label_dataset_writes_a_distance_only_debug_plot(tmp_path, monkeypatch):

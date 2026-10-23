@@ -58,7 +58,7 @@ _POLICY_REQUIRED_PACKAGES: dict[str, tuple[str, ...]] = {
     "diffusion": ("diffusers",),
 }
 
-_ALL_POLICIES = ["act", "diffusion", "tdmpc", "vqbet"]
+_ALL_POLICIES = ["act", "kinetic_act", "diffusion", "tdmpc", "vqbet"]
 AVAILABLE_POLICIES = [
     p for p in _ALL_POLICIES if all(is_package_available(pkg) for pkg in _POLICY_REQUIRED_PACKAGES.get(p, ()))
 ]

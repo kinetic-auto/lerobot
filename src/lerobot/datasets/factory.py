@@ -93,6 +93,9 @@ def resolve_delta_timestamps(
     state_indices = (
         explicit_state_indices if explicit_state_indices is not None else cfg.observation_delta_indices
     )
+    # Policies with per-timestep supervision labels (e.g. kinetic_act) map each label key to
+    # the chunk of future frames it is loaded with, the same way `action` is chunked.
+    auxiliary_label_indices = getattr(cfg, "auxiliary_label_delta_indices", None) or {}
 
     delta_timestamps: dict[str, list[float]] = {}
     matched_image_keys: list[str] = []
@@ -110,6 +113,8 @@ def resolve_delta_timestamps(
             matched_image_keys.append(key)
         elif policy_key == OBS_STATE:
             indices = state_indices
+        elif policy_key in auxiliary_label_indices:
+            indices = auxiliary_label_indices[policy_key]
         else:
             indices = cfg.observation_delta_indices if policy_key.startswith(OBS_PREFIX) else None
         if indices is not None:

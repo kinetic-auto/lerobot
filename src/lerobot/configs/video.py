@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar
 
 import numpy as np
+from typing_extensions import Self
 
 from lerobot.utils.import_utils import require_package
 

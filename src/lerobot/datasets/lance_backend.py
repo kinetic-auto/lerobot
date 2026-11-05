@@ -35,7 +35,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, TypeVar
 
 import numpy as np
 import torch
@@ -86,7 +86,10 @@ class _SamplePlan(TypedDict):
     padding: dict[str, torch.Tensor]
 
 
-def _opened[T](resource: T | None) -> T:
+T = TypeVar("T")
+
+
+def _opened(resource: T | None) -> T:
     """Return a lazily-opened reader resource, raising if ``_ensure_open()`` has not run."""
     if resource is None:
         raise RuntimeError("LanceDatasetReader is not open; call _ensure_open() first.")

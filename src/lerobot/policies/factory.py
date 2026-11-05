@@ -20,9 +20,10 @@ import importlib
 import inspect
 import logging
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
+from typing_extensions import Unpack
 
 if TYPE_CHECKING:
     from lerobot.datasets import LeRobotDatasetMetadata

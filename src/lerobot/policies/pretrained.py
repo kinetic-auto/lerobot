@@ -20,13 +20,14 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, TypeVar, Unpack
+from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, TypeVar
 
 from huggingface_hub import hf_hub_download, save_torch_state_dict
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from safetensors.torch import load_model as load_model_as_safetensor
 from torch import Tensor, nn
+from typing_extensions import Unpack
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import ACTION

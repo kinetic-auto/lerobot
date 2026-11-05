@@ -2,7 +2,65 @@
 
 ## Validate MCAP
 
+`lerobot-mcap-valid` scans a recording session, one `.mcap` file per episode, before conversion. Requires the `mcap-dep` extra.
+
+Each episode gets a severity: `critical` (a required topic has no messages, a gap inside a stream, depth that does not decode, or no static transform between the depth and color frames), `warning` (a gap at the start or end of a stream, or a stream rate well below the batch median) or `pass`. A JSON and a Markdown report are written to `<session>/mcap_valid_reports/`.
+
+Flags:
+
+- `--session_directory`: folder searched recursively for `*.mcap` files (required).
+- `--report_directory`: where to write `report.json` and `report.md` (default: `<session>/mcap_valid_reports/`).
+- `--stream_gap_factor` / `--stream_min_gap_seconds`: a gap is flagged above the larger of this multiple of the topic's median interval and the absolute floor (defaults: 5.0, 0.5 s).
+- `--fps_tolerance`: fraction below the batch median rate that raises a warning (default: 0.15).
+- `--fail_on_critical`: exit with code 1 if any episode is critical.
+
+Example:
+
+```bash
+lerobot-mcap-valid \
+  --session_directory /path/to/<session_name>
+```
+
 ## Convert MCAP to LeRobotDataset v3.0
+
+`lerobot-mcap-convert` writes the episodes of a validated session into a new LeRobotDataset. It refuses to run without the report from `lerobot-mcap-valid`, and skips `critical` episodes unless `--include_flagged critical` is given.
+
+Each frame holds:
+
+- `observation.state`: the joint positions followed by the joint efforts, with the gripper opening and torque as the last channel of each group. Joints are matched by name, so their order in `/joint_states` does not matter.
+- `action`: the observation state `--action_lookahead_frames` frames later. The last frames of an episode, which have no later state, are dropped.
+- `observation.images.pc1`, `observation.images.realsense`: RGB cameras, resized to the configured output size.
+- `observation.images.realsense_depth`: D405 depth in millimeters, projected into the D405 color camera using the color intrinsics from `--d405_color_intrinsics_path`, the depth intrinsics from the recorded depth `camera_info`, and the depth-to-color transform from `/tf_static`.
+
+All streams are resampled onto a fixed `--fps` grid by holding each stream's latest message. Depth pixels with no return are stored at `--no_return_depth_millimeters` (default 10000, the 10 m end of the range), because the dataset's depth video decodes values into 0.01 to 10 m and a zero would otherwise read back as a very near surface. An episode that fails to convert, for example on non-finite joint values, is skipped and its reason is logged. The dataset root also gets `mcap_conversion_manifest.json`, which lists the converted episodes and the skipped ones with their reasons.
+
+Flags:
+
+- `--session_directory`, `--output_root`, `--repo_id`, `--d405_color_intrinsics_path`: required. `--output_root` must not exist yet.
+- `--episode_allow_list_path`: text file with one episode folder name per line; only those episodes are converted.
+- `--include_flagged`: highest report severity to convert, `pass`, `warning` or `critical` (default: `warning`).
+- `--quality_report_path`: report to use instead of `<session>/mcap_valid_reports/report.json`.
+- `--fps` (default: 10), `--action_lookahead_frames` (default: 3), `--task`, `--robot_type`.
+- `--pc1_output_size` / `--d405_output_size`: `[width, height]` (defaults: `[640, 360]`).
+- `--joint_names`: joints in dataset order (default: the six UR joints, shoulder pan to wrist 3).
+
+Example:
+
+```bash
+lerobot-mcap-convert \
+  --session_directory /path/to/<session_name> \
+  --output_root /path/to/<dataset_name> \
+  --repo_id local/<dataset_name> \
+  --d405_color_intrinsics_path /path/to/d405_intrinsics.yaml \
+  --episode_allow_list_path /path/to/good_episodes.txt
+```
+
+Then check the result with `lerobot-dataset-valid`: it loads the dataset and checks the features, the first frame, a spread of frames, timestamp spacing, finite values, plausible metric depth, and the counts against the manifest.
+
+```bash
+lerobot-dataset-valid \
+  --dataset-path /path/to/<dataset_name>
+```
 
 ## Edit LeRobotDataset
 
@@ -90,14 +148,17 @@ Flags:
 
 - `--repo_id` / `--root`: source dataset. `--new_repo_id` / `--new_root`: where the labelled copy is written.
 - `--rgb_image_key` / `--depth_image_key`: RealSense RGB and depth features (default: `observation.images.realsense`, `observation.images.realsense_depth`).
-- `--object_text_prompt`: SAM 3 text prompt (default: `door handle`). `--sam3_model_name_or_path`: hub id or local weights (default: `facebook/sam3`).
+- `--object_text_prompt`: SAM 3 text prompt (default: `car door handle`). `--sam3_model_name_or_path`: hub id or local weights (default: `facebook/sam3`).
+- `--sam_input_rotation_degrees`: clockwise rotation, a multiple of 90, applied to the RGB image before SAM 3 and undone on the mask (default: 0). SAM 3 detects an upright object far more reliably, so set it for a sideways-mounted camera; the labels stay in the camera's own orientation.
 - `--gripper_action_channel_name`: gripper channel of `action` (default: `gripper.position.x`).
 - `--labels_to_write`: labels to add, any of `object_distance`, `stage` and `object_mask` (default: all three). The mask needs only the RGB feature. The distance needs the aligned depth. The stage is computed from the distance, so it needs the depth as well.
 - `--gripper_closed_threshold`, `--grasp_distance_meters`, `--pull_joint_displacement_threshold` (required with the `stage` label): grasp starts when the gripper command is below the first and the object distance below the second. Pull starts when the joint positions have moved more than the third from where the grasp started. Stages never go backwards within an episode.
+- `--gripper_still_frames`, `--gripper_still_speed_threshold`, `--gripper_state_channel_name`: make the grasp stricter, so it starts only once the measured gripper is closed and has stopped moving (default: off, the command alone decides). The gripper position, read from the channel of `observation.state` (default: the same name as `--gripper_action_channel_name`), must be below `--gripper_closed_threshold` and change by less than `--gripper_still_speed_threshold` per frame for `--gripper_still_frames` consecutive frames. The grasp is labelled from the first frame of that still window. The speed threshold is required when the frame count is positive.
 - `--mark_missing_labels`: when SAM 3 finds no object in a frame, write a missing marker instead of filling the gap (default: true). A missing distance is NaN and a missing mask is filled with 255. With `false`, the distance is carried forward from the last valid frame and the mask is empty. The stage is never missing, because it does not depend on the detection of a single frame.
-- `--mask_score_threshold`, `--mask_downsample_factor`, `--distance_median_filter_frames`: SAM 3 score cutoff (default: 0.4), mask label resolution as image size divided by the factor (default: 16), and an odd median filter window over the distance (default: 5).
+- `--mask_score_threshold`, `--mask_downsample_factor`, `--distance_median_filter_frames`: SAM 3 score cutoff (default: 0.2), mask label resolution as image size divided by the factor (default: 16), and an odd median filter window over the distance (default: 5).
 - Progress: a frame progress bar shows the speed and the episode in progress, with one log line per episode giving its frame count and the frames where SAM 3 found no object.
-- `--debug_output_directory`, `--debug_frames_per_episode`: write mask overlays and a distance and stage plot per episode, to check the labels before training. The plots need the `matplotlib-dep` extra and are written when a distance or stage label is computed.
+- `--debug_output_directory`, `--debug_frames_per_episode`: write mask overlays and a distance and stage plot per episode, to check the labels before training. The plots need the `matplotlib-dep` extra and are written when a distance or stage label is computed. The mask overlays are written only for episodes that SAM 3 segments in that run, not for episodes loaded from the cache.
+- `--label_cache_directory`: where the SAM 3 result of each finished episode is cached (default: `label_cache` next to the dataset folder, so `<dataset>/label_cache` for `--root <dataset>/lerobotv3`). Each episode file holds the raw per-frame distance, the downsampled mask and whether SAM 3 found the object, written to a temporary file and renamed so a crash never leaves a half episode. The settings of the run are stored in each file and in `config.json`. A rerun loads the episodes whose settings match and segments the others, so changing `--gripper_closed_threshold`, `--grasp_distance_meters`, `--pull_joint_displacement_threshold` or `--distance_median_filter_frames` needs no SAM 3 pass. A different `--object_text_prompt`, `--sam_input_rotation_degrees`, `--mask_score_threshold`, `--mask_downsample_factor`, `--sam3_model_name_or_path`, image key or repo id segments the episode again. Pass the flag when several datasets share one parent folder, and delete the folder when the source dataset changes. A partial `--new_root` from a failed run must be removed before the rerun, because the writer refuses an existing output path.
 
 Example:
 

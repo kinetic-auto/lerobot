@@ -104,6 +104,9 @@ def decode_video_frames(
         raise ValueError(f"Unsupported video backend: {backend}")
 
 
+PYAV_RETRY_SEEK_BACK_S = 1.0
+
+
 def decode_video_frames_pyav(
     video_path: Path | str | BinaryIO,
     timestamps: list[float],
@@ -147,39 +150,19 @@ def decode_video_frames_pyav(
     first_ts = min(timestamps)
     last_ts = max(timestamps)
 
-    loaded_frames: list[torch.Tensor] = []
-    loaded_ts: list[float] = []
-
-    # Seek + decode. `container.seek(offset)` with no `stream` argument expects the offset in
-    # av.time_base units (microseconds). `backward=True` lands us on the nearest keyframe at or
-    # before `first_ts`, so we can then decode forward until we cover `last_ts`. See:
-    # https://pyav.basswood-io.com/docs/stable/api/container.html#av.container.InputContainer.seek
-    with av.open(video_path) as container:
-        stream = container.streams.video[0]
-        # Seek to the nearest keyframe at or before `first_ts` with a 1 frame margin
-        container.seek(
-            round(first_ts / stream.time_base) - 1,
-            backward=True,
-            any_frame=False,
-            stream=stream,
+    # A first pass that misses a requested timestamp is retried from an earlier keyframe, because a
+    # picture that precedes its keyframe in decode order is dropped when the seek lands on that keyframe.
+    for extra_seek_back_s in (0.0, PYAV_RETRY_SEEK_BACK_S):
+        loaded_frames, loaded_ts = _decode_pyav_frames_after_seek(
+            video_path, first_ts, last_ts, extra_seek_back_s, is_depth, log_loaded_timestamps
         )
-
-        for frame in container.decode(stream):
-            if frame.pts is None:
-                continue
-            current_ts = float(frame.pts * stream.time_base)
-            if log_loaded_timestamps:
-                logger.info(f"frame loaded at timestamp={current_ts:.4f}")
-            if is_depth:
-                arr = frame.to_ndarray(format="gray12le")  # (H, W) uint12
-                loaded_frames.append(torch.from_numpy(arr).unsqueeze(0).contiguous())
-            else:
-                arr = frame.to_ndarray(format="rgb24")  # (H, W, 3)
-                # Convert to CHW uint8 to match torchcodec's output layout.
-                loaded_frames.append(torch.from_numpy(arr).permute(2, 0, 1).contiguous())
-            loaded_ts.append(current_ts)
-            if current_ts >= last_ts:
-                break
+        if _covers_timestamps(timestamps, loaded_ts, tolerance_s):
+            if extra_seek_back_s > 0:
+                logger.warning(
+                    f"Frames near {first_ts}s were only decoded after seeking {extra_seek_back_s}s earlier "
+                    f"in {video_path}."
+                )
+            break
 
     if not loaded_frames:
         raise FrameTimestampError(
@@ -226,6 +209,61 @@ def decode_video_frames_pyav(
     # convert to the pytorch format which is float32 in [0,1] range (and channel first)
     closest_frames = closest_frames.type(torch.float32) / 255
     return closest_frames
+
+
+def _decode_pyav_frames_after_seek(
+    video_path: Path | str | BinaryIO,
+    first_ts: float,
+    last_ts: float,
+    extra_seek_back_s: float,
+    is_depth: bool,
+    log_loaded_timestamps: bool,
+) -> tuple[list[torch.Tensor], list[float]]:
+    loaded_frames: list[torch.Tensor] = []
+    loaded_ts: list[float] = []
+
+    # Seek + decode. `container.seek(offset)` with a `stream` expects the offset in stream time_base
+    # units. `backward=True` lands us on the nearest keyframe at or before the offset, so we can then
+    # decode forward until we cover `last_ts`. See:
+    # https://pyav.basswood-io.com/docs/stable/api/container.html#av.container.InputContainer.seek
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        # Seek to the nearest keyframe at or before `first_ts` with a 1 frame margin
+        container.seek(
+            max(round((first_ts - extra_seek_back_s) / stream.time_base) - 1, 0),
+            backward=True,
+            any_frame=False,
+            stream=stream,
+        )
+
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                continue
+            current_ts = float(frame.pts * stream.time_base)
+            if log_loaded_timestamps:
+                logger.info(f"frame loaded at timestamp={current_ts:.4f}")
+            if is_depth:
+                arr = frame.to_ndarray(format="gray12le")  # (H, W) uint12
+                loaded_frames.append(torch.from_numpy(arr).unsqueeze(0).contiguous())
+            else:
+                arr = frame.to_ndarray(format="rgb24")  # (H, W, 3)
+                # Convert to CHW uint8 to match torchcodec's output layout.
+                loaded_frames.append(torch.from_numpy(arr).permute(2, 0, 1).contiguous())
+            loaded_ts.append(current_ts)
+            if current_ts >= last_ts:
+                break
+
+    return loaded_frames, loaded_ts
+
+
+def _covers_timestamps(timestamps: list[float], loaded_ts: list[float], tolerance_s: float) -> bool:
+    if not loaded_ts:
+        return False
+    # float64: hour-scale timestamps quantize past tolerance_s in float32.
+    query_ts = torch.tensor(timestamps, dtype=torch.float64)
+    loaded_ts_t = torch.tensor(loaded_ts, dtype=torch.float64)
+    nearest_distance = torch.cdist(query_ts[:, None], loaded_ts_t[:, None], p=1).min(1).values
+    return bool((nearest_distance <= tolerance_s).all())
 
 
 DEFAULT_DECODER_CACHE_SIZE = 100

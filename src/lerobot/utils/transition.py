@@ -14,9 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 
 import torch
+from typing_extensions import NotRequired
 
 
 class Transition(TypedDict):

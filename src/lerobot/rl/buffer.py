@@ -18,11 +18,12 @@ import functools
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from tqdm import tqdm
+from typing_extensions import NotRequired
 
 from lerobot.datasets import LeRobotDataset
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, REWARD

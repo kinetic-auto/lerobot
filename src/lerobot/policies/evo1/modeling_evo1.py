@@ -18,10 +18,11 @@ import builtins
 from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
-from typing import TypedDict, Unpack
+from typing import TypedDict
 
 import torch
 from torch import Tensor
+from typing_extensions import Unpack
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pretrained import PreTrainedPolicy, T

@@ -18,11 +18,12 @@ import builtins
 import logging
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import numpy as np
 import torch
 from torch import Tensor, nn
+from typing_extensions import Unpack
 
 from lerobot.utils.import_utils import _scipy_available, _transformers_available, require_package
 

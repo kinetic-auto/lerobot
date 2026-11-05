@@ -29,7 +29,7 @@ version = "0.6.2"
 description = "🤗 LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch"
 dynamic = ["readme"]
 license = { text = "Apache-2.0" }
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 authors = [
     { name = "Rémi Cadène", email = "re.cadene@gmail.com" },
     { name = "Simon Alibert", email = "alibert.sim@gmail.com" },
@@ -50,6 +50,8 @@ classifiers = [
     "Intended Audience :: Education",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Build Tools",
@@ -83,6 +85,7 @@ dependencies = [
     # Lightweight utilities
     "packaging>=24.2,<26.0",
     "termcolor>=2.4.0,<4.0.0",
+    "typing-extensions>=4.6.0,<5.0.0", # NOTE: Provides Self, Unpack and NotRequired, which typing only has from Python 3.11.
     "tqdm>=4.66.0,<5.0.0",
 
     # Build tools (required by opencv-python-headless on some platforms)
@@ -406,7 +409,7 @@ lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt"]
 where = ["src"]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"
 line-length = 110
 exclude = ["tests/artifacts/**/*.safetensors", "*_pb2.py", "*_pb2_grpc.py"]
 
@@ -560,7 +563,7 @@ markers = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 ignore_missing_imports = true
 follow_imports = "skip"
 # warn_return_any = true

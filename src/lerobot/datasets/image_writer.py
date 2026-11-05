@@ -19,6 +19,7 @@ import multiprocessing.queues
 import queue
 import threading
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import PIL.Image
@@ -28,9 +29,11 @@ logger = logging.getLogger(__name__)
 
 # One pending write: (image, destination path, PNG compress level). ``None`` is the stop sentinel.
 ImageWriterItem = tuple[np.ndarray | PIL.Image.Image, Path, int]
-ImageWriterQueue = (
-    queue.Queue[ImageWriterItem | None] | multiprocessing.queues.JoinableQueue[ImageWriterItem | None]
-)
+# The multiprocessing queue is a forward reference because it is only subscriptable from Python 3.12.
+ImageWriterQueue = Union[
+    queue.Queue[ImageWriterItem | None],
+    "multiprocessing.queues.JoinableQueue[ImageWriterItem | None]",
+]
 
 
 def safe_stop_image_writer(func):

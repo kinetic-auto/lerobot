@@ -16,7 +16,11 @@
 Requires: pip install 'lerobot[transformers-dep]' and, for the distance and stage labels, a depth feature
 aligned to the RGB image. Choose the labels with `--labels_to_write`; the stage thresholds are needed
 only for the stage label. Frames where SAM 3 finds no object are marked as missing labels that `kinetic_act`
-leaves out of its losses, unless `--mark_missing_labels false` fills them instead.
+leaves out of its losses, unless `--mark_missing_labels false` fills them instead. `--sam_input_rotation_degrees`
+turns the image of a sideways-mounted camera upright before SAM 3 segments it.
+
+The SAM 3 result of every finished episode is cached beside the dataset, so a rerun after a crash or after
+changing a stage threshold skips the episodes whose cache matches the segmentation settings.
 
 Example:
 ```
@@ -31,8 +35,13 @@ lerobot-label-object-task \
 ```
 """
 
+import functools
+import json
 import logging
 import math
+import os
+import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -84,6 +93,15 @@ class StageThresholds:
     gripper_closed_threshold: float
     grasp_distance_meters: float
     pull_joint_displacement_threshold: float
+    gripper_still_frames: int = 0
+    gripper_still_speed_threshold: float | None = None
+
+
+@dataclass
+class StageChannelIndices:
+    gripper_command: int
+    gripper_state: int | None
+    joint_positions: list[int]
 
 
 @dataclass
@@ -98,15 +116,22 @@ class LabelObjectTaskConfig:
     pull_joint_displacement_threshold: float | None = None
     rgb_image_key: str = f"{OBS_IMAGES}.realsense"
     depth_image_key: str = f"{OBS_IMAGES}.realsense_depth"
-    object_text_prompt: str = "door handle"
+    object_text_prompt: str = "car door handle"
     sam3_model_name_or_path: str = "facebook/sam3"
-    mask_score_threshold: float = 0.4
+    # Clockwise, a multiple of 90. The image is turned before SAM 3 and the mask is turned back.
+    sam_input_rotation_degrees: int = 0
+    mask_score_threshold: float = 0.2
     mask_downsample_factor: int = 16
     distance_median_filter_frames: int = 5
     mark_missing_labels: bool = True
     gripper_action_channel_name: str = "gripper.position.x"
+    gripper_state_channel_name: str | None = None
+    gripper_still_frames: int = 0
+    gripper_still_speed_threshold: float | None = None
     debug_output_directory: str | None = None
+    label_cache_directory: str | None = None
     debug_frames_per_episode: int = 6
+    sam_batch_size: int = 8
     device: str = "cuda"
 
     @property
@@ -126,6 +151,14 @@ class LabelObjectTaskConfig:
         return self.writes_object_distance or self.writes_stage
 
     @property
+    def requires_gripper_state(self) -> bool:
+        return self.writes_stage and self.gripper_still_frames > 0
+
+    @property
+    def resolved_gripper_state_channel_name(self) -> str:
+        return self.gripper_state_channel_name or self.gripper_action_channel_name
+
+    @property
     def stage_thresholds(self) -> StageThresholds:
         missing_names = [name for name in STAGE_THRESHOLD_FIELD_NAMES if getattr(self, name) is None]
         if missing_names:
@@ -134,6 +167,8 @@ class LabelObjectTaskConfig:
             gripper_closed_threshold=self.gripper_closed_threshold,
             grasp_distance_meters=self.grasp_distance_meters,
             pull_joint_displacement_threshold=self.pull_joint_displacement_threshold,
+            gripper_still_frames=self.gripper_still_frames,
+            gripper_still_speed_threshold=self.gripper_still_speed_threshold,
         )
 
     @property
@@ -157,6 +192,97 @@ class ObjectMeasurement:
     object_found: bool
 
 
+@dataclass
+class EpisodeSegmentation:
+    raw_distances: np.ndarray
+    object_masks: np.ndarray
+    object_found: np.ndarray
+    distances_measured: bool
+
+
+@dataclass
+class StageInputs:
+    gripper_commands: np.ndarray
+    gripper_positions: np.ndarray | None
+    joint_positions: np.ndarray
+
+
+class SegmentationCache:
+    SETTINGS_FILE_NAME = "config.json"
+
+    def __init__(self, directory: Path, config: LabelObjectTaskConfig):
+        self.directory = directory
+        self.needs_object_distance = config.needs_object_distance
+        self.settings = {
+            "repo_id": config.repo_id,
+            "rgb_image_key": config.rgb_image_key,
+            "depth_image_key": config.depth_image_key,
+            "object_text_prompt": config.object_text_prompt,
+            "sam3_model_name_or_path": config.sam3_model_name_or_path,
+            "sam_input_rotation_degrees": config.sam_input_rotation_degrees,
+            "mask_score_threshold": config.mask_score_threshold,
+            "mask_downsample_factor": config.mask_downsample_factor,
+        }
+
+    def write_settings(self) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        settings_path = self.directory / self.SETTINGS_FILE_NAME
+        temporary_path = settings_path.with_name(settings_path.name + ".tmp")
+        temporary_path.write_text(json.dumps(self.settings, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary_path, settings_path)
+
+    def load(self, episode_index: int, frame_count: int) -> EpisodeSegmentation | None:
+        episode_path = self.episode_path(episode_index)
+        if not episode_path.exists():
+            return None
+        try:
+            with np.load(episode_path, allow_pickle=False) as cached:
+                if str(cached["settings_json"]) != self.settings_json():
+                    logging.info("Episode %d: the cache has other segmentation settings", episode_index)
+                    return None
+                segmentation = EpisodeSegmentation(
+                    raw_distances=cached["raw_distances"],
+                    object_masks=cached["object_masks"],
+                    object_found=cached["object_found"],
+                    distances_measured=bool(cached["distances_measured"]),
+                )
+        except (OSError, EOFError, KeyError, ValueError, zipfile.BadZipFile) as error:
+            logging.warning(
+                "Episode %d: ignoring the unreadable cache %s (%s)", episode_index, episode_path, error
+            )
+            return None
+        if len(segmentation.raw_distances) != frame_count:
+            logging.info("Episode %d: the cache has another frame count", episode_index)
+            return None
+        if self.needs_object_distance and not segmentation.distances_measured:
+            logging.info("Episode %d: the cache has no object distances", episode_index)
+            return None
+        return segmentation
+
+    def save(self, episode_index: int, segmentation: EpisodeSegmentation) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        episode_path = self.episode_path(episode_index)
+        temporary_path = episode_path.with_name(episode_path.name + ".tmp")
+        with open(temporary_path, "wb") as temporary_file:
+            np.savez(
+                temporary_file,
+                settings_json=np.array(self.settings_json()),
+                raw_distances=segmentation.raw_distances,
+                object_masks=segmentation.object_masks,
+                object_found=segmentation.object_found,
+                distances_measured=np.array(segmentation.distances_measured),
+            )
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, episode_path)
+
+    def episode_path(self, episode_index: int) -> Path:
+        return self.directory / f"episode_{episode_index:03d}.npz"
+
+    def settings_json(self) -> str:
+        return json.dumps(self.settings, sort_keys=True)
+
+
 @parser.wrap()
 def label_dataset(config: LabelObjectTaskConfig) -> None:
     validate_config(config)
@@ -169,18 +295,32 @@ def label_dataset(config: LabelObjectTaskConfig) -> None:
         dataset.meta.total_frames,
         config.repo_id,
     )
-    segmenter = load_sam3_segmenter(config.sam3_model_name_or_path, config.device)
-    logging.info("Loaded SAM 3 from %s on %s", config.sam3_model_name_or_path, config.device)
+    segmentation_cache = SegmentationCache(resolve_label_cache_directory(dataset, config), config)
+    segmentation_cache.write_settings()
+    logging.info("Segmentation cache: %s", segmentation_cache.directory)
+
+    # SAM 3 loads on the first episode that is not cached, so a fully cached rerun never touches the GPU.
+    @functools.cache
+    def get_segmenter() -> Sam3Segmenter:
+        segmenter = load_sam3_segmenter(config.sam3_model_name_or_path, config.device)
+        logging.info("Loaded SAM 3 from %s on %s", config.sam3_model_name_or_path, config.device)
+        return segmenter
 
     with (
         logging_redirect_tqdm(),
         tqdm(total=dataset.meta.total_frames, desc="Labelling frames", unit="frame") as progress_bar,
     ):
         label_arrays_per_episode = [
-            label_episode(dataset, episode_index, segmenter, config, progress_bar)
+            label_episode(dataset, episode_index, get_segmenter, config, progress_bar, segmentation_cache)
             for episode_index in range(dataset.meta.total_episodes)
         ]
     write_label_features(dataset, label_arrays_per_episode, config)
+
+
+def resolve_label_cache_directory(dataset: LeRobotDataset, config: LabelObjectTaskConfig) -> Path:
+    if config.label_cache_directory is not None:
+        return Path(config.label_cache_directory)
+    return Path(dataset.root).parent / "label_cache"
 
 
 def validate_config(config: LabelObjectTaskConfig) -> None:
@@ -198,6 +338,15 @@ def validate_config(config: LabelObjectTaskConfig) -> None:
         missing_names = [name for name in STAGE_THRESHOLD_FIELD_NAMES if getattr(config, name) is None]
         if missing_names:
             raise ValueError(f"Writing the stage label requires {missing_names}.")
+    if config.gripper_still_frames < 0:
+        raise ValueError(f"`gripper_still_frames` must not be negative. Got {config.gripper_still_frames}.")
+    if config.requires_gripper_state and (
+        config.gripper_still_speed_threshold is None or config.gripper_still_speed_threshold <= 0
+    ):
+        raise ValueError(
+            "`gripper_still_speed_threshold` must be positive when `gripper_still_frames` is set. "
+            f"Got {config.gripper_still_speed_threshold}."
+        )
     if config.distance_median_filter_frames < 1 or config.distance_median_filter_frames % 2 == 0:
         raise ValueError(
             f"`distance_median_filter_frames` must be a positive odd number. "
@@ -205,8 +354,14 @@ def validate_config(config: LabelObjectTaskConfig) -> None:
         )
     if config.mask_downsample_factor < 1:
         raise ValueError(f"`mask_downsample_factor` must be positive. Got {config.mask_downsample_factor}.")
+    if config.sam_batch_size < 1:
+        raise ValueError(f"`sam_batch_size` must be positive. Got {config.sam_batch_size}.")
     if not 0.0 < config.mask_score_threshold < 1.0:
         raise ValueError(f"`mask_score_threshold` must be in (0, 1). Got {config.mask_score_threshold}.")
+    if config.sam_input_rotation_degrees % 90 != 0:
+        raise ValueError(
+            f"`sam_input_rotation_degrees` must be a multiple of 90. Got {config.sam_input_rotation_degrees}."
+        )
     if config.debug_output_directory is not None and config.debug_frames_per_episode < 1:
         raise ValueError(
             f"`debug_frames_per_episode` must be positive. Got {config.debug_frames_per_episode}."
@@ -228,6 +383,13 @@ def validate_dataset_features(dataset: LeRobotDataset, config: LabelObjectTaskCo
                 f"`gripper_action_channel_name` {config.gripper_action_channel_name!r} is not an action "
                 f"channel. Channels: {action_names}."
             )
+    if config.requires_gripper_state:
+        state_names = feature_channel_names(features[OBS_STATE])
+        if config.resolved_gripper_state_channel_name not in state_names:
+            raise ValueError(
+                f"`gripper_state_channel_name` {config.resolved_gripper_state_channel_name!r} is not a state "
+                f"channel. Channels: {state_names}."
+            )
 
 
 def validate_depth_feature(dataset: LeRobotDataset, config: LabelObjectTaskConfig) -> None:
@@ -240,13 +402,22 @@ def validate_depth_feature(dataset: LeRobotDataset, config: LabelObjectTaskConfi
         raise ValueError(
             f"`{config.depth_image_key}` is not a depth feature. Depth: {dataset.meta.depth_keys}."
         )
-    rgb_shape = tuple(features[config.rgb_image_key]["shape"][:2])
-    depth_shape = tuple(features[config.depth_image_key]["shape"][:2])
-    if rgb_shape != depth_shape:
+    rgb_size = get_image_height_and_width(features[config.rgb_image_key])
+    depth_size = get_image_height_and_width(features[config.depth_image_key])
+    if rgb_size != depth_size:
         raise ValueError(
-            f"The depth image {depth_shape} must be aligned to the RGB image {rgb_shape}: "
+            f"The depth image {depth_size} must be aligned to the RGB image {rgb_size}: "
             "same height and width."
         )
+
+
+def get_image_height_and_width(feature: dict) -> tuple[int, int]:
+    shape = tuple(feature["shape"])
+    names = feature.get("names") or []
+    # Same rule as `dataset_to_policy_features`: height, width, channel when the last name is the channel,
+    # channel, height, width otherwise.
+    is_channel_last = len(names) == 3 and names[2] in ("channel", "channels")
+    return (shape[0], shape[1]) if is_channel_last else (shape[1], shape[2])
 
 
 def load_sam3_segmenter(model_name_or_path: str, device: str) -> Sam3Segmenter:
@@ -259,80 +430,128 @@ def load_sam3_segmenter(model_name_or_path: str, device: str) -> Sam3Segmenter:
 def label_episode(
     dataset: LeRobotDataset,
     episode_index: int,
-    segmenter: Sam3Segmenter,
+    get_segmenter: Callable[[], Sam3Segmenter],
     config: LabelObjectTaskConfig,
     progress_bar: tqdm,
+    segmentation_cache: SegmentationCache,
 ) -> dict[str, np.ndarray]:
     episode = dataset.meta.episodes[episode_index]
-    frame_indices = range(episode["dataset_from_index"], episode["dataset_to_index"])
-    stage_channel_indices = find_stage_channel_indices(dataset, config) if config.writes_stage else None
-    debug_frame_positions = find_debug_frame_positions(len(frame_indices), config)
+    frame_indices = list(range(episode["dataset_from_index"], episode["dataset_to_index"]))
 
-    raw_distances = np.full(len(frame_indices), np.nan)
-    undetected_frame_count = 0
-    object_masks = []
-    gripper_commands = []
-    joint_positions = []
-    for frame_position, frame_index in enumerate(frame_indices):
-        frame = dataset[frame_index]
-        measurement = measure_object_in_frame(segmenter, frame, config)
-        if measurement.distance is not None:
-            raw_distances[frame_position] = measurement.distance
-        undetected_frame_count += not measurement.object_found
-
-        if config.writes_object_mask:
-            object_mask = downsample_mask(measurement.mask, config.mask_downsample_factor)
-            if config.mark_missing_labels and not measurement.object_found:
-                object_mask = np.full_like(object_mask, MISSING_MASK_CELL_VALUE)
-            object_masks.append(object_mask)
-        if stage_channel_indices is not None:
-            gripper_channel_index, position_channel_indices = stage_channel_indices
-            gripper_commands.append(float(frame[ACTION][gripper_channel_index]))
-            joint_positions.append(frame[OBS_STATE][position_channel_indices].numpy())
-        if frame_position in debug_frame_positions:
-            overlay_path = Path(config.debug_output_directory) / (
-                f"episode_{episode_index:03d}_frame_{frame_position:04d}.png"
-            )
-            write_mask_overlay(measurement.rgb_image, measurement.mask, overlay_path)
-        progress_bar.update(1)
+    segmentation = segmentation_cache.load(episode_index, len(frame_indices))
+    is_cached = segmentation is not None
+    if segmentation is None:
+        segmentation = segment_episode(
+            dataset, episode_index, frame_indices, get_segmenter(), config, progress_bar
+        )
+        segmentation_cache.save(episode_index, segmentation)
+    else:
+        progress_bar.update(len(frame_indices))
 
     progress_bar.set_postfix(episode=f"{episode_index + 1}/{dataset.meta.total_episodes}")
     logging.info(
-        "Episode %d/%d: %d frames, %d without an object detection",
+        "Episode %d/%d: %d frames, %d without an object detection%s",
         episode_index + 1,
         dataset.meta.total_episodes,
         len(frame_indices),
-        undetected_frame_count,
+        int((~segmentation.object_found).sum()),
+        " (cached)" if is_cached else "",
     )
     label_arrays: dict[str, np.ndarray] = {}
     if config.writes_object_mask:
-        label_arrays[config.object_mask_feature_key] = np.stack(object_masks)
+        label_arrays[config.object_mask_feature_key] = mark_missing_object_masks(segmentation, config)
     if config.needs_object_distance:
+        stage_inputs = read_stage_inputs(dataset, frame_indices, config) if config.writes_stage else None
         label_arrays.update(
-            label_object_distance_and_stage(
-                episode_index, raw_distances, gripper_commands, joint_positions, config
-            )
+            label_object_distance_and_stage(episode_index, segmentation.raw_distances, stage_inputs, config)
         )
     return label_arrays
 
 
-def find_stage_channel_indices(
-    dataset: LeRobotDataset, config: LabelObjectTaskConfig
-) -> tuple[int, list[int]]:
-    gripper_channel_index = feature_channel_names(dataset.meta.features[ACTION]).index(
-        config.gripper_action_channel_name
+def segment_episode(
+    dataset: LeRobotDataset,
+    episode_index: int,
+    frame_indices: list[int],
+    segmenter: Sam3Segmenter,
+    config: LabelObjectTaskConfig,
+    progress_bar: tqdm,
+) -> EpisodeSegmentation:
+    debug_frame_positions = find_debug_frame_positions(len(frame_indices), config)
+    raw_distances = np.full(len(frame_indices), np.nan)
+    object_found = np.zeros(len(frame_indices), dtype=bool)
+    object_masks = []
+    for batch_start in range(0, len(frame_indices), config.sam_batch_size):
+        batch_frame_indices = frame_indices[batch_start : batch_start + config.sam_batch_size]
+        frames = [dataset[frame_index] for frame_index in batch_frame_indices]
+        measurements = measure_objects_in_frames(segmenter, frames, config)
+        for offset, measurement in enumerate(measurements):
+            frame_position = batch_start + offset
+            if measurement.distance is not None:
+                raw_distances[frame_position] = measurement.distance
+            object_found[frame_position] = measurement.object_found
+            object_masks.append(downsample_mask(measurement.mask, config.mask_downsample_factor))
+            if frame_position in debug_frame_positions:
+                overlay_path = Path(config.debug_output_directory) / (
+                    f"episode_{episode_index:03d}_frame_{frame_position:04d}.png"
+                )
+                write_mask_overlay(measurement.rgb_image, measurement.mask, overlay_path)
+            progress_bar.update(1)
+    return EpisodeSegmentation(
+        raw_distances=raw_distances,
+        object_masks=np.stack(object_masks),
+        object_found=object_found,
+        distances_measured=config.needs_object_distance,
     )
-    position_channel_indices = find_position_channel_indices(
-        feature_channel_names(dataset.meta.features[OBS_STATE])
+
+
+def mark_missing_object_masks(segmentation: EpisodeSegmentation, config: LabelObjectTaskConfig) -> np.ndarray:
+    object_masks = segmentation.object_masks.copy()
+    if config.mark_missing_labels:
+        object_masks[~segmentation.object_found] = MISSING_MASK_CELL_VALUE
+    return object_masks
+
+
+def read_stage_inputs(
+    dataset: LeRobotDataset, frame_indices: list[int], config: LabelObjectTaskConfig
+) -> StageInputs:
+    stage_channel_indices = find_stage_channel_indices(dataset, config)
+    actions = read_column(dataset, ACTION, frame_indices)
+    states = read_column(dataset, OBS_STATE, frame_indices)
+    # The gripper is compared with its thresholds in float64, as when it was read frame by frame.
+    return StageInputs(
+        gripper_commands=actions[:, stage_channel_indices.gripper_command].astype(np.float64),
+        gripper_positions=(
+            None
+            if stage_channel_indices.gripper_state is None
+            else states[:, stage_channel_indices.gripper_state].astype(np.float64)
+        ),
+        joint_positions=states[:, stage_channel_indices.joint_positions],
     )
-    return gripper_channel_index, position_channel_indices
+
+
+def read_column(dataset: LeRobotDataset, column_name: str, frame_indices: list[int]) -> np.ndarray:
+    return torch.stack(dataset.select_columns(column_name)[frame_indices][column_name]).numpy()
+
+
+def find_stage_channel_indices(dataset: LeRobotDataset, config: LabelObjectTaskConfig) -> StageChannelIndices:
+    state_channel_names = feature_channel_names(dataset.meta.features[OBS_STATE])
+    return StageChannelIndices(
+        gripper_command=feature_channel_names(dataset.meta.features[ACTION]).index(
+            config.gripper_action_channel_name
+        ),
+        gripper_state=(
+            state_channel_names.index(config.resolved_gripper_state_channel_name)
+            if config.requires_gripper_state
+            else None
+        ),
+        joint_positions=find_position_channel_indices(state_channel_names),
+    )
 
 
 def label_object_distance_and_stage(
     episode_index: int,
     raw_distances: np.ndarray,
-    gripper_commands: list[float],
-    joint_positions: list[np.ndarray],
+    stage_inputs: StageInputs | None,
     config: LabelObjectTaskConfig,
 ) -> dict[str, np.ndarray]:
     missing_frame_count = int(np.isnan(raw_distances).sum())
@@ -354,7 +573,11 @@ def label_object_distance_and_stage(
     stage = None
     if config.writes_stage:
         stage = assign_stage_labels(
-            np.array(gripper_commands), object_distance, np.stack(joint_positions), config.stage_thresholds
+            stage_inputs.gripper_commands,
+            object_distance,
+            stage_inputs.joint_positions,
+            config.stage_thresholds,
+            stage_inputs.gripper_positions,
         )
         label_arrays[STAGE_FEATURE_KEY] = stage
     logging.info(
@@ -371,17 +594,33 @@ def label_object_distance_and_stage(
     return label_arrays
 
 
-def measure_object_in_frame(
-    segmenter: Sam3Segmenter, frame: dict[str, torch.Tensor], config: LabelObjectTaskConfig
-) -> ObjectMeasurement:
-    rgb_image = to_uint8_rgb_image(frame[config.rgb_image_key])
-    mask = segment_object_mask(segmenter, rgb_image, config.object_text_prompt, config.mask_score_threshold)
-    if mask is None:
-        return ObjectMeasurement(rgb_image, np.zeros(rgb_image.shape[:2], dtype=bool), None, False)
-    if not config.needs_object_distance:
-        return ObjectMeasurement(rgb_image, mask, None, True)
-    depth_image = frame[config.depth_image_key].squeeze(0).numpy()
-    return ObjectMeasurement(rgb_image, mask, median_depth_under_mask(depth_image, mask), True)
+def measure_objects_in_frames(
+    segmenter: Sam3Segmenter, frames: list[dict[str, torch.Tensor]], config: LabelObjectTaskConfig
+) -> list[ObjectMeasurement]:
+    rgb_images = [to_uint8_rgb_image(frame[config.rgb_image_key]) for frame in frames]
+    segmenter_images = [
+        rotate_clockwise(rgb_image, config.sam_input_rotation_degrees) for rgb_image in rgb_images
+    ]
+    masks = [
+        None if mask is None else rotate_clockwise(mask, -config.sam_input_rotation_degrees)
+        for mask in segment_object_masks(
+            segmenter, segmenter_images, config.object_text_prompt, config.mask_score_threshold
+        )
+    ]
+    measurements = []
+    for frame, rgb_image, mask in zip(frames, rgb_images, masks, strict=True):
+        if mask is None:
+            empty_mask = np.zeros(rgb_image.shape[:2], dtype=bool)
+            measurements.append(ObjectMeasurement(rgb_image, empty_mask, None, False))
+            continue
+        if not config.needs_object_distance:
+            measurements.append(ObjectMeasurement(rgb_image, mask, None, True))
+            continue
+        depth_image = frame[config.depth_image_key].squeeze(0).numpy()
+        measurements.append(
+            ObjectMeasurement(rgb_image, mask, median_depth_under_mask(depth_image, mask), True)
+        )
+    return measurements
 
 
 def find_position_channel_indices(state_channel_names: list[str]) -> list[int]:
@@ -402,24 +641,51 @@ def to_uint8_rgb_image(image: torch.Tensor) -> np.ndarray:
     return (image.permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
 
 
-def segment_object_mask(
-    segmenter: Sam3Segmenter, rgb_image: np.ndarray, object_text_prompt: str, mask_score_threshold: float
-) -> np.ndarray | None:
+def rotate_clockwise(image: np.ndarray, degrees: int) -> np.ndarray:
+    if degrees % 90 != 0:
+        raise ValueError(f"The rotation must be a multiple of 90 degrees. Got {degrees}.")
+    # `np.rot90` turns counter-clockwise, so a clockwise turn is a negative number of quarter turns.
+    return np.ascontiguousarray(np.rot90(image, k=-(degrees // 90)))
+
+
+def segment_object_masks(
+    segmenter: Sam3Segmenter,
+    rgb_images: list[np.ndarray],
+    object_text_prompt: str,
+    mask_score_threshold: float,
+) -> list[np.ndarray | None]:
+    if not rgb_images:
+        return []
     inputs = segmenter.processor(
-        images=Image.fromarray(rgb_image), text=object_text_prompt, return_tensors="pt"
+        images=[Image.fromarray(rgb_image) for rgb_image in rgb_images],
+        text=[object_text_prompt] * len(rgb_images),
+        return_tensors="pt",
     ).to(segmenter.device)
     with torch.no_grad():
         outputs = segmenter.model(**inputs)
-    instances = segmenter.processor.post_process_instance_segmentation(
+    original_sizes = inputs["original_sizes"]
+    if isinstance(original_sizes, torch.Tensor):
+        original_sizes = original_sizes.tolist()
+    instances_per_image = segmenter.processor.post_process_instance_segmentation(
         outputs,
         threshold=mask_score_threshold,
         mask_threshold=0.5,
-        target_sizes=inputs["original_sizes"].tolist(),
-    )[0]
-    if len(instances["scores"]) == 0:
-        return None
-    best_instance_index = int(instances["scores"].argmax())
-    return instances["masks"][best_instance_index].cpu().numpy().astype(bool)
+        target_sizes=original_sizes,
+    )
+    masks = []
+    for instances in instances_per_image:
+        if len(instances["scores"]) == 0:
+            masks.append(None)
+            continue
+        best_instance_index = int(instances["scores"].argmax())
+        masks.append(instances["masks"][best_instance_index].cpu().numpy().astype(bool))
+    return masks
+
+
+def segment_object_mask(
+    segmenter: Sam3Segmenter, rgb_image: np.ndarray, object_text_prompt: str, mask_score_threshold: float
+) -> np.ndarray | None:
+    return segment_object_masks(segmenter, [rgb_image], object_text_prompt, mask_score_threshold)[0]
 
 
 def median_depth_under_mask(depth_image_meters: np.ndarray, mask: np.ndarray) -> float | None:
@@ -468,16 +734,14 @@ def assign_stage_labels(
     object_distances: np.ndarray,
     joint_positions: np.ndarray,
     thresholds: StageThresholds,
+    gripper_positions: np.ndarray | None = None,
 ) -> np.ndarray:
     # Stages latch at their first crossing, so a label never goes backwards within an episode.
-    is_grasping = (gripper_commands < thresholds.gripper_closed_threshold) & (
-        object_distances < thresholds.grasp_distance_meters
-    )
     stage = np.full(len(gripper_commands), APPROACH_STAGE, dtype=np.int64)
-    if not is_grasping.any():
+    grasp_onset = find_grasp_onset(gripper_commands, gripper_positions, object_distances, thresholds)
+    if grasp_onset is None:
         return stage
 
-    grasp_onset = int(np.argmax(is_grasping))
     stage[grasp_onset:] = GRASP_STAGE
     displacement_from_grasp = np.linalg.norm(joint_positions - joint_positions[grasp_onset], axis=1)
     has_pulled = (displacement_from_grasp > thresholds.pull_joint_displacement_threshold) & (
@@ -486,6 +750,28 @@ def assign_stage_labels(
     if has_pulled.any():
         stage[int(np.argmax(has_pulled)) :] = PULL_STAGE
     return stage
+
+
+def find_grasp_onset(
+    gripper_commands: np.ndarray,
+    gripper_positions: np.ndarray | None,
+    object_distances: np.ndarray,
+    thresholds: StageThresholds,
+) -> int | None:
+    is_near_object = object_distances < thresholds.grasp_distance_meters
+    if thresholds.gripper_still_frames == 0:
+        is_grasping = (gripper_commands < thresholds.gripper_closed_threshold) & is_near_object
+        return int(np.argmax(is_grasping)) if is_grasping.any() else None
+
+    # The grasp starts when the measured gripper is closed and has stopped moving, so the frames
+    # while it is still closing stay in the approach. The label starts at the first still frame.
+    still_frames = thresholds.gripper_still_frames
+    is_closed = gripper_positions < thresholds.gripper_closed_threshold
+    speed = np.abs(np.diff(gripper_positions, prepend=gripper_positions[0]))
+    is_slow = speed < thresholds.gripper_still_speed_threshold
+    slow_frames_in_window = np.convolve(is_slow.astype(int), np.ones(still_frames, dtype=int))[: len(is_slow)]
+    is_grasping = is_closed & (slow_frames_in_window >= still_frames) & is_near_object
+    return int(np.argmax(is_grasping)) - still_frames + 1 if is_grasping.any() else None
 
 
 def first_frame_of_stage(stage: np.ndarray, stage_label: int) -> int | None:
@@ -549,7 +835,11 @@ def write_label_features(
         if valid_arrays
     ]
     label_stats = aggregate_stats(episode_stats) if episode_stats else {}
-    labelled_dataset.meta.stats = {**(load_stats(labelled_dataset.root) or {}), **label_stats}
+    # `add_features` copies the stats that `LeRobotDataset` rescaled to metres in memory, while the copy keeps
+    # the recorded depth unit, so the depth stats are read again from the source on disk.
+    source_stats = load_stats(dataset.root) or {}
+    depth_stats = {key: source_stats[key] for key in dataset.meta.depth_keys if key in source_stats}
+    labelled_dataset.meta.stats = {**(load_stats(labelled_dataset.root) or {}), **depth_stats, **label_stats}
     write_stats(labelled_dataset.meta.stats, labelled_dataset.root)
     logging.info("Wrote %s to %s", sorted(label_values), labelled_dataset.root)
 

@@ -57,6 +57,7 @@ lerobot-mcap-convert \
   --repo_id local/<dataset_name> \
   --d405_color_intrinsics_path /path/to/d405_intrinsics.yaml \
   --d405_depth_intrinsics_path /path/to/d405_depth_intrinsics.yaml \
+  --align_depth true \
   --episode_allow_list_path /path/to/good_episodes.txt
 
 lerobot-mcap-convert \

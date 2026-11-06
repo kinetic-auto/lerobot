@@ -16,7 +16,7 @@ FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0
 
 ARG LEROBOT_REPO=huggingface/lerobot
 ARG LEROBOT_REF=main
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.10
 ARG TORCH_VERSION=2.11.0
 ARG TORCHCODEC_VERSION=0.11.0
 ARG TORCH_CUDA_ARCH=8.7
@@ -24,10 +24,9 @@ ARG TORCH_CUDA_ARCH=8.7
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
-# --- base toolchain + Python 3.12 (deadsnakes PPA ships python3.12-dev, apt jammy alone doesn't) ---
+# --- base toolchain + Python 3.10 (ships with jammy) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common curl git ninja-build pkg-config \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
@@ -65,7 +64,7 @@ RUN USE_CUDA=1 USE_CUDNN=1 \
     PYTORCH_BUILD_VERSION=${TORCH_VERSION} PYTORCH_BUILD_NUMBER=1 \
     MAX_JOBS=3 USE_DISTRIBUTED=1 USE_GLOO=1 USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=1 USE_NVSHMEM=0 \
     python3 setup.py bdist_wheel \
-    && python3 -m pip install dist/torch-${TORCH_VERSION}-cp312-cp312-linux_aarch64.whl
+    && python3 -m pip install dist/torch-${TORCH_VERSION}-*.whl
 
 # --- build ffmpeg with NVDEC (dav1d >=1.0.0 needed by ffmpeg 8.x, jammy's apt only has 0.9.2) ---
 RUN git clone --branch 1.5.1 --depth 1 https://code.videolan.org/videolan/dav1d.git /opt/dav1d-src \
@@ -143,7 +142,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         speech-dispatcher speech-dispatcher-espeak-ng ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# python3.12's ensurepip only ever creates pip3/pip3.12, never a bare `pip` -
+# python3.10's ensurepip only ever creates pip3/pip3.10, never a bare `pip` -
 # every doc/tutorial that says `pip install X` fails with "command not found" otherwise.
 RUN ln -sf /opt/venv/bin/pip3 /opt/venv/bin/pip
 

@@ -4,21 +4,23 @@
 
 `lerobot-mcap-valid` scans a recording session, one `.mcap` file per episode, before conversion. Requires the `mcap-dep` extra.
 
-Each episode gets a severity: `critical` (a required topic has no messages, a gap inside a stream, depth that does not decode, or no static transform between the depth and color frames), `warning` (a gap at the start or end of a stream, or a stream rate well below the batch median) or `pass`. A JSON and a Markdown report are written to `<session>/mcap_valid_reports/`.
+Each episode gets a severity: `critical` (a required topic has no messages, a gap inside a stream, or depth that does not decode or whose size differs from `--d405_depth_intrinsics_path`), `warning` (a gap at the start or end of a stream, or a stream rate well below the batch median) or `pass`. A JSON and a Markdown report are written to `<session>/mcap_valid_reports/`.
 
 Flags:
 
 - `--session_directory`: folder searched recursively for `*.mcap` files (required).
+- `--d405_depth_intrinsics_path`: depth intrinsics YAML; when given, a depth frame of another size than its `img_size` is critical (optional).
 - `--report_directory`: where to write `report.json` and `report.md` (default: `<session>/mcap_valid_reports/`).
 - `--stream_gap_factor` / `--stream_min_gap_seconds`: a gap is flagged above the larger of this multiple of the topic's median interval and the absolute floor (defaults: 5.0, 0.5 s).
-- `--fps_tolerance`: fraction below the batch median rate that raises a warning (default: 0.15).
+- `--fps_tolerance`: fraction below the batch median rate that raises a warning (default: 0.30).
 - `--fail_on_critical`: exit with code 1 if any episode is critical.
 
 Example:
 
 ```bash
 lerobot-mcap-valid \
-  --session_directory /path/to/<session_name>
+  --session_directory /path/to/<session_name> \
+  --d405_depth_intrinsics_path /path/to/d405_depth_intrinsics.yaml
 ```
 
 ## Convert MCAP to LeRobotDataset v3.0
@@ -27,21 +29,23 @@ lerobot-mcap-valid \
 
 Each frame holds:
 
-- `observation.state`: the joint positions followed by the joint efforts, with the gripper opening and torque as the last channel of each group. Joints are matched by name, so their order in `/joint_states` does not matter.
+- `observation.state`: the joint positions followed by the joint efforts, with the gripper opening as the last position channel. The gripper effort channel is present and always zero; `estimated_torque_nm` is not read. Joints are matched by name, so their order in `/joint_states` does not matter.
 - `action`: the observation state `--action_lookahead_frames` frames later. The last frames of an episode, which have no later state, are dropped.
 - `observation.images.pc1`, `observation.images.realsense`: RGB cameras, resized to the configured output size.
-- `observation.images.realsense_depth`: D405 depth in millimeters, projected into the D405 color camera using the color intrinsics from `--d405_color_intrinsics_path`, the depth intrinsics from the recorded depth `camera_info`, and the depth-to-color transform from `/tf_static`.
+- `observation.images.realsense_depth`: D405 depth in millimeters. `--align_depth` (the default) projects it into the D405 color camera using the intrinsics and `camera_link_to_optical` extrinsics from `--d405_color_intrinsics_path` and `--d405_depth_intrinsics_path`. `--align_depth false` stores the depth image as recorded, which is what a sim bag needs when its depth is already in the color image. The bags need no `camera_info` or `/tf_static` topic.
 
-All streams are resampled onto a fixed `--fps` grid by holding each stream's latest message. Depth pixels with no return are stored at `--no_return_depth_millimeters` (default 10000, the 10 m end of the range), because the dataset's depth video decodes values into 0.01 to 10 m and a zero would otherwise read back as a very near surface. An episode that fails to convert, for example on non-finite joint values, is skipped and its reason is logged. The dataset root also gets `mcap_conversion_manifest.json`, which lists the converted episodes and the skipped ones with their reasons.
+All streams are resampled onto a fixed `--fps` grid by holding each stream's latest message. Depth pixels with no return are stored at `--no_return_depth_mm` (default 10000, the 10 m end of the range), because the dataset's depth video decodes values into 0.01 to 10 m and a zero would otherwise read back as a very near surface. An episode that fails to convert, for example on non-finite joint values, is skipped and its reason is logged. The dataset root also gets `mcap_conversion_manifest.json`, which lists the converted episodes and the skipped ones with their reasons.
 
 Flags:
 
-- `--session_directory`, `--output_root`, `--repo_id`, `--d405_color_intrinsics_path`: required. `--output_root` must not exist yet.
+- `--session_directory`, `--output_root`, `--repo_id`: required. `--output_root` must not exist yet.
+- `--align_depth`: project depth into the color camera (default: true). Requires `--d405_color_intrinsics_path` and `--d405_depth_intrinsics_path`. Pass `false` to keep the recorded depth image.
 - `--episode_allow_list_path`: text file with one episode folder name per line; only those episodes are converted.
 - `--include_flagged`: highest report severity to convert, `pass`, `warning` or `critical` (default: `warning`).
 - `--quality_report_path`: report to use instead of `<session>/mcap_valid_reports/report.json`.
 - `--fps` (default: 10), `--action_lookahead_frames` (default: 3), `--task`, `--robot_type`.
-- `--pc1_output_size` / `--d405_output_size`: `[width, height]` (defaults: `[640, 360]`).
+- `--camera_feature_names`: dataset camera names, matched to `topics_mapping` (default: `pc1`, `realsense`, `realsense_depth`). A name ending in `_depth` is stored as a depth map.
+- `--img_sizes`: `[width, height]` per camera name (default: `[640, 360]` for each camera).
 - `--joint_names`: joints in dataset order (default: the six UR joints, shoulder pan to wrist 3).
 
 Example:
@@ -52,7 +56,14 @@ lerobot-mcap-convert \
   --output_root /path/to/<dataset_name> \
   --repo_id local/<dataset_name> \
   --d405_color_intrinsics_path /path/to/d405_intrinsics.yaml \
+  --d405_depth_intrinsics_path /path/to/d405_depth_intrinsics.yaml \
   --episode_allow_list_path /path/to/good_episodes.txt
+
+lerobot-mcap-convert \
+  --session_directory /path/to/<sim_session_name> \
+  --output_root /path/to/<sim_dataset_name> \
+  --repo_id local/<sim_dataset_name> \
+  --align_depth false
 ```
 
 Then check the result with `lerobot-dataset-valid`: it loads the dataset and checks the features, the first frame, a spread of frames, timestamp spacing, finite values, plausible metric depth, and the counts against the manifest.

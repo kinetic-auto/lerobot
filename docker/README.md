@@ -27,7 +27,7 @@ lerobot-train --policy.type=act --dataset.repo_id=lerobot/aloha_sim_transfer_cub
 
 ### `Dockerfile.user` (CPU)
 
-A lightweight image based on `python:3.12-slim`. Includes all Python dependencies and system libraries but does not include CUDA — there is no GPU support. Useful for exploring the codebase, running scripts, or working with robots, but not practical for training.
+A lightweight image based on `python:3.10-slim`. Includes all Python dependencies and system libraries but does not include CUDA — there is no GPU support. Useful for exploring the codebase, running scripts, or working with robots, but not practical for training.
 
 ### `Dockerfile.internal` (GPU)
 

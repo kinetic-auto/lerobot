@@ -23,7 +23,7 @@ ARG OS_VERSION=24.04
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
 
 # Define Python version argument
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.10
 
 # Configure environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -33,8 +33,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TEST_TYPE=single_gpu \
     DEVICE=cuda
 
-# Install Python, system dependencies, and uv (as root)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install Python, system dependencies, and uv (as root); Ubuntu 24.04 only ships Python 3.12, so Python 3.10 comes from deadsnakes
+RUN apt-get update && apt-get install -y --no-install-recommends software-properties-common gnupg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
     build-essential git curl \
     libglib2.0-0 libgl1 libegl1 ffmpeg \
     libusb-1.0-0-dev speech-dispatcher libgeos-dev portaudio19-dev \

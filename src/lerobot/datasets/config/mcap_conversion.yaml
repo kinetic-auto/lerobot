@@ -1,0 +1,13 @@
+topics:
+  - "/joint_states"
+  - "/kinetic_gripper/feedback"
+  - "/perception_cameras/pc1/image_raw/compressed"
+  - "/camera/camera/color/image_raw/compressed"
+  - "/camera/camera/depth/image_rect_raw/compressedDepth"
+
+topics_mapping:
+  "/joint_states": "robot_state"
+  "/kinetic_gripper/feedback": "gripper_feedback"
+  "/perception_cameras/pc1/image_raw/compressed": "pc1"
+  "/camera/camera/color/image_raw/compressed": "realsense"
+  "/camera/camera/depth/image_rect_raw/compressedDepth": "realsense_depth"

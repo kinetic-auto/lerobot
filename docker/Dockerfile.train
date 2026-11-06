@@ -25,7 +25,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
 
 ARG LEROBOT_EXTRAS=training,dataset_viz
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.10
 
 ENV DEBIAN_FRONTEND=noninteractive \
     MUJOCO_GL=egl \
@@ -33,15 +33,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_EXTRA_INDEX_URL=${TORCH_INDEX_URL}
 
+# Ubuntu's own Python 3.10 refuses ensurepip, so its pip comes from python3-pip; a deadsnakes Python still uses ensurepip.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common gnupg \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
-    python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+    python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv python3-pip \
     build-essential git ffmpeg \
     libglib2.0-0 libgl1 libegl1 \
     cmake pkg-config ninja-build \
-    && python${PYTHON_VERSION} -m ensurepip --upgrade \
+    && { python${PYTHON_VERSION} -m ensurepip --upgrade || python${PYTHON_VERSION} -m pip --version; } \
     && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
     && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
     && apt-get clean && rm -rf /var/lib/apt/lists/*

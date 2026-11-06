@@ -144,11 +144,14 @@ class JointSpaceLayout:
         except ValueError as exc:
             raise ValueError(f"Feature names are not packed '<joint>.<field>' blocks: {names}") from exc
 
-        # Create a mapping of joint names and fields to their positions in the feature.
-        index = {
-            (name.rpartition(".")[0], name.rpartition(".")[2]): position
-            for position, name in enumerate(names)
-        }
+        # Names with no field suffix are a position block (see io_block_layout).
+        index = {}
+        for position, name in enumerate(names):
+            if "." not in name:
+                index[(name, "position")] = position
+                continue
+            joint, _, field_name = name.rpartition(".")
+            index[(joint, field_name)] = position
 
         return cls(joint_names=list(joint_names), fields=list(fields), index=index)
 

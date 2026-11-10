@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -286,6 +287,16 @@ def test_convert_joints_to_cartesian(tmp_path, empty_lerobot_dataset_factory):
         assert regimes["free"]["frames"] + regimes["contact"]["frames"] == 24
         assert stats["baseline"]["frames"] > 0
         assert sum(item["fraction"] for item in stats["force_histogram"]) == pytest.approx(1.0)
+    manifest = json.loads((converted.root / "cartesian_conversion_manifest.json").read_text())
+    assert manifest["repo_id"] == dataset.repo_id
+    assert manifest["root"] == str(dataset.root)
+    assert manifest["new_repo_id"] == converted.repo_id
+    assert manifest["new_root"] == str(converted.root)
+    assert manifest["operation"] == json.loads(json.dumps(asdict(config)))
+    assert manifest["converted"] == [
+        {"episode_index": 0, "frame_count": 12},
+        {"episode_index": 1, "frame_count": 12},
+    ]
     reloaded = LeRobotDataset(converted.repo_id, root=converted.root)
     assert len(reloaded) == 24
     assert reloaded.meta.features[OBS_STATE]["names"] == EXPECTED_NAMES
@@ -301,6 +312,91 @@ def _conversion_config(tmp_path, **overrides):
     }
     config.update(overrides)
     return JointToCartesianConversionConfig(**config)
+
+
+def test_conversion_manifest_records_the_joint_map_used_when_the_flag_was_unset(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset(tmp_path, empty_lerobot_dataset_factory)
+
+    converted, _report = convert_joints_to_cartesian(
+        dataset,
+        _conversion_config(tmp_path, joint_map=None),
+        output_dir=tmp_path / "cartesian",
+        repo_id="local/cartesian",
+    )
+
+    manifest = json.loads((converted.root / "cartesian_conversion_manifest.json").read_text())
+    assert manifest["operation"]["joint_map"] == JOINT_MAP
+    assert manifest["operation"]["target_frame"] == "tcp"
+
+
+def test_conversion_manifest_carries_episode_ids_from_the_source_mcap_manifest(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset(tmp_path, empty_lerobot_dataset_factory)
+    source_manifest = {
+        "converted": [
+            {"episode_id": "episode-a", "episode_index": 0, "frame_count": 12},
+            {"episode_id": "episode-b", "episode_index": 1, "frame_count": 12},
+        ]
+    }
+    (dataset.root / "mcap_conversion_manifest.json").write_text(json.dumps(source_manifest))
+
+    converted, _report = convert_joints_to_cartesian(
+        dataset, _conversion_config(tmp_path), output_dir=tmp_path / "cartesian", repo_id="local/cartesian"
+    )
+
+    manifest = json.loads((converted.root / "cartesian_conversion_manifest.json").read_text())
+    assert manifest["converted"] == [
+        {"episode_id": "episode-a", "episode_index": 0, "frame_count": 12},
+        {"episode_id": "episode-b", "episode_index": 1, "frame_count": 12},
+    ]
+
+
+@pytest.mark.parametrize(
+    "source_manifest_text",
+    [
+        None,
+        "not json",
+        json.dumps([1, 2]),
+        json.dumps({"converted": [{"episode_id": "episode-a", "episode_index": 0, "frame_count": 12}]}),
+        json.dumps(
+            {
+                "converted": [
+                    {"episode_id": "episode-a", "episode_index": 1, "frame_count": 12},
+                    {"episode_id": "episode-b", "episode_index": 0, "frame_count": 12},
+                ]
+            }
+        ),
+    ],
+    ids=[
+        "no_manifest",
+        "malformed_json",
+        "not_an_object",
+        "episode_count_mismatch",
+        "episode_index_mismatch",
+    ],
+)
+def test_conversion_manifest_leaves_out_episode_ids_without_a_matching_source_manifest(
+    tmp_path, empty_lerobot_dataset_factory, source_manifest_text
+):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset(tmp_path, empty_lerobot_dataset_factory)
+    if source_manifest_text is not None:
+        (dataset.root / "mcap_conversion_manifest.json").write_text(source_manifest_text)
+
+    converted, _report = convert_joints_to_cartesian(
+        dataset, _conversion_config(tmp_path), output_dir=tmp_path / "cartesian", repo_id="local/cartesian"
+    )
+
+    manifest = json.loads((converted.root / "cartesian_conversion_manifest.json").read_text())
+    assert manifest["converted"] == [
+        {"episode_index": 0, "frame_count": 12},
+        {"episode_index": 1, "frame_count": 12},
+    ]
 
 
 def test_convert_position_keeps_joint_effort(tmp_path, empty_lerobot_dataset_factory):

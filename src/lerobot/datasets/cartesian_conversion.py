@@ -20,7 +20,7 @@ import logging
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -50,10 +50,13 @@ from lerobot.utils.utils import flatten_dict
 
 from .compute_stats import compute_episode_stats
 from .dataset_tools import modify_features, recompute_stats
+from .dataset_validation import CONVERSION_MANIFEST_FILE_NAME as MCAP_CONVERSION_MANIFEST_FILE_NAME
 from .io_utils import write_episodes
 from .joint_layout import VALID_JOINT_FIELDS, feature_channel_names, io_block_layout
 from .lerobot_dataset import LeRobotDataset
 from .utils import DATA_DIR, DEFAULT_EPISODES_PATH
+
+CARTESIAN_CONVERSION_MANIFEST_FILE_NAME = "cartesian_conversion_manifest.json"
 
 _EE_NAME_HINTS = ("tcp", "hand", "ee", "wrist")
 _JOINT_ANGLE_UNITS = ("rad", "deg")
@@ -361,6 +364,13 @@ def convert_joints_to_cartesian(
         units,
         converted_names,
         report if config.evaluate else None,
+    )
+    _write_conversion_manifest(
+        source_dataset=dataset,
+        converted_dataset=new_dataset,
+        config=config,
+        target_frame=target_frame,
+        joint_map=joint_map,
     )
     _plot_episodes(new_dataset, config.plot_episodes)
     _plot_contact_profiles(
@@ -1760,6 +1770,61 @@ def _write_provenance(
     }
     path = Path(dataset.root) / "meta" / "cartesian_conversion.json"
     path.write_text(json.dumps(_to_json_format(payload), indent=2) + "\n")
+
+
+def _write_conversion_manifest(
+    source_dataset: LeRobotDataset,
+    converted_dataset: LeRobotDataset,
+    config: JointToCartesianConversionConfig,
+    target_frame: str,
+    joint_map: dict[str, str],
+) -> None:
+    episode_indices = np.asarray(
+        _read_parquet_columns(converted_dataset, ["episode_index"])["episode_index"], dtype=np.int64
+    ).reshape(-1)
+    converted_episode_indices, frame_counts = np.unique(episode_indices, return_counts=True)
+    source_episode_identifiers = _read_source_episode_identifiers(source_dataset)
+    converted_episodes = []
+    for episode_index, frame_count in zip(converted_episode_indices, frame_counts, strict=True):
+        converted_episode = {"episode_index": int(episode_index), "frame_count": int(frame_count)}
+        if source_episode_identifiers is not None:
+            converted_episode = {
+                "episode_id": source_episode_identifiers[int(episode_index)],
+                **converted_episode,
+            }
+        converted_episodes.append(converted_episode)
+    manifest = {
+        "repo_id": source_dataset.repo_id,
+        "root": str(source_dataset.root),
+        "new_repo_id": converted_dataset.repo_id,
+        "new_root": str(converted_dataset.root),
+        "operation": {**asdict(config), "target_frame": target_frame, "joint_map": joint_map},
+        "converted": converted_episodes,
+    }
+    manifest_path = Path(converted_dataset.root) / CARTESIAN_CONVERSION_MANIFEST_FILE_NAME
+    manifest_path.write_text(json.dumps(_to_json_format(manifest), indent=2) + "\n")
+
+
+def _read_source_episode_identifiers(dataset: LeRobotDataset) -> list[str] | None:
+    manifest_path = Path(dataset.root) / MCAP_CONVERSION_MANIFEST_FILE_NAME
+    if not manifest_path.exists():
+        return None
+    try:
+        source_episodes = json.loads(manifest_path.read_text())["converted"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        source_episodes = []
+    is_aligned_with_dataset = len(source_episodes) == dataset.meta.total_episodes and all(
+        isinstance(episode, dict) and episode.get("episode_index") == position and "episode_id" in episode
+        for position, episode in enumerate(source_episodes)
+    )
+    if not is_aligned_with_dataset:
+        logging.warning(
+            "%s does not match the episodes of %s; episode ids are left out of the conversion manifest.",
+            manifest_path,
+            dataset.repo_id,
+        )
+        return None
+    return [episode["episode_id"] for episode in source_episodes]
 
 
 def _sha256(path: str) -> str:

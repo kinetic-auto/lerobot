@@ -18,8 +18,11 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
+    DepthRangeProcessorStep,
+    NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStep,
     make_default_pre_post_processors,
 )
 
@@ -47,4 +50,25 @@ def make_kinetic_act_pre_post_processors(
         tuple[PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]: A tuple containing the
         pre-processor pipeline and the post-processor pipeline.
     """
-    return make_default_pre_post_processors(config, dataset_stats, normalizer_device=config.device)
+    preprocessor, postprocessor = make_default_pre_post_processors(
+        config, dataset_stats, normalizer_device=config.device
+    )
+    if config.valid_depth_range_meters is not None:
+        minimum_depth_meters, maximum_depth_meters = config.valid_depth_range_meters
+        _insert_before_normalizer(
+            preprocessor, DepthRangeProcessorStep(minimum_depth_meters, maximum_depth_meters)
+        )
+    return preprocessor, postprocessor
+
+
+def _insert_before_normalizer(
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], step: ProcessorStep
+) -> None:
+    steps = list(preprocessor.steps)
+    normalizer_index = next(
+        (index for index, existing in enumerate(steps) if isinstance(existing, NormalizerProcessorStep)),
+        None,
+    )
+    if normalizer_index is None:
+        raise ValueError("The preprocessor has no normalizer step to insert the depth range step before.")
+    preprocessor.steps = [*steps[:normalizer_index], step, *steps[normalizer_index:]]

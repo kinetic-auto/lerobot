@@ -24,7 +24,9 @@ from typing import Any
 import cv2
 import numpy as np
 
+from lerobot.configs.video import DepthEncoderConfig, depth_encoder_defaults
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.depth_range import zero_depth_outside_valid_range
 
 from .dataset_validation import CONVERSION_MANIFEST_FILE_NAME
 from .joint_layout import packed_feature_names
@@ -88,6 +90,7 @@ class McapConversionConfig:
         }
     )
     no_return_depth_mm: int = 10000
+    valid_depth_range_meters: tuple[float, float] | None = None
 
 
 @dataclass
@@ -131,6 +134,7 @@ def convert_session(config: McapConversionConfig) -> None:
         root=config.output_root,
         robot_type=config.robot_type,
         use_videos=True,
+        depth_encoder=build_depth_encoder_config(config),
     )
 
     converted_episodes = []
@@ -189,6 +193,13 @@ def validate_config(config: McapConversionConfig) -> None:
         raise ValueError(
             f"no_return_depth_mm must be in (0, {max_depth_mm}], got {config.no_return_depth_mm}."
         )
+    if config.valid_depth_range_meters is not None:
+        minimum_depth_meters, maximum_depth_meters = config.valid_depth_range_meters
+        if not 0 <= minimum_depth_meters < maximum_depth_meters:
+            raise ValueError(
+                f"valid_depth_range_meters must be (minimum, maximum) meters with 0 <= minimum < maximum. "
+                f"Got {config.valid_depth_range_meters}."
+            )
     if not config.joint_names:
         raise ValueError("joint_names must not be empty.")
     if config.align_depth and not (
@@ -271,6 +282,15 @@ def build_features(config: McapConversionConfig, state_names: list[str]) -> dict
             feature["info"] = {"is_depth_map": True}
         features[f"{OBS_IMAGES}.{feature_name}"] = feature
     return features
+
+
+def build_depth_encoder_config(config: McapConversionConfig) -> DepthEncoderConfig | None:
+    if config.valid_depth_range_meters is None:
+        return None
+    # A stored zero decodes as depth_min. The default floor is 10 mm, so keep the floor at zero.
+    depth_encoder_config = depth_encoder_defaults()
+    depth_encoder_config.depth_min = 0.0
+    return depth_encoder_config
 
 
 def convert_episode(
@@ -426,7 +446,10 @@ def decode_camera_observations(
         output_size = tuple(config.img_sizes[feature_name])
         if feature_name.endswith("_depth"):
             decoder = depth_frame_decoder(
-                streams.depth_alignment, output_size, config.no_return_depth_mm
+                streams.depth_alignment,
+                output_size,
+                config.no_return_depth_mm,
+                config.valid_depth_range_meters,
             )
         else:
             decoder = LatestMessageDecoder(lambda payload, size=output_size: decode_rgb_image(payload, size))
@@ -459,14 +482,17 @@ def depth_frame_decoder(
     depth_alignment: DepthAlignment | None,
     output_size: tuple[int, int],
     no_return_depth_mm: int,
+    valid_depth_range_meters: tuple[float, float] | None = None,
 ) -> LatestMessageDecoder:
     if depth_alignment is None:
         return LatestMessageDecoder(
-            lambda payload: decode_depth_image(payload, output_size, no_return_depth_mm)
+            lambda payload: decode_depth_image(
+                payload, output_size, no_return_depth_mm, valid_depth_range_meters
+            )
         )
     return LatestMessageDecoder(
         lambda payload: decode_aligned_depth_image(
-            payload, depth_alignment, output_size, no_return_depth_mm
+            payload, depth_alignment, output_size, no_return_depth_mm, valid_depth_range_meters
         )
     )
 
@@ -483,9 +509,10 @@ def decode_depth_image(
     depth_payload: tuple[str, bytes],
     output_size: tuple[int, int],
     no_return_depth_mm: int,
+    valid_depth_range_meters: tuple[float, float] | None = None,
 ) -> np.ndarray:
     depth_millimeters = decode_depth_millimeters(depth_payload)
-    return store_depth_image(depth_millimeters, output_size, no_return_depth_mm)
+    return store_depth_image(depth_millimeters, output_size, no_return_depth_mm, valid_depth_range_meters)
 
 
 def decode_aligned_depth_image(
@@ -493,13 +520,14 @@ def decode_aligned_depth_image(
     alignment: DepthAlignment,
     output_size: tuple[int, int],
     no_return_depth_mm: int,
+    valid_depth_range_meters: tuple[float, float] | None = None,
 ) -> np.ndarray:
     depth_millimeters = decode_depth_millimeters(depth_payload)
     validate_depth_image_dims(depth_millimeters, alignment.depth_camera)
     aligned_millimeters = align_depth_to_rgb(
         depth_millimeters, alignment.depth_camera, alignment.color_camera, alignment.depth_frame_wrt_rgb_frame
     )
-    return store_depth_image(aligned_millimeters, output_size, no_return_depth_mm)
+    return store_depth_image(aligned_millimeters, output_size, no_return_depth_mm, valid_depth_range_meters)
 
 
 def decode_depth_millimeters(depth_payload: tuple[str, bytes]) -> np.ndarray:
@@ -508,13 +536,20 @@ def decode_depth_millimeters(depth_payload: tuple[str, bytes]) -> np.ndarray:
 
 
 def store_depth_image(
-    depth_millimeters: np.ndarray, output_size: tuple[int, int], no_return_depth_mm: int
+    depth_millimeters: np.ndarray,
+    output_size: tuple[int, int],
+    no_return_depth_mm: int,
+    valid_depth_range_meters: tuple[float, float] | None = None,
 ) -> np.ndarray:
     # Nearest-neighbor keeps a no-return zero from blending into a real range
     resized_millimeters = cv2.resize(depth_millimeters, output_size, interpolation=cv2.INTER_NEAREST)
-    # The dataset's depth video decodes into a floor above zero, so a no-return zero would read back as
-    # a very near surface. Store it at the far end of the range instead.
-    resized_millimeters[resized_millimeters == 0] = no_return_depth_mm
+
+    # Filter out invalid depth values / out of range depth values
+    if valid_depth_range_meters is None:
+        resized_millimeters[resized_millimeters == 0] = no_return_depth_mm
+    else:
+        resized_millimeters = zero_depth_outside_valid_range(resized_millimeters, *valid_depth_range_meters)
+
     return resized_millimeters[..., None]
 
 

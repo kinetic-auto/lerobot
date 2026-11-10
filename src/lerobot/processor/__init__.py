@@ -39,6 +39,7 @@ from .converters import (
     transition_to_robot_action,
 )
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
+from .depth_range_processor import DepthRangeProcessorStep
 from .device_processor import DeviceProcessorStep
 from .env_processor import IsaaclabArenaProcessorStep, LiberoProcessorStep
 from .factory import (
@@ -111,6 +112,7 @@ __all__ = [
     "AddTeleopActionAsComplimentaryDataStep",
     "AddTeleopEventsAsInfoStep",
     "ComplementaryDataProcessorStep",
+    "DepthRangeProcessorStep",
     "batch_to_transition",
     "create_transition",
     "from_tensor_to_numpy",

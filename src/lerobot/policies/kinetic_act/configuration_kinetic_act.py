@@ -39,6 +39,7 @@ class KineticACTConfig(ACTConfig):
         object_mask_loss_weight: Weight of the object mask loss.
         object_mask_positive_class_weight: Weight of the object cells in the object mask loss.
         use_camera_identity_embedding: Whether to add a learned embedding per camera.
+        valid_depth_range_meters: Depth range in meters. Values outside it are set to 0. None leaves depth unchanged.
     """
 
     object_distance_label_key: str | None = None
@@ -50,6 +51,7 @@ class KineticACTConfig(ACTConfig):
     object_mask_loss_weight: float = 1.0
     object_mask_positive_class_weight: float = 1.0
     use_camera_identity_embedding: bool = False
+    valid_depth_range_meters: tuple[float, float] | None = None
 
     @property
     def auxiliary_label_keys(self) -> list[str]:
@@ -109,6 +111,13 @@ class KineticACTConfig(ACTConfig):
         for weight_name, weight in loss_weights.items():
             if weight < 0:
                 raise ValueError(f"`{weight_name}` must be non-negative. Got {weight}.")
+
+        if self.valid_depth_range_meters is not None:
+            minimum_depth_meters, maximum_depth_meters = self.valid_depth_range_meters
+            if not 0 <= minimum_depth_meters < maximum_depth_meters:
+                raise ValueError(
+                    f"`valid_depth_range_meters` must be (minimum, maximum) with 0 <= minimum < maximum. Got {self.valid_depth_range_meters}."
+                )
 
         # Validate the object mask positive class weight.
         if self.object_mask_positive_class_weight <= 0:

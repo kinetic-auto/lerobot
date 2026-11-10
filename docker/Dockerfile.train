@@ -50,7 +50,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /lerobot
 COPY pyproject.toml setup.py README.md MANIFEST.in ./
 COPY src ./src
-RUN python3 -m pip install -e ".[${LEROBOT_EXTRAS}]"
+RUN python3 -m pip install --upgrade "pip>=24" "setuptools>=68" wheel \
+    && python3 -m pip install -e ".[${LEROBOT_EXTRAS}]"
 
 # torchcodec prerequires nvidia-npp-cu12
 RUN python3 -m pip install nvidia-npp-cu12

@@ -33,6 +33,7 @@ from lerobot.datasets.mcap_conversion import (
     build_time_grid,
     decode_aligned_depth_image,
     decode_depth_image,
+    build_depth_encoder_config,
     depth_frame_decoder,
     find_joint_indices,
     latest_message_indices,
@@ -141,6 +142,33 @@ def test_decode_aligned_depth_image_stores_no_return_at_the_far_end():
     assert depth_image.dtype == np.uint16
     assert (depth_image[:, :4, 0] == 10000).all()
     assert (depth_image[:, 4:, 0] == 500).all()
+
+
+def test_decode_depth_image_zeroes_depth_outside_the_configured_range():
+    depth_millimeters = np.full((24, 32), 500, dtype=np.uint16)
+    depth_millimeters[:, :4] = 0
+    depth_millimeters[:, -4:] = 4000
+    payload = depth_payload(depth_millimeters)
+    depth_image = decode_depth_image(
+        payload, (32, 24), no_return_depth_mm=10000, valid_depth_range_meters=(0.06, 2.0)
+    )
+    assert depth_image.dtype == np.uint16
+    assert (depth_image[:, :4, 0] == 0).all()
+    assert (depth_image[:, 4:-4, 0] == 500).all()
+    assert (depth_image[:, -4:, 0] == 0).all()
+
+
+def test_valid_depth_range_sets_the_encoder_floor_to_zero(tmp_path):
+    depth_encoder_config = build_depth_encoder_config(
+        make_conversion_config(tmp_path, valid_depth_range_meters=(0.06, 2.0))
+    )
+
+    assert depth_encoder_config is not None
+    assert depth_encoder_config.depth_min == 0.0
+
+
+def test_default_depth_encoder_is_kept_without_a_valid_depth_range(tmp_path):
+    assert build_depth_encoder_config(make_conversion_config(tmp_path)) is None
 
 
 def test_decode_depth_image_keeps_pixels_an_alignment_would_shift():
@@ -319,6 +347,8 @@ def test_build_features_flags_depth_and_sizes_cameras(tmp_path):
         {"img_sizes": {"pc1": [640], "realsense": [640, 360], "realsense_depth": [640, 360]}},
         {"no_return_depth_mm": 0},
         {"no_return_depth_mm": 70000},
+        {"valid_depth_range_meters": (-0.1, 2.0)},
+        {"valid_depth_range_meters": (2.0, 0.06)},
     ],
 )
 def test_validate_config_rejects_bad_values(tmp_path, overrides):

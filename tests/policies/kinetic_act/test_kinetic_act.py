@@ -27,9 +27,11 @@ from lerobot.policies.kinetic_act.configuration_kinetic_act import (
     KineticACTConfig,
 )
 from lerobot.policies.kinetic_act.modeling_kinetic_act import KineticACT, KineticACTPolicy
+from lerobot.processor import DepthRangeProcessorStep, NormalizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 CHUNK_SIZE = 8
+VALID_DEPTH_RANGE_METERS = (0.06, 2.0)
 STATE_DIM = 6
 ACTION_DIM = 6
 STAGE_CLASS_COUNT = 3
@@ -147,6 +149,36 @@ def test_registration_resolves_config_policy_and_processors():
     preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=None)
     assert preprocessor is not None
     assert postprocessor is not None
+
+
+def test_depth_range_step_is_applied_before_the_normalizer():
+    config = make_kinetic_act_config(valid_depth_range_meters=VALID_DEPTH_RANGE_METERS)
+
+    preprocessor, _ = make_pre_post_processors(config, dataset_stats=None)
+
+    step_types = [type(step) for step in preprocessor.steps]
+    assert step_types.index(DepthRangeProcessorStep) < step_types.index(NormalizerProcessorStep)
+    depth_range_step = next(step for step in preprocessor.steps if isinstance(step, DepthRangeProcessorStep))
+    assert (
+        depth_range_step.minimum_depth_meters,
+        depth_range_step.maximum_depth_meters,
+    ) == VALID_DEPTH_RANGE_METERS
+
+
+def test_depth_range_step_zeroes_invalid_depth_and_keeps_millimeters_in_the_processed_batch():
+    config = make_kinetic_act_config(valid_depth_range_meters=VALID_DEPTH_RANGE_METERS)
+    preprocessor, _ = make_pre_post_processors(config, dataset_stats=None)
+    batch = make_inference_batch()
+    depth_millimeters = torch.full((2, 1, IMAGE_HEIGHT, IMAGE_WIDTH), 300.0)
+    depth_millimeters[..., 0] = 10000.0
+    batch[DEPTH_CAMERA_KEY] = depth_millimeters
+
+    processed = preprocessor(batch)
+
+    assert torch.equal(processed[DEPTH_CAMERA_KEY][..., 0], torch.zeros(2, 1, IMAGE_HEIGHT))
+    assert torch.allclose(
+        processed[DEPTH_CAMERA_KEY][..., 1:], torch.full((2, 1, IMAGE_HEIGHT, IMAGE_WIDTH - 1), 300.0)
+    )
 
 
 def test_set_dataset_feature_metadata_drops_label_keys_from_inputs():

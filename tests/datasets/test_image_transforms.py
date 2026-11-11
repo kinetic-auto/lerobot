@@ -42,6 +42,7 @@ from lerobot.transforms import (
     RandomSubsetApply,
     SharpnessJitter,
     make_transform_from_config,
+    transform_image_with_aligned_mask,
 )
 from lerobot.utils.random_utils import seeded_context
 from tests.artifacts.image_transforms.save_image_transforms_to_safetensors import ARTIFACT_DIR
@@ -613,3 +614,122 @@ def test_random_shadow_supports_small_images():
 def test_robotics_transform_rejects_invalid_config(cls, kwargs):
     with pytest.raises(ValueError):
         cls(**kwargs)
+
+
+# --- Tests for moving a per-pixel mask label with the image ---
+
+# RealSense layout: 360x640 image, mask label downsampled by 16 to 23x40.
+MASK_DOWNSAMPLE_FACTOR = 16
+ALIGNED_IMAGE_SIZE = (360, 640)
+ALIGNED_MASK_SIZE = (23, 40)
+
+
+def make_image_with_aligned_mask() -> tuple[torch.Tensor, torch.Tensor]:
+    """Make an image whose bright pixels are the object cells of its mask."""
+    mask = torch.zeros(ALIGNED_MASK_SIZE, dtype=torch.uint8)
+    mask[4:10, 15:22] = 1
+    mask[20:23, 30:33] = 1
+    upsampled_mask = mask.repeat_interleave(MASK_DOWNSAMPLE_FACTOR, dim=0).repeat_interleave(
+        MASK_DOWNSAMPLE_FACTOR, dim=1
+    )[: ALIGNED_IMAGE_SIZE[0], : ALIGNED_IMAGE_SIZE[1]]
+    image = (upsampled_mask * 255).expand(3, -1, -1).contiguous()
+    return image, mask
+
+
+def make_label_from_bright_pixels(image: torch.Tensor) -> torch.Tensor:
+    """Make the mask label from the bright pixels."""
+    padded_mask = torch.zeros(
+        ALIGNED_MASK_SIZE[0] * MASK_DOWNSAMPLE_FACTOR, ALIGNED_MASK_SIZE[1] * MASK_DOWNSAMPLE_FACTOR
+    )
+    padded_mask[: ALIGNED_IMAGE_SIZE[0], : ALIGNED_IMAGE_SIZE[1]] = (image[0] > 127).float()
+    mask_blocks = padded_mask.reshape(
+        ALIGNED_MASK_SIZE[0], MASK_DOWNSAMPLE_FACTOR, ALIGNED_MASK_SIZE[1], MASK_DOWNSAMPLE_FACTOR
+    )
+    return (mask_blocks.mean(dim=(1, 3)) >= 0.5).to(torch.uint8)
+
+
+def test_aligned_mask_is_unchanged_by_the_identity_transform():
+    image, mask = make_image_with_aligned_mask()
+
+    transformed_image, transformed_mask = transform_image_with_aligned_mask(v2.Identity(), image, mask)
+
+    assert torch.equal(transformed_image, image)
+    assert torch.equal(transformed_mask, mask)
+    assert type(transformed_image) is torch.Tensor
+    assert type(transformed_mask) is torch.Tensor
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_aligned_mask_follows_the_affine_translation(seed):
+    image, mask = make_image_with_aligned_mask()
+    # Translation-only affines shift by whole pixels.
+    translation_transform = ImageTransforms(
+        ImageTransformsConfig(
+            enable=True,
+            tfs={
+                "affine": ImageTransformConfig(
+                    type="RandomAffine", kwargs={"degrees": 0.0, "translate": (0.1, 0.1)}
+                )
+            },
+        )
+    )
+
+    with seeded_context(seed):
+        transformed_image, transformed_mask = transform_image_with_aligned_mask(
+            translation_transform, image, mask
+        )
+
+    assert not torch.equal(transformed_mask, mask)
+    assert torch.equal(transformed_mask, make_label_from_bright_pixels(transformed_image))
+
+
+def test_fill_of_uncovered_pixels_does_not_become_object():
+    image, mask = make_image_with_aligned_mask()
+    translation_with_grey_fill = v2.RandomAffine(degrees=0.0, translate=(0.1, 0.1), fill=128)
+    translation_with_zero_fill = v2.RandomAffine(degrees=0.0, translate=(0.1, 0.1), fill=0)
+
+    with seeded_context(0):
+        _, mask_with_grey_fill = transform_image_with_aligned_mask(translation_with_grey_fill, image, mask)
+    with seeded_context(0):
+        _, mask_with_zero_fill = transform_image_with_aligned_mask(translation_with_zero_fill, image, mask)
+
+    assert torch.equal(mask_with_grey_fill, mask_with_zero_fill)
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        v2.ColorJitter(brightness=(0.5, 0.5)),
+        SharpnessJitter(sharpness=(0.5, 0.5)),
+        *(cls(**kwargs) for _, cls, kwargs in ROBOTICS_TRANSFORMS),
+    ],
+    ids=["ColorJitter", "SharpnessJitter", *(name for name, _, _ in ROBOTICS_TRANSFORMS)],
+)
+def test_photometric_transforms_change_the_image_and_keep_the_mask(transform):
+    _, mask = make_image_with_aligned_mask()
+    image = torch.rand(3, *ALIGNED_IMAGE_SIZE)
+
+    with seeded_context(0):
+        transformed_image, transformed_mask = transform_image_with_aligned_mask(transform, image, mask)
+
+    assert not torch.equal(transformed_image, image)
+    assert torch.equal(transformed_mask, mask)
+
+
+def test_mask_with_a_missing_label_marker_is_left_unchanged():
+    image, _ = make_image_with_aligned_mask()
+    missing_mask = torch.full(ALIGNED_MASK_SIZE, 255, dtype=torch.uint8)
+
+    _, transformed_mask = transform_image_with_aligned_mask(
+        v2.RandomHorizontalFlip(p=1.0), image, missing_mask
+    )
+
+    assert torch.equal(transformed_mask, missing_mask)
+
+
+def test_mask_that_is_not_a_downsampling_of_the_image_is_rejected():
+    image, _ = make_image_with_aligned_mask()
+    mismatched_mask = torch.zeros(10, 40, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="not an integer downsampling"):
+        transform_image_with_aligned_mask(v2.Identity(), image, mismatched_mask)

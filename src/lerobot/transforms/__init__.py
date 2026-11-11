@@ -27,6 +27,7 @@ from .transforms import (
     RandomSubsetApply,
     SharpnessJitter,
     make_transform_from_config,
+    transform_image_with_aligned_mask,
 )
 
 # An example of transforms effects can be found in: https://github.com/huggingface/lerobot/pull/4210
@@ -46,4 +47,5 @@ __all__ = [
     "RandomSubsetApply",
     "SharpnessJitter",
     "make_transform_from_config",
+    "transform_image_with_aligned_mask",
 ]

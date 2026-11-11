@@ -23,7 +23,7 @@
 #   GIT_REF           default main
 #   REMOTE_REPO       default $HOME/github_repos/lerobot on the box
 #   REMOTE_DATA_ROOT  default /var/tmp/lerobot
-#   LEROBOT_EXTRAS    forwarded to the compose build (default: training,dataset_viz)
+#   LEROBOT_EXTRAS    forwarded to the compose build (default: training,dataset_viz,transformers-dep)
 
 set -euo pipefail
 
@@ -31,7 +31,7 @@ GIT_URL="${GIT_URL:-git@github.com:kinetic-auto/lerobot.git}"
 GIT_REF="${GIT_REF:-main}"
 REMOTE_REPO="${REMOTE_REPO:-}"
 REMOTE_DATA_ROOT="${REMOTE_DATA_ROOT:-/var/tmp/lerobot}"
-LEROBOT_EXTRAS="${LEROBOT_EXTRAS:-training,dataset_viz}"
+LEROBOT_EXTRAS="${LEROBOT_EXTRAS:-training,dataset_viz,transformers-dep}"
 SSH_USER="ubuntu"
 INSTANCE_IP=""
 SSH_KEY=""

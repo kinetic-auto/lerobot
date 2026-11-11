@@ -14,16 +14,16 @@
 #
 # docker build -f docker/Dockerfile.train -t lerobot-train .
 #
-# Override extras (default training,dataset_viz):
+# Override extras (default training,dataset_viz,transformers-dep):
 #   docker build -f docker/Dockerfile.train \
-#     --build-arg LEROBOT_EXTRAS=training,dataset_viz,smolvla \
+#     --build-arg LEROBOT_EXTRAS=training,dataset_viz,transformers-dep,smolvla \
 #     -t lerobot-train .
 
 ARG CUDA_VERSION=12.8.1
 ARG OS_VERSION=22.04
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
 
-ARG LEROBOT_EXTRAS=training,dataset_viz
+ARG LEROBOT_EXTRAS=training,dataset_viz,transformers-dep
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG PYTHON_VERSION=3.10
 

@@ -15,7 +15,7 @@
 # Optional env overrides:
 #   DATA_ROOT      — host tree mounted at /data (default: /var/tmp/lerobot)
 #   IMAGE_TAG      — tag for lerobot-train (default: latest)
-#   LEROBOT_EXTRAS — pip extras at build (default: training,dataset_viz)
+#   LEROBOT_EXTRAS — pip extras at build (default: training,dataset_viz,transformers-dep)
 #   SHM_SIZE       — /dev/shm size; DataLoader workers need well above the
 #                    64MB Docker default (default: 16gb)
 #   HOST_UID / HOST_GID — uid:gid the container runs as and that owns the output
@@ -33,7 +33,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.train
       args:
-        LEROBOT_EXTRAS: "${LEROBOT_EXTRAS:-training,dataset_viz}"
+        LEROBOT_EXTRAS: "${LEROBOT_EXTRAS:-training,dataset_viz,transformers-dep}"
         HOST_UID: "${HOST_UID:-1000}"
         HOST_GID: "${HOST_GID:-1000}"
     container_name: lerobot-train

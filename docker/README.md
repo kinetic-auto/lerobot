@@ -35,7 +35,7 @@ A CUDA-enabled image based on `nvidia/cuda`. This is the image for training — 
 
 ### `Dockerfile.train` (GPU, pip, rented-box training)
 
-A CUDA-enabled image based on `nvidia/cuda`, installed with system pip (no uv) and an editable `lerobot` install. Default extras are `training,dataset_viz`; override with the `LEROBOT_EXTRAS` build arg (for example `training,dataset_viz,smolvla`). Not part of the nightly Docker Hub pipeline — built locally or on the box via `docker/docker-compose.train.yml`.
+A CUDA-enabled image based on `nvidia/cuda`, installed with system pip (no uv) and an editable `lerobot` install. Default extras are `training,dataset_viz,transformers-dep`; override with the `LEROBOT_EXTRAS` build arg (for example `training,dataset_viz,transformers-dep,smolvla`). Not part of the nightly Docker Hub pipeline — built locally or on the box via `docker/docker-compose.train.yml`.
 
 ```bash
 docker build -f docker/Dockerfile.train -t lerobot-train .

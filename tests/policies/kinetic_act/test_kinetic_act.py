@@ -26,7 +26,11 @@ from lerobot.policies.kinetic_act.configuration_kinetic_act import (
     MISSING_STAGE_LABEL,
     KineticACTConfig,
 )
-from lerobot.policies.kinetic_act.modeling_kinetic_act import KineticACT, KineticACTPolicy
+from lerobot.policies.kinetic_act.modeling_kinetic_act import (
+    LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX,
+    KineticACT,
+    KineticACTPolicy,
+)
 from lerobot.processor import DepthRangeProcessorStep, NormalizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
@@ -46,6 +50,8 @@ DEPTH_CAMERA_KEY = f"{OBS_IMAGES}.depth"
 OBJECT_DISTANCE_LABEL_KEY = "observation.object_distance"
 STAGE_LABEL_KEY = "observation.stage"
 OBJECT_MASK_LABEL_KEY = "observation.object_mask.front"
+OBJECT_ATTENTION_OUTPUT_KEY = f"{OBJECT_MASK_LABEL_KEY}{LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX}"
+OBJECT_ATTENTION_LOSS_WEIGHT = 0.5
 
 ALL_HEAD_OVERRIDES = {
     "object_distance_label_key": OBJECT_DISTANCE_LABEL_KEY,
@@ -357,6 +363,113 @@ def test_all_object_masks_missing_gives_zero_mask_loss():
     assert loss_dict["object_mask_binary_cross_entropy_loss"] == 0.0
 
 
+def make_object_attention_policy() -> KineticACTPolicy:
+    return KineticACTPolicy(
+        make_kinetic_act_config(
+            **ALL_HEAD_OVERRIDES, object_attention_loss_weight=OBJECT_ATTENTION_LOSS_WEIGHT
+        )
+    )
+
+
+def test_object_attention_loss_is_off_by_default():
+    default_policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
+    attention_policy = make_object_attention_policy()
+
+    loss_dict = evaluate_loss_dict(default_policy, make_train_batch())
+    _, auxiliary_outputs = default_policy.predict_action_chunk_with_auxiliary_outputs(make_inference_batch())
+
+    assert "object_attention_loss" not in loss_dict
+    assert OBJECT_ATTENTION_OUTPUT_KEY not in auxiliary_outputs
+    assert parameter_shapes(attention_policy) == parameter_shapes(default_policy)
+
+
+def test_object_attention_loss_trains_the_last_decoder_cross_attention():
+    batch_size = 2
+    policy = make_object_attention_policy()
+    policy.train()
+    batch = make_train_batch(batch_size)
+    batch[OBJECT_MASK_LABEL_KEY][0] = MISSING_MASK_CELL_VALUE
+
+    loss, loss_dict = policy(batch)
+    _, (_, _), auxiliary_outputs = policy.model(policy._add_camera_image_list(batch))
+    policy.zero_grad()
+    policy._compute_object_attention_loss(batch, auxiliary_outputs).backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(torch.tensor(loss_dict["object_attention_loss"]))
+    assert auxiliary_outputs[OBJECT_ATTENTION_OUTPUT_KEY].shape == (batch_size, CHUNK_SIZE, *TOKEN_GRID_SHAPE)
+    cross_attention_gradient = policy.model.decoder.layers[-1].multihead_attn.in_proj_weight.grad
+    assert cross_attention_gradient is not None
+    assert torch.isfinite(cross_attention_gradient).all()
+    assert cross_attention_gradient.abs().sum() > 0
+
+
+def make_object_attention_inputs(batch_size: int = 2) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    # Object in the top-left 2x2 label cells, pooled onto token (0, 0).
+    object_mask = torch.zeros(batch_size, *MASK_LABEL_SHAPE, dtype=torch.uint8)
+    object_mask[:, :2, :2] = 1
+    batch = {
+        OBJECT_MASK_LABEL_KEY: object_mask,
+        "action_is_pad": torch.zeros(batch_size, CHUNK_SIZE, dtype=torch.bool),
+    }
+    attention_on_object = torch.zeros(batch_size, CHUNK_SIZE, *TOKEN_GRID_SHAPE)
+    attention_on_object[..., 0, 0] = 1.0
+    return batch, attention_on_object
+
+
+def test_object_attention_loss_is_lower_when_attention_is_on_the_object():
+    policy = make_object_attention_policy()
+    batch, attention_on_object = make_object_attention_inputs()
+    token_count = TOKEN_GRID_SHAPE[0] * TOKEN_GRID_SHAPE[1]
+    uniform_attention = torch.full_like(attention_on_object, 1.0 / token_count)
+
+    loss_on_object = policy._compute_object_attention_loss(
+        batch, {OBJECT_ATTENTION_OUTPUT_KEY: attention_on_object}
+    )
+    uniform_loss = policy._compute_object_attention_loss(
+        batch, {OBJECT_ATTENTION_OUTPUT_KEY: uniform_attention}
+    )
+
+    assert loss_on_object.item() == pytest.approx(0.0, abs=1e-5)
+    assert uniform_loss.item() == pytest.approx(torch.log(torch.tensor(float(token_count))).item(), abs=1e-5)
+
+
+def test_object_attention_loss_leaves_out_padded_steps():
+    policy = make_object_attention_policy()
+    batch, attention = make_object_attention_inputs()
+    padded_step_count = 3
+    batch["action_is_pad"][:, -padded_step_count:] = True
+    attention[:, -padded_step_count:] = 0.0
+    attention[:, -padded_step_count:, -1, -1] = 1.0
+
+    loss = policy._compute_object_attention_loss(batch, {OBJECT_ATTENTION_OUTPUT_KEY: attention})
+
+    assert loss.item() == pytest.approx(0.0, abs=1e-5)
+
+
+@pytest.mark.parametrize("unusable_mask_value", [MISSING_MASK_CELL_VALUE, 0])
+def test_object_attention_loss_leaves_out_samples_without_an_object(unusable_mask_value):
+    policy = make_object_attention_policy()
+    batch, attention = make_object_attention_inputs()
+    batch[OBJECT_MASK_LABEL_KEY][0] = unusable_mask_value
+    attention[0] = 0.0
+    attention[0, :, -1, -1] = 1.0
+
+    loss = policy._compute_object_attention_loss(batch, {OBJECT_ATTENTION_OUTPUT_KEY: attention})
+
+    assert loss.item() == pytest.approx(0.0, abs=1e-5)
+
+
+def test_all_object_masks_missing_gives_zero_object_attention_loss():
+    policy = make_object_attention_policy()
+    batch, attention = make_object_attention_inputs()
+    batch[OBJECT_MASK_LABEL_KEY][:] = MISSING_MASK_CELL_VALUE
+
+    loss = policy._compute_object_attention_loss(batch, {OBJECT_ATTENTION_OUTPUT_KEY: attention})
+
+    assert loss.item() == 0.0
+
+
 def test_missing_labels_give_finite_gradients():
     policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
     policy.train()
@@ -439,6 +552,14 @@ def test_save_and_load_round_trip(tmp_path):
         ({"stage_loss_weight": -0.1}, "stage_loss_weight"),
         ({"object_mask_loss_weight": -2.0}, "object_mask_loss_weight"),
         ({"object_mask_positive_class_weight": 0.0}, "object_mask_positive_class_weight"),
+        (
+            {
+                "object_mask_label_key_per_camera": {RGB_CAMERA_KEY: OBJECT_MASK_LABEL_KEY},
+                "object_attention_loss_weight": -1.0,
+            },
+            "object_attention_loss_weight",
+        ),
+        ({"object_attention_loss_weight": OBJECT_ATTENTION_LOSS_WEIGHT}, "needs the object mask labels"),
         ({"object_distance_label_key": "object_distance"}, "must start with 'observation.'"),
         ({"stage_label_key": OBS_STATE}, "must start with 'observation.'"),
         ({"stage_label_key": f"{OBS_IMAGES}.stage"}, "must start with 'observation.'"),

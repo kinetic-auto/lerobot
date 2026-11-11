@@ -38,6 +38,7 @@ class KineticACTConfig(ACTConfig):
         object_mask_label_key_per_camera: Camera key to dataset key of the object mask label.
         object_mask_loss_weight: Weight of the object mask loss.
         object_mask_positive_class_weight: Weight of the object cells in the object mask loss.
+        object_attention_loss_weight: Weight of the object attention loss.
         use_camera_identity_embedding: Whether to add a learned embedding per camera.
         valid_depth_range_meters: Depth range in meters. Values outside it are set to 0. None leaves depth unchanged.
     """
@@ -50,6 +51,7 @@ class KineticACTConfig(ACTConfig):
     object_mask_label_key_per_camera: dict[str, str] = field(default_factory=dict)
     object_mask_loss_weight: float = 1.0
     object_mask_positive_class_weight: float = 1.0
+    object_attention_loss_weight: float = 0.0
     use_camera_identity_embedding: bool = False
     valid_depth_range_meters: tuple[float, float] | None = None
 
@@ -67,6 +69,10 @@ class KineticACTConfig(ACTConfig):
             for label_key in chunked_label_keys
             if label_key is not None
         }
+
+    @property
+    def mask_label_key_per_camera(self) -> dict[str, str]:
+        return self.object_mask_label_key_per_camera
 
     def set_dataset_feature_metadata(self, dataset_features: dict[str, Any]) -> None:
         missing_label_keys = [
@@ -107,10 +113,17 @@ class KineticACTConfig(ACTConfig):
             "object_distance_loss_weight": self.object_distance_loss_weight,
             "stage_loss_weight": self.stage_loss_weight,
             "object_mask_loss_weight": self.object_mask_loss_weight,
+            "object_attention_loss_weight": self.object_attention_loss_weight,
         }
         for weight_name, weight in loss_weights.items():
             if weight < 0:
                 raise ValueError(f"`{weight_name}` must be non-negative. Got {weight}.")
+
+        if self.object_attention_loss_weight > 0 and not self.object_mask_label_key_per_camera:
+            raise ValueError(
+                "`object_attention_loss_weight` needs the object mask labels. "
+                "Set `object_mask_label_key_per_camera` or set the weight to 0."
+            )
 
         if self.valid_depth_range_meters is not None:
             minimum_depth_meters, maximum_depth_meters = self.valid_depth_range_meters

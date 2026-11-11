@@ -21,10 +21,12 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import (
     _resolve_episode_split,
     _uses_recomputed_relative_action_stats,
+    make_dataset,
     make_train_eval_datasets,
 )
 from lerobot.datasets.utils import EpisodeSplit
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.kinetic_act.configuration_kinetic_act import KineticACTConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR, SPLIT_INFO
 from lerobot.utils.io_utils import write_json
 
@@ -60,6 +62,38 @@ def test_make_three_way_episode_split(tmp_path, lerobot_dataset_factory):
     assert train | validation | test == set(range(10))
     assert result.eval.image_transforms is None
     assert result.test.image_transforms is None
+
+
+OBJECT_MASK_KEY_PER_CAMERA = {"observation.images.laptop": "observation.object_mask.laptop"}
+
+
+@pytest.mark.parametrize(
+    ("policy_config", "expected_mapping"),
+    [
+        (ACTConfig(device="cpu"), None),
+        (
+            KineticACTConfig(device="cpu", object_mask_label_key_per_camera=OBJECT_MASK_KEY_PER_CAMERA),
+            OBJECT_MASK_KEY_PER_CAMERA,
+        ),
+    ],
+    ids=["act", "kinetic_act"],
+)
+def test_datasets_get_the_policy_mask_label_keys(
+    tmp_path, lerobot_dataset_factory, policy_config, expected_mapping
+):
+    root = tmp_path / "dataset"
+    dataset = lerobot_dataset_factory(root=root, total_episodes=4, total_frames=40, use_videos=False)
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id=dataset.repo_id, root=str(root), split_ratio=[2, 1, 1]),
+        policy=policy_config,
+        seed=42,
+    )
+
+    full_dataset = make_dataset(cfg)
+    split_datasets = make_train_eval_datasets(cfg)
+
+    for split_dataset in (full_dataset, split_datasets.train, split_datasets.eval, split_datasets.test):
+        assert split_dataset.mask_label_key_per_camera == expected_mapping
 
 
 def test_make_eval_split_has_no_test_dataset(tmp_path, lerobot_dataset_factory):

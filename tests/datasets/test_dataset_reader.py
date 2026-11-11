@@ -173,6 +173,66 @@ def test_image_transforms_are_applied(tmp_path, lerobot_dataset_factory):
         assert transform_called["count"] >= 1
 
 
+MASKED_CAMERA_KEY = "observation.images.masked"
+UNMASKED_CAMERA_KEY = "observation.images.unmasked"
+OBJECT_MASK_KEY = "observation.object_mask.masked"
+# A 32x48 image with its mask label downsampled by 16 to 2x3.
+ALIGNED_IMAGE_SHAPE = (32, 48, 3)
+OBJECT_MASK = torch.tensor([[1, 1, 0], [0, 0, 0]], dtype=torch.uint8)
+
+
+def write_dataset_with_object_mask(root):
+    """Write a one-frame dataset with an object mask label."""
+    import numpy as np
+
+    image_feature = {"dtype": "image", "shape": ALIGNED_IMAGE_SHAPE, "names": ["height", "width", "channels"]}
+    features = {
+        "observation.state": {"dtype": "float32", "shape": (1,), "names": None},
+        "action": {"dtype": "float32", "shape": (1,), "names": None},
+        MASKED_CAMERA_KEY: image_feature,
+        UNMASKED_CAMERA_KEY: image_feature,
+        OBJECT_MASK_KEY: {"dtype": "uint8", "shape": tuple(OBJECT_MASK.shape), "names": None},
+    }
+    dataset = LeRobotDataset.create("local/object_mask", DEFAULT_FPS, features, root=root, use_videos=False)
+    image = np.zeros(ALIGNED_IMAGE_SHAPE, dtype=np.uint8)
+    image[:16, :32] = 255
+    dataset.add_frame(
+        {
+            "observation.state": np.zeros(1, dtype=np.float32),
+            "action": np.zeros(1, dtype=np.float32),
+            MASKED_CAMERA_KEY: image,
+            UNMASKED_CAMERA_KEY: image,
+            OBJECT_MASK_KEY: OBJECT_MASK.numpy(),
+            "task": "open door",
+        }
+    )
+    dataset.save_episode()
+    dataset.finalize()
+
+
+@pytest.mark.parametrize("map_mask_to_camera", [True, False])
+def test_image_transform_moves_the_mask_only_of_its_mapped_camera(tmp_path, map_mask_to_camera):
+    from torchvision.transforms import v2
+
+    root = tmp_path / "ds"
+    write_dataset_with_object_mask(root)
+    mask_label_key_per_camera = {MASKED_CAMERA_KEY: OBJECT_MASK_KEY} if map_mask_to_camera else None
+    dataset = LeRobotDataset(
+        "local/object_mask",
+        root=root,
+        image_transforms=v2.RandomHorizontalFlip(p=1.0),
+        mask_label_key_per_camera=mask_label_key_per_camera,
+    )
+    untransformed_item = LeRobotDataset("local/object_mask", root=root)[0]
+
+    item = dataset[0]
+
+    expected_mask = OBJECT_MASK.flip(-1) if map_mask_to_camera else OBJECT_MASK
+    assert torch.equal(item[OBJECT_MASK_KEY], expected_mask)
+    for camera_key in (MASKED_CAMERA_KEY, UNMASKED_CAMERA_KEY):
+        assert torch.equal(item[camera_key], untransformed_item[camera_key].flip(-1))
+
+
 # ── File paths ───────────────────────────────────────────────────────
 
 

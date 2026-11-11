@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from torchvision import tv_tensors
 from torchvision.io import decode_image, encode_jpeg
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import (
@@ -726,3 +727,82 @@ class ImageTransforms(Transform):
 
     def forward(self, *inputs: Any) -> Any:
         return self.tf(*inputs)
+
+
+def transform_image_with_aligned_mask(
+    image_transforms: Callable[..., Any], image: torch.Tensor, mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the image transforms to an image and its mask label.
+
+    Args:
+        image_transforms (Callable[..., Any]): Image transforms.
+        image (torch.Tensor): Image (..., C, H, W).
+        mask (torch.Tensor): Mask label (h, w).
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Transformed image and mask label.
+    """
+    # Non-binary masks, such as the missing-label marker, stay unchanged.
+    if not ((mask == 0) | (mask == 1)).all():
+        return image_transforms(image), mask
+
+    image_size = (image.shape[-2], image.shape[-1])
+    upsampled_mask, upsample_factor = _upsample_mask_to_image_size(mask, image_size)
+    transformed_image, transformed_mask = image_transforms(
+        tv_tensors.Image(image), tv_tensors.Mask(upsampled_mask)
+    )
+
+    downsampled_mask = _downsample_mask_to_label_size(
+        transformed_mask.as_subclass(torch.Tensor) == 1, upsample_factor, (mask.shape[-2], mask.shape[-1])
+    )
+    return transformed_image.as_subclass(torch.Tensor), downsampled_mask.to(mask.dtype)
+
+
+def _upsample_mask_to_image_size(mask: torch.Tensor, image_size: tuple[int, int]) -> tuple[torch.Tensor, int]:
+    """Upsample a mask label to the image size.
+
+    Args:
+        mask (torch.Tensor): Mask label (h, w).
+        image_size (tuple[int, int]): Image height and width.
+
+    Returns:
+        tuple[torch.Tensor, int]: Upsampled mask and upsample factor.
+    """
+    image_height, image_width = image_size
+    mask_height, mask_width = mask.shape[-2:]
+    upsample_factor = math.ceil(image_height / mask_height)
+    if (
+        math.ceil(image_height / upsample_factor) != mask_height
+        or math.ceil(image_width / upsample_factor) != mask_width
+    ):
+        raise ValueError(
+            f"Mask of size {(mask_height, mask_width)} is not an integer downsampling of the image of size "
+            f"{image_size}."
+        )
+    upsampled_mask = mask.repeat_interleave(upsample_factor, dim=-2).repeat_interleave(
+        upsample_factor, dim=-1
+    )
+    return upsampled_mask[..., :image_height, :image_width], upsample_factor
+
+
+def _downsample_mask_to_label_size(
+    mask: torch.Tensor, downsample_factor: int, label_size: tuple[int, int]
+) -> torch.Tensor:
+    """Downsample a mask to the label size.
+
+    Args:
+        mask (torch.Tensor): Mask (H, W).
+        downsample_factor (int): Block size in pixels.
+        label_size (tuple[int, int]): Label height and width.
+
+    Returns:
+        torch.Tensor: Mask label.
+    """
+    # Same rule as `downsample_mask` in the labelling script.
+    label_height, label_width = label_size
+    padded_mask = mask.new_zeros(
+        (label_height * downsample_factor, label_width * downsample_factor), dtype=torch.float32
+    )
+    padded_mask[: mask.shape[-2], : mask.shape[-1]] = mask
+    mask_blocks = padded_mask.reshape(label_height, downsample_factor, label_width, downsample_factor)
+    return mask_blocks.mean(dim=(1, 3)) >= 0.5

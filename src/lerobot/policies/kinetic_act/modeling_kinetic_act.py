@@ -28,6 +28,9 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from .configuration_kinetic_act import MISSING_MASK_CELL_VALUE, KineticACTConfig
 
+LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX = ".last_decoder_cross_attention_weights"
+OBJECT_ATTENTION_LOSS_EPSILON = 1e-6
+
 
 class KineticACTPolicy(ACTPolicy):
     config_class = KineticACTConfig
@@ -80,6 +83,11 @@ class KineticACTPolicy(ACTPolicy):
             )
             loss = loss + object_mask_binary_cross_entropy_loss * self.config.object_mask_loss_weight
             loss_dict["object_mask_binary_cross_entropy_loss"] = object_mask_binary_cross_entropy_loss.item()
+
+        if self.config.object_attention_loss_weight > 0:
+            object_attention_loss = self._compute_object_attention_loss(batch, auxiliary_outputs)
+            loss = loss + object_attention_loss * self.config.object_attention_loss_weight
+            loss_dict["object_attention_loss"] = object_attention_loss.item()
 
         return loss, loss_dict
 
@@ -251,12 +259,9 @@ class KineticACTPolicy(ACTPolicy):
         for mask_label_key in self.config.object_mask_label_key_per_camera.values():
             mask_logits = auxiliary_outputs[mask_label_key].float()
             positive_class_weight = mask_logits.new_tensor(self.config.object_mask_positive_class_weight)
-            mask_labels = batch[mask_label_key]
-            is_missing = (mask_labels == MISSING_MASK_CELL_VALUE).flatten(1).any(dim=1)
-            target_mask = F.adaptive_avg_pool2d(
-                mask_labels.masked_fill(is_missing[:, None, None], 0).float().unsqueeze(1),
-                mask_logits.shape[-2:],
-            ).squeeze(1)
+            target_mask, is_missing = self._pool_object_mask_to_token_grid(
+                batch, mask_label_key, mask_logits.shape[-2:]
+            )
             per_cell_loss = F.binary_cross_entropy_with_logits(
                 mask_logits, target_mask, pos_weight=positive_class_weight, reduction="none"
             )
@@ -267,6 +272,63 @@ class KineticACTPolicy(ACTPolicy):
 
         valid_camera_count = torch.stack(camera_has_valid_sample).sum().clamp_min(1)
         return torch.stack(per_camera_losses).sum() / valid_camera_count
+
+    def _compute_object_attention_loss(
+        self, batch: dict[str, Tensor], auxiliary_outputs: dict[str, Tensor]
+    ) -> Tensor:
+        """Compute the object attention loss.
+
+        Args:
+            batch (dict[str, Tensor]): Training batch.
+            auxiliary_outputs (dict[str, Tensor]): Auxiliary outputs.
+
+        Returns:
+            Tensor: Object attention loss.
+        """
+        per_camera_losses = []
+        camera_has_valid_step = []
+        for mask_label_key in self.config.object_mask_label_key_per_camera.values():
+            camera_attention = auxiliary_outputs[
+                f"{mask_label_key}{LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX}"
+            ].float()
+            target_mask, is_missing = self._pool_object_mask_to_token_grid(
+                batch, mask_label_key, camera_attention.shape[-2:]
+            )
+            attention_on_object = (camera_attention * target_mask.unsqueeze(1)).sum(dim=(-2, -1))
+            total_camera_attention = camera_attention.sum(dim=(-2, -1)).clamp_min(OBJECT_ATTENTION_LOSS_EPSILON)
+            attention_share_on_object = attention_on_object / total_camera_attention
+            per_step_loss = -torch.log(attention_share_on_object + OBJECT_ATTENTION_LOSS_EPSILON)
+
+            # Skip samples whose mask has no object cell.
+            sample_has_no_object = target_mask.flatten(1).sum(dim=1) == 0
+            is_excluded = batch["action_is_pad"] | (is_missing | sample_has_no_object).unsqueeze(1)
+            per_camera_losses.append(self._average_over_valid_steps(per_step_loss, is_excluded))
+            camera_has_valid_step.append(~is_excluded.all())
+
+        valid_camera_count = torch.stack(camera_has_valid_step).sum().clamp_min(1)
+        return torch.stack(per_camera_losses).sum() / valid_camera_count
+
+    @staticmethod
+    def _pool_object_mask_to_token_grid(
+        batch: dict[str, Tensor], mask_label_key: str, token_grid_shape: tuple[int, int]
+    ) -> tuple[Tensor, Tensor]:
+        """Pool the object mask label onto the camera token grid.
+
+        Args:
+            batch (dict[str, Tensor]): Training batch.
+            mask_label_key (str): Dataset key of the object mask label.
+            token_grid_shape (tuple[int, int]): Token grid height and width.
+
+        Returns:
+            tuple[Tensor, Tensor]: Pooled object mask and missing-label mask.
+        """
+        mask_labels = batch[mask_label_key]
+        is_missing = (mask_labels == MISSING_MASK_CELL_VALUE).flatten(1).any(dim=1)
+        target_mask = F.adaptive_avg_pool2d(
+            mask_labels.masked_fill(is_missing[:, None, None], 0).float().unsqueeze(1),
+            token_grid_shape,
+        ).squeeze(1)
+        return target_mask, is_missing
 
     @staticmethod
     def _average_over_valid_steps(values: Tensor, is_excluded: Tensor) -> Tensor:
@@ -302,6 +364,13 @@ class KineticACT(ACT):
         if config.use_camera_identity_embedding:
             self.encoder_camera_identity_embedding = nn.Embedding(len(self.camera_keys), config.dim_model)
 
+        # Add a hook to record cross-attention weights during forward pass for object-attention loss.
+        self.last_decoder_cross_attention_weights: Tensor | None = None
+        if config.object_attention_loss_weight > 0:
+            self.decoder.layers[-1].multihead_attn.register_forward_hook(
+                self._record_last_decoder_cross_attention_weights
+            )
+
     def forward(
         self, batch: dict[str, Tensor]
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], dict[str, Tensor]]:
@@ -326,13 +395,19 @@ class KineticACT(ACT):
 
         # Run the ACT transformer.
         encoder_output, decoder_output = self._run_transformer(encoder_tokens, encoder_position_embedding)
+        last_decoder_cross_attention_weights = self.last_decoder_cross_attention_weights
+        self.last_decoder_cross_attention_weights = None
 
         # Predict the actions.
         actions = self.action_head(decoder_output)
 
         # Predict the auxiliary outputs.
         auxiliary_outputs = self._predict_auxiliary_outputs(
-            encoder_output, decoder_output, token_slice_per_camera, token_grid_shape_per_camera
+            encoder_output,
+            decoder_output,
+            token_slice_per_camera,
+            token_grid_shape_per_camera,
+            last_decoder_cross_attention_weights,
         )
 
         return actions, (latent_mean, latent_log_variance), auxiliary_outputs
@@ -504,20 +579,35 @@ class KineticACT(ACT):
         # Move back to (B, S, C).
         return encoder_output, decoder_output.transpose(0, 1)
 
+    def _record_last_decoder_cross_attention_weights(
+        self, module: nn.Module, inputs: tuple, output: tuple
+    ) -> None:
+        """Store the last decoder layer's cross-attention weights.
+
+        Args:
+            module (nn.Module): Cross-attention module.
+            inputs (tuple): Module inputs.
+            output (tuple): Attention output and head-averaged weights (B, chunk, N).
+        """
+        del module, inputs
+        self.last_decoder_cross_attention_weights = output[1]
+
     def _predict_auxiliary_outputs(
         self,
         encoder_output: Tensor,
         decoder_output: Tensor,
         token_slice_per_camera: dict[str, slice],
         token_grid_shape_per_camera: dict[str, tuple[int, int]],
+        last_decoder_cross_attention_weights: Tensor | None,
     ) -> dict[str, Tensor]:
-        """Predict the object distance, stage logits and object mask logits.
+        """Predict the object distance, stage logits, object mask logits and per-camera decoder attention.
 
         Args:
             encoder_output (Tensor): Encoder output.
             decoder_output (Tensor): Decoder output.
             token_slice_per_camera (dict[str, slice]): Token slice per camera.
             token_grid_shape_per_camera (dict[str, tuple[int, int]]): Token grid shape per camera.
+            last_decoder_cross_attention_weights (Tensor | None): Head-averaged cross-attention weights.
 
         Returns:
             dict[str, Tensor]: Auxiliary outputs.
@@ -541,5 +631,12 @@ class KineticACT(ACT):
             auxiliary_outputs[mask_label_key] = einops.rearrange(
                 mask_logits, "(h w) b -> b h w", h=grid_height, w=grid_width
             )
+
+            # Camera's decoder cross-attention on its token grid.
+            if last_decoder_cross_attention_weights is not None:
+                camera_attention = last_decoder_cross_attention_weights[..., token_slice_per_camera[camera_key]]
+                auxiliary_outputs[f"{mask_label_key}{LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX}"] = (
+                    einops.rearrange(camera_attention, "b q (h w) -> b q h w", h=grid_height, w=grid_width)
+                )
 
         return auxiliary_outputs

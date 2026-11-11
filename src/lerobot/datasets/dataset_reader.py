@@ -28,6 +28,7 @@ from lerobot.configs import (
     DEPTH_METER_UNIT,
     DepthEncoderConfig,
 )
+from lerobot.transforms import transform_image_with_aligned_mask
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .depth_utils import MM_PER_METRE, dequantize_depth
@@ -123,6 +124,7 @@ class DatasetReader(BaseDatasetReader):
         image_transforms: Callable | None,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        mask_label_key_per_camera: dict[str, str] | None = None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -144,6 +146,8 @@ class DatasetReader(BaseDatasetReader):
                 instead of normalized float32.
             depth_output_unit: Physical unit depth maps are dequantized to
                 (``"m"`` or ``"mm"``). Defaults to ``"mm"``.
+            mask_label_key_per_camera: Optional mapping from a camera
+                key to the key of its mask label.
         """
         self._meta = meta
         self.root = root
@@ -153,6 +157,7 @@ class DatasetReader(BaseDatasetReader):
         self.set_image_transforms(image_transforms)
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        self._mask_label_key_per_camera = mask_label_key_per_camera or {}
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -455,7 +460,13 @@ class DatasetReader(BaseDatasetReader):
             for cam in self._meta.camera_keys:
                 if cam in self._meta.depth_keys:
                     continue
-                item[cam] = self._image_transforms(item[cam])
+                mask_label_key = self._mask_label_key_per_camera.get(cam)
+                if mask_label_key in item:
+                    item[cam], item[mask_label_key] = transform_image_with_aligned_mask(
+                        self._image_transforms, item[cam], item[mask_label_key]
+                    )
+                else:
+                    item[cam] = self._image_transforms(item[cam])
 
         # Convert depth features to the output unit.
         for key, stored_unit in self._image_depth_units.items():

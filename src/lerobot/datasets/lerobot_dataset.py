@@ -58,6 +58,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episodes: list[int] | None = None,
         episode_filter: Callable[[dict], bool] | None = None,
         image_transforms: Callable | None = None,
+        mask_label_key_per_camera: dict[str, str] | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
         revision: str | None = None,
@@ -178,6 +179,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 conversion. This works for both image-backed and video-backed observations and can later be
                 updated with `set_image_transforms()` or cleared with `clear_image_transforms()`.
                 Defaults to None.
+            mask_label_key_per_camera (dict[str, str] | None, optional): Camera key to the key of
+                its mask label. Defaults to None.
             delta_timestamps (dict[list[float]] | None, optional): _description_. Defaults to None.
             tolerance_s (float, optional): Tolerance in seconds used to ensure data timestamps are actually in
                 sync with the fps value. It is used at the init of the dataset to make sure that each
@@ -293,6 +296,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             )
 
         self.image_transforms = image_transforms
+        self.mask_label_key_per_camera = mask_label_key_per_camera
         self.reader: BaseDatasetReader | None
         self.writer: DatasetWriter | None
         if self.meta.storage_format != DEFAULT_STORAGE_FORMAT:
@@ -330,6 +334,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
             return_uint8=return_uint8,
             depth_output_unit=depth_output_unit,
+            mask_label_key_per_camera=mask_label_key_per_camera,
         )
         self.reader = reader
 
@@ -420,6 +425,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
                 depth_output_unit=self._depth_output_unit,
+                mask_label_key_per_camera=self.mask_label_key_per_camera,
             )
         return self.reader
 
@@ -848,6 +854,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.revision = None
         obj.tolerance_s = tolerance_s
         obj.image_transforms = None
+        obj.mask_label_key_per_camera = None
         obj.delta_timestamps = None
         obj.episodes = None
         obj._video_backend = video_backend if video_backend is not None else get_safe_default_video_backend()
@@ -952,6 +959,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.revision = revision if revision else CODEBASE_VERSION
         obj.tolerance_s = tolerance_s
         obj.image_transforms = None
+        obj.mask_label_key_per_camera = None
         obj.delta_timestamps = None
         obj.episodes = None
         obj._video_backend = video_backend if video_backend else get_safe_default_video_backend()

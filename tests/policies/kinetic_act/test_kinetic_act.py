@@ -27,6 +27,7 @@ from lerobot.policies.kinetic_act.configuration_kinetic_act import (
     KineticACTConfig,
 )
 from lerobot.policies.kinetic_act.modeling_kinetic_act import (
+    ATTENTION_MASK_LOGITS_KEY_SUFFIX,
     LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX,
     KineticACT,
     KineticACTPolicy,
@@ -52,6 +53,10 @@ STAGE_LABEL_KEY = "observation.stage"
 OBJECT_MASK_LABEL_KEY = "observation.object_mask.front"
 OBJECT_ATTENTION_OUTPUT_KEY = f"{OBJECT_MASK_LABEL_KEY}{LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX}"
 OBJECT_ATTENTION_LOSS_WEIGHT = 0.5
+ATTENTION_MASK_LOGITS_KEY = f"{OBJECT_MASK_LABEL_KEY}{ATTENTION_MASK_LOGITS_KEY_SUFFIX}"
+STAGE_FEATURE_DIMENSION = 16
+# Latent and state tokens plus a 2x3 grid for each of the two cameras.
+ENCODER_TOKEN_COUNT = 2 + 2 * TOKEN_GRID_SHAPE[0] * TOKEN_GRID_SHAPE[1]
 
 ALL_HEAD_OVERRIDES = {
     "object_distance_label_key": OBJECT_DISTANCE_LABEL_KEY,
@@ -140,8 +145,6 @@ def test_enabled_heads_add_only_their_own_parameters():
         "object_distance_head.bias": (1,),
         "stage_head.weight": (STAGE_CLASS_COUNT, 64),
         "stage_head.bias": (STAGE_CLASS_COUNT,),
-        "object_mask_head.weight": (1, 64),
-        "object_mask_head.bias": (1,),
         "encoder_camera_identity_embedding.weight": (2, 64),
     }
     assert {name: all_heads_shapes[name] for name in default_shapes} == default_shapes
@@ -252,10 +255,9 @@ def test_train_step_with_all_heads():
         "object_distance_l1_loss",
         "stage_cross_entropy_loss",
         "stage_accuracy",
-        "object_mask_binary_cross_entropy_loss",
     }
     assert all(isinstance(value, float) for value in loss_dict.values())
-    for head in (policy.model.object_distance_head, policy.model.stage_head, policy.model.object_mask_head):
+    for head in (policy.model.object_distance_head, policy.model.stage_head):
         assert head.weight.grad is not None
     assert policy.model.encoder_camera_identity_embedding.weight.grad is not None
 
@@ -271,7 +273,7 @@ def test_auxiliary_output_shapes():
     assert actions.shape == (batch_size, CHUNK_SIZE, ACTION_DIM)
     assert auxiliary_outputs["object_distance"].shape == (batch_size, CHUNK_SIZE)
     assert auxiliary_outputs["stage_logits"].shape == (batch_size, CHUNK_SIZE, STAGE_CLASS_COUNT)
-    assert auxiliary_outputs[OBJECT_MASK_LABEL_KEY].shape == (batch_size, *TOKEN_GRID_SHAPE)
+    assert OBJECT_MASK_LABEL_KEY not in auxiliary_outputs
 
 
 def test_padded_steps_do_not_contribute_to_the_loss():
@@ -337,30 +339,115 @@ def test_missing_stage_is_left_out_like_padding():
     assert missing_loss_dict["stage_accuracy"] == pytest.approx(padded_loss_dict["stage_accuracy"])
 
 
-def test_missing_object_mask_sample_is_left_out_of_the_mask_loss():
-    policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
+V3_OVERRIDES = {
+    **ALL_HEAD_OVERRIDES,
+    "stage_feature_dimension": STAGE_FEATURE_DIMENSION,
+    "object_attention_loss_weight": OBJECT_ATTENTION_LOSS_WEIGHT,
+    "use_attention_mask_projection": True,
+}
+
+
+def test_stage_feature_feeds_the_stage_and_object_distance_heads():
+    batch_size = 2
+    default_shapes = parameter_shapes(KineticACT(make_kinetic_act_config(**ALL_HEAD_OVERRIDES)))
+    policy = KineticACTPolicy(
+        make_kinetic_act_config(**ALL_HEAD_OVERRIDES, stage_feature_dimension=STAGE_FEATURE_DIMENSION)
+    )
+    policy.train()
+    stage_feature_shapes = parameter_shapes(policy.model)
+
+    batch = make_train_batch(batch_size)
+    _, _, auxiliary_outputs = policy.model(policy._add_camera_image_list(batch))
+    policy._compute_object_distance_l1_loss(batch, auxiliary_outputs).backward()
+
+    changed_shapes = {
+        name: shape for name, shape in stage_feature_shapes.items() if default_shapes.get(name) != shape
+    }
+    assert changed_shapes == {
+        "stage_feature_projection.0.weight": (STAGE_FEATURE_DIMENSION, 64),
+        "stage_feature_projection.0.bias": (STAGE_FEATURE_DIMENSION,),
+        "object_distance_head.weight": (1, STAGE_FEATURE_DIMENSION),
+        "stage_head.weight": (STAGE_CLASS_COUNT, STAGE_FEATURE_DIMENSION),
+    }
+    assert auxiliary_outputs["object_distance"].shape == (batch_size, CHUNK_SIZE)
+    assert auxiliary_outputs["stage_logits"].shape == (batch_size, CHUNK_SIZE, STAGE_CLASS_COUNT)
+    stage_feature_gradient = policy.model.stage_feature_projection[0].weight.grad
+    assert stage_feature_gradient is not None
+    assert stage_feature_gradient.abs().sum() > 0
+
+
+def test_attention_mask_projection_maps_all_attention_weights_to_the_mask_grid():
+    batch_size = 2
+    policy = KineticACTPolicy(make_kinetic_act_config(**V3_OVERRIDES))
+    policy.train()
+    batch = make_train_batch(batch_size)
+
+    loss, loss_dict = policy(batch)
+    _, _, auxiliary_outputs = policy.model(policy._add_camera_image_list(batch))
+    policy.zero_grad()
+    policy._compute_object_attention_mask_loss(batch, auxiliary_outputs).backward()
+
+    token_grid_cell_count = TOKEN_GRID_SHAPE[0] * TOKEN_GRID_SHAPE[1]
+    projection = policy.model.attention_mask_projections[0]
+    assert tuple(projection.weight.shape) == (token_grid_cell_count, CHUNK_SIZE * ENCODER_TOKEN_COUNT)
+    assert auxiliary_outputs[ATTENTION_MASK_LOGITS_KEY].shape == (batch_size, *TOKEN_GRID_SHAPE)
+    assert OBJECT_ATTENTION_OUTPUT_KEY not in auxiliary_outputs
+    assert torch.isfinite(loss)
+    assert torch.isfinite(torch.tensor(loss_dict["object_attention_loss"]))
+    assert projection.weight.grad.abs().sum() > 0
+    cross_attention_gradient = policy.model.decoder.layers[-1].multihead_attn.in_proj_weight.grad
+    assert cross_attention_gradient is not None
+    assert cross_attention_gradient.abs().sum() > 0
+
+
+def test_attention_mask_projection_is_off_by_default():
+    model = KineticACT(
+        make_kinetic_act_config(
+            **ALL_HEAD_OVERRIDES, object_attention_loss_weight=OBJECT_ATTENTION_LOSS_WEIGHT
+        )
+    )
+
+    assert not any(name.startswith("attention_mask_projections") for name in parameter_shapes(model))
+
+
+def test_missing_object_mask_sample_is_left_out_of_the_attention_mask_loss():
+    policy = KineticACTPolicy(make_kinetic_act_config(**V3_OVERRIDES))
     policy.eval()
     batch = make_train_batch(batch_size=2)
     batch[OBJECT_MASK_LABEL_KEY][0] = MISSING_MASK_CELL_VALUE
     only_valid_sample = {key: value[1:2].clone() for key, value in batch.items()}
 
-    loss_with_missing_sample = evaluate_loss_dict(policy, batch)["object_mask_binary_cross_entropy_loss"]
-    loss_of_valid_sample = evaluate_loss_dict(policy, only_valid_sample)[
-        "object_mask_binary_cross_entropy_loss"
-    ]
+    loss_with_missing_sample = evaluate_loss_dict(policy, batch)["object_attention_loss"]
+    loss_of_valid_sample = evaluate_loss_dict(policy, only_valid_sample)["object_attention_loss"]
 
     assert loss_with_missing_sample == pytest.approx(loss_of_valid_sample, abs=1e-5)
 
 
-def test_all_object_masks_missing_gives_zero_mask_loss():
-    policy = KineticACTPolicy(make_kinetic_act_config(**ALL_HEAD_OVERRIDES))
+def test_all_object_masks_missing_gives_zero_attention_mask_loss():
+    policy = KineticACTPolicy(make_kinetic_act_config(**V3_OVERRIDES))
     policy.eval()
     batch = make_train_batch()
     batch[OBJECT_MASK_LABEL_KEY][:] = MISSING_MASK_CELL_VALUE
 
     loss_dict = evaluate_loss_dict(policy, batch)
 
-    assert loss_dict["object_mask_binary_cross_entropy_loss"] == 0.0
+    assert loss_dict["object_attention_loss"] == 0.0
+
+
+def test_save_and_load_round_trip_with_stage_feature_and_attention_mask_projection(tmp_path):
+    policy = KineticACTPolicy(make_kinetic_act_config(**V3_OVERRIDES))
+    policy.save_pretrained(tmp_path)
+
+    loaded_policy = KineticACTPolicy.from_pretrained(tmp_path)
+
+    assert loaded_policy.config.stage_feature_dimension == STAGE_FEATURE_DIMENSION
+    assert loaded_policy.config.use_attention_mask_projection
+    # Stored configs keep the unused object mask loss weight.
+    assert loaded_policy.config.object_mask_loss_weight == 1.0
+    original_state = policy.state_dict()
+    assert set(loaded_policy.state_dict()) == set(original_state)
+    for name, value in loaded_policy.state_dict().items():
+        torch.testing.assert_close(value, original_state[name])
 
 
 def make_object_attention_policy() -> KineticACTPolicy:
@@ -550,7 +637,15 @@ def test_save_and_load_round_trip(tmp_path):
         ),
         ({"object_distance_loss_weight": -1.0}, "object_distance_loss_weight"),
         ({"stage_loss_weight": -0.1}, "stage_loss_weight"),
-        ({"object_mask_loss_weight": -2.0}, "object_mask_loss_weight"),
+        ({"stage_label_key": STAGE_LABEL_KEY, "stage_feature_dimension": 0}, "stage_feature_dimension"),
+        ({"stage_feature_dimension": STAGE_FEATURE_DIMENSION}, "needs the stage head"),
+        (
+            {
+                "object_mask_label_key_per_camera": {RGB_CAMERA_KEY: OBJECT_MASK_LABEL_KEY},
+                "use_attention_mask_projection": True,
+            },
+            "needs the object attention loss",
+        ),
         ({"object_mask_positive_class_weight": 0.0}, "object_mask_positive_class_weight"),
         (
             {

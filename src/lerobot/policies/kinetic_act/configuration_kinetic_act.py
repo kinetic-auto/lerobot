@@ -35,10 +35,12 @@ class KineticACTConfig(ACTConfig):
         stage_label_key: Dataset key of the integer stage label.
         stage_class_count: Number of stages.
         stage_loss_weight: Weight of the stage loss.
+        stage_feature_dimension: Size of the feature shared by the stage and object distance heads. None gives each head the decoder output.
         object_mask_label_key_per_camera: Camera key to dataset key of the object mask label.
-        object_mask_loss_weight: Weight of the object mask loss.
-        object_mask_positive_class_weight: Weight of the object cells in the object mask loss.
+        object_mask_loss_weight: Unused. Kept so that stored configs load.
+        object_mask_positive_class_weight: Weight of the object cells in the attention mask loss.
         object_attention_loss_weight: Weight of the object attention loss.
+        use_attention_mask_projection: Whether the object attention loss projects the attention weights of all encoder tokens to the mask grid.
         use_camera_identity_embedding: Whether to add a learned embedding per camera.
         valid_depth_range_meters: Depth range in meters. Values outside it are set to 0. None leaves depth unchanged.
     """
@@ -48,10 +50,12 @@ class KineticACTConfig(ACTConfig):
     stage_label_key: str | None = None
     stage_class_count: int = 3
     stage_loss_weight: float = 1.0
+    stage_feature_dimension: int | None = None
     object_mask_label_key_per_camera: dict[str, str] = field(default_factory=dict)
     object_mask_loss_weight: float = 1.0
     object_mask_positive_class_weight: float = 1.0
     object_attention_loss_weight: float = 0.0
+    use_attention_mask_projection: bool = False
     use_camera_identity_embedding: bool = False
     valid_depth_range_meters: tuple[float, float] | None = None
 
@@ -97,6 +101,14 @@ class KineticACTConfig(ACTConfig):
         if self.stage_label_key is not None and self.stage_class_count < 2:
             raise ValueError(f"`stage_class_count` must be at least 2. Got {self.stage_class_count}.")
 
+        if self.stage_feature_dimension is not None:
+            if self.stage_feature_dimension <= 0:
+                raise ValueError(
+                    f"`stage_feature_dimension` must be positive. Got {self.stage_feature_dimension}."
+                )
+            if self.stage_label_key is None:
+                raise ValueError("`stage_feature_dimension` needs the stage head. Set `stage_label_key`.")
+
         unknown_camera_keys = [
             camera_key
             for camera_key in self.object_mask_label_key_per_camera
@@ -112,7 +124,6 @@ class KineticACTConfig(ACTConfig):
         loss_weights = {
             "object_distance_loss_weight": self.object_distance_loss_weight,
             "stage_loss_weight": self.stage_loss_weight,
-            "object_mask_loss_weight": self.object_mask_loss_weight,
             "object_attention_loss_weight": self.object_attention_loss_weight,
         }
         for weight_name, weight in loss_weights.items():
@@ -123,6 +134,12 @@ class KineticACTConfig(ACTConfig):
             raise ValueError(
                 "`object_attention_loss_weight` needs the object mask labels. "
                 "Set `object_mask_label_key_per_camera` or set the weight to 0."
+            )
+
+        if self.use_attention_mask_projection and self.object_attention_loss_weight <= 0:
+            raise ValueError(
+                "`use_attention_mask_projection` needs the object attention loss. "
+                "Set `object_attention_loss_weight` above 0."
             )
 
         if self.valid_depth_range_meters is not None:

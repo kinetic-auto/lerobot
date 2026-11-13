@@ -152,7 +152,7 @@ lerobot-train \
 
 ## Train kinetic_act (depth, object distance and stage heads)
 
-`kinetic_act` is ACT plus a depth camera input and three optional supervised heads: the distance of the object of interest from the RealSense camera and the task stage for each future step of the action chunk, and an object mask on the RealSense RGB tokens. Every head is off until its label key is set, so a bare `--policy.type=kinetic_act` run is equivalent to ACT.
+`kinetic_act` is ACT plus a depth camera input, two optional supervised heads and an optional attention loss. The heads predict the distance of the object of interest from the RealSense camera and the task stage for each future step of the action chunk. The attention loss uses an object mask to make the last decoder layer attend to the object. Every head and loss is off until it is configured, so a bare `--policy.type=kinetic_act` run is equivalent to ACT.
 
 The labels are added to a copy of the dataset with `lerobot-label-object-task`. SAM 3 segments the object in the RealSense RGB image, the median aligned depth under the mask gives the distance in meters, and thresholds on the gripper command, the distance and the joint displacement give the stage. The depth feature must be aligned to the RGB image. Requires the `transformers-dep` extra.
 
@@ -206,7 +206,10 @@ lerobot-train \
   --policy.object_distance_label_key=observation.object_distance \
   --policy.stage_label_key=observation.stage \
   --policy.stage_class_count=<number_of_stages> \
+  --policy.stage_feature_dimension=128 \
   --policy.object_mask_label_key_per_camera='{"<rgb_camera_key>":"<object_mask_key>"}' \
+  --policy.object_attention_loss_weight=<weight> \
+  --policy.use_attention_mask_projection=true \
   --policy.use_camera_identity_embedding=true \
   --backbone=resnet18 \
   --batch_size=8 \
@@ -221,14 +224,17 @@ lerobot-train \
 
 - `--policy.*_label_key`: dataset key of each label. Set only the heads you want. The distance and stage labels are loaded for every step of the chunk, like the actions. A label column whose head is not set stays in the dataset and is listed as an unused model input. Drop it with `--dataset.exclude_features` if you want the inputs clean.
 - Missing labels: a distance of NaN, a stage below 0 or a mask with any cell of 255 is left out of its loss, the same way padded steps are, so labels may be missing on random frames. A label that is missing for every frame of a batch adds no loss and no gradient. The dataset needs no other change.
-- `--policy.*_loss_weight`: weight of each head's loss next to the action loss (default: 1.0). `--policy.object_mask_positive_class_weight` raises the cost of missing object cells.
-- `--policy.object_attention_loss_weight`: weight of the loss that moves the last decoder layer's cross-attention onto the object mask cells (default: 0.0, off). It needs `--policy.object_mask_label_key_per_camera`. Frames without an object in the mask are left out.
+- `--policy.object_distance_loss_weight`, `--policy.stage_loss_weight`: weight of each head's loss next to the action loss (default: 1.0).
+- `--policy.stage_feature_dimension`: size of a feature layer (Linear and ReLU) on the decoder output that feeds both the stage head and the object distance head (default: unset, each head reads the decoder output). It needs `--policy.stage_label_key`.
+- `--policy.object_attention_loss_weight`: weight of the object attention loss on the last decoder layer's cross-attention (default: 0.0, off). It needs `--policy.object_mask_label_key_per_camera`. Without the projection below, the loss is the negative log of the share of the camera's attention on the object mask cells, and frames without an object in the mask are left out.
+- `--policy.use_attention_mask_projection`: with `true`, one learned layer per masked camera maps the attention weights of all action queries and all encoder tokens to the camera's mask grid, and the object attention loss is the binary cross-entropy against the mask (default: false). `--policy.object_mask_positive_class_weight` raises the cost of missing object cells. The layer size depends on `chunk_size` and the image sizes.
+- `--policy.object_mask_loss_weight` is unused. It is accepted so that stored configs load. The object mask head on the encoder is not part of the model, and its weights in older checkpoints are ignored.
 - With `--dataset.image_transforms.enable=true`, each object mask moves with its camera image, so a shift or rotation of the image shifts or rotates the mask too. Colour transforms leave the mask unchanged. Depth images are not transformed.
 - `--policy.normalization_mapping`: `VISUAL` is `MEAN_STD` for a metric depth map. A 3-channel depth image keeps `VISUAL` at `IDENTITY`.
 - `--policy.use_camera_identity_embedding`: lets the encoder tell the cameras apart. Recommended with depth.
 - A DINO backbone is selected with `--policy.vision_backbone=<hub id>` and `--policy.pretrained_backbone_weights=<hub id>`. The DINO aliases of `--backbone` are only accepted for `act`.
 
-The object distance, stage and mask logits are returned by `predict_action_chunk_with_auxiliary_outputs`. `select_action` returns actions only, so recording, evaluation and the ROS 2 node work unchanged.
+The object distance and stage logits are returned by `predict_action_chunk_with_auxiliary_outputs`. With the object attention loss on, it also returns the attention weights per masked camera, or the attention mask logits when the projection is used. `select_action` returns actions only, so recording, evaluation and the ROS 2 node work unchanged.
 
 ## Train on cloud GPU instance
 

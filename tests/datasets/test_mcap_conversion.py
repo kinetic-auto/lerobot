@@ -55,11 +55,13 @@ from lerobot.datasets.mcap_depth import (
 from lerobot.datasets.mcap_episodes import find_episode_paths
 from lerobot.datasets.mcap_validation import (
     EpisodeReport,
+    Issue,
     McapValidationConfig,
     Severity,
     TopicReport,
     build_topic_report,
     flag_topic_hz_degradation,
+    validate_episode,
     load_episode_severities,
     write_reports,
 )
@@ -418,6 +420,14 @@ def test_conversion_requires_the_quality_report(tmp_path):
         resolve_quality_report_path(make_conversion_config(tmp_path))
 
 
+def test_unreadable_mcap_is_critical(tmp_path):
+    missing = tmp_path / "missing.mcap"
+    report = validate_episode(missing, None, McapValidationConfig(session_directory=str(tmp_path)))
+    assert report.severity == Severity.CRITICAL
+    assert report.topics == []
+    assert report.episode_issues[0].message.startswith("unreadable mcap:")
+
+
 def test_empty_topic_is_critical():
     report = build_topic_report("/t", np.array([]), 0.0, 1.0, McapValidationConfig(session_directory="s"))
     assert report.message_count == 0
@@ -444,6 +454,14 @@ def test_slow_episode_is_flagged_against_the_batch_median():
     reports = [make_report("a", 10.0), make_report("b", 10.0), make_report("c", 5.0)]
     flag_topic_hz_degradation(reports, fps_tolerance=0.15)
     assert [report.severity for report in reports] == [Severity.PASS, Severity.PASS, Severity.WARNING]
+
+
+def test_hz_comparison_skips_episodes_with_no_topics():
+    readable = EpisodeReport("ok", "p", 1.0, [TopicReport("/t", 50, 10.0, 0.1)])
+    other = EpisodeReport("ok2", "p", 1.0, [TopicReport("/t", 50, 10.0, 0.1)])
+    unreadable = EpisodeReport("bad", "p", 0.0, [], [Issue(Severity.CRITICAL, "unreadable mcap")])
+    flag_topic_hz_degradation([readable, unreadable, other], fps_tolerance=0.15)
+    assert unreadable.severity == Severity.CRITICAL
 
 
 def test_report_roundtrip_keeps_each_episode_severity(tmp_path):

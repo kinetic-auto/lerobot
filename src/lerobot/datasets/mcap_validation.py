@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from mcap.exceptions import McapError
 import numpy as np
 
 from .mcap_depth import (
@@ -126,8 +127,16 @@ def load_depth_camera(config: McapValidationConfig) -> CameraParameters | None:
 def validate_episode(
     mcap_path: Path, depth_camera: CameraParameters | None, config: McapValidationConfig
 ) -> EpisodeReport:
-    # Read the message timestamps by topic
-    timestamps_by_topic = read_message_timestamps(mcap_path, config.required_topics)
+    try:
+        timestamps_by_topic = read_message_timestamps(mcap_path, config.required_topics)
+    except (OSError, McapError) as error:
+        return EpisodeReport(
+            episode_id=episode_identifier(mcap_path),
+            mcap_path=str(mcap_path),
+            duration_seconds=0.0,
+            topics=[],
+            episode_issues=[Issue(Severity.CRITICAL, f"unreadable mcap: {error}")],
+        )
 
     # Calculate the episode start and end times
     window_start, window_end = get_episode_duration(timestamps_by_topic)
@@ -226,15 +235,17 @@ def validate_depth_topics(
 
 
 def flag_topic_hz_degradation(episode_reports: list[EpisodeReport], fps_tolerance: float) -> None:
-    # Get all the topics from the first episode
-    topics = [topic_report.topic for topic_report in episode_reports[0].topics]
+    reference = next((report for report in episode_reports if report.topics), None)
+    if reference is None:
+        return
+    topics = [topic_report.topic for topic_report in reference.topics]
 
     # Check the hz for each topic across all episodes
     for topic_index, topic in enumerate(topics):
         rates = [
             report.topics[topic_index].mean_rate_hz
             for report in episode_reports
-            if report.topics[topic_index].message_count >= 2
+            if topic_index < len(report.topics) and report.topics[topic_index].message_count >= 2
         ]
         if not rates:
             continue
@@ -245,6 +256,8 @@ def flag_topic_hz_degradation(episode_reports: list[EpisodeReport], fps_toleranc
 
         # Flag episodes with rates below the minimum
         for report in episode_reports:
+            if topic_index >= len(report.topics):
+                continue
             topic_report = report.topics[topic_index]
             if topic_report.message_count >= 2 and topic_report.mean_rate_hz < minimum_rate_hz:
                 message = (

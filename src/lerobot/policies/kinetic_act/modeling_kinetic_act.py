@@ -29,6 +29,7 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from .configuration_kinetic_act import MISSING_MASK_CELL_VALUE, KineticACTConfig
 
 LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX = ".last_decoder_cross_attention_weights"
+ATTENTION_MASK_LOGITS_KEY_SUFFIX = ".attention_mask_logits"
 OBJECT_ATTENTION_LOSS_EPSILON = 1e-6
 
 
@@ -77,15 +78,11 @@ class KineticACTPolicy(ACTPolicy):
             loss_dict["stage_cross_entropy_loss"] = stage_cross_entropy_loss.item()
             loss_dict["stage_accuracy"] = self._compute_stage_accuracy(batch, auxiliary_outputs)
 
-        if self.config.object_mask_label_key_per_camera:
-            object_mask_binary_cross_entropy_loss = self._compute_object_mask_binary_cross_entropy_loss(
-                batch, auxiliary_outputs
-            )
-            loss = loss + object_mask_binary_cross_entropy_loss * self.config.object_mask_loss_weight
-            loss_dict["object_mask_binary_cross_entropy_loss"] = object_mask_binary_cross_entropy_loss.item()
-
         if self.config.object_attention_loss_weight > 0:
-            object_attention_loss = self._compute_object_attention_loss(batch, auxiliary_outputs)
+            if self.config.use_attention_mask_projection:
+                object_attention_loss = self._compute_object_attention_mask_loss(batch, auxiliary_outputs)
+            else:
+                object_attention_loss = self._compute_object_attention_loss(batch, auxiliary_outputs)
             loss = loss + object_attention_loss * self.config.object_attention_loss_weight
             loss_dict["object_attention_loss"] = object_attention_loss.item()
 
@@ -242,37 +239,6 @@ class KineticACTPolicy(ACTPolicy):
         """
         return batch[f"{self.config.stage_label_key}_is_pad"] | (target_stage < 0)
 
-    def _compute_object_mask_binary_cross_entropy_loss(
-        self, batch: dict[str, Tensor], auxiliary_outputs: dict[str, Tensor]
-    ) -> Tensor:
-        """Compute the object mask binary cross-entropy loss.
-
-        Args:
-            batch (dict[str, Tensor]): Training batch.
-            auxiliary_outputs (dict[str, Tensor]): Auxiliary outputs.
-
-        Returns:
-            Tensor: Binary cross-entropy loss.
-        """
-        per_camera_losses = []
-        camera_has_valid_sample = []
-        for mask_label_key in self.config.object_mask_label_key_per_camera.values():
-            mask_logits = auxiliary_outputs[mask_label_key].float()
-            positive_class_weight = mask_logits.new_tensor(self.config.object_mask_positive_class_weight)
-            target_mask, is_missing = self._pool_object_mask_to_token_grid(
-                batch, mask_label_key, mask_logits.shape[-2:]
-            )
-            per_cell_loss = F.binary_cross_entropy_with_logits(
-                mask_logits, target_mask, pos_weight=positive_class_weight, reduction="none"
-            )
-            per_camera_losses.append(
-                self._average_over_valid_steps(per_cell_loss.mean(dim=(1, 2)), is_missing)
-            )
-            camera_has_valid_sample.append(~is_missing.all())
-
-        valid_camera_count = torch.stack(camera_has_valid_sample).sum().clamp_min(1)
-        return torch.stack(per_camera_losses).sum() / valid_camera_count
-
     def _compute_object_attention_loss(
         self, batch: dict[str, Tensor], auxiliary_outputs: dict[str, Tensor]
     ) -> Tensor:
@@ -295,7 +261,9 @@ class KineticACTPolicy(ACTPolicy):
                 batch, mask_label_key, camera_attention.shape[-2:]
             )
             attention_on_object = (camera_attention * target_mask.unsqueeze(1)).sum(dim=(-2, -1))
-            total_camera_attention = camera_attention.sum(dim=(-2, -1)).clamp_min(OBJECT_ATTENTION_LOSS_EPSILON)
+            total_camera_attention = camera_attention.sum(dim=(-2, -1)).clamp_min(
+                OBJECT_ATTENTION_LOSS_EPSILON
+            )
             attention_share_on_object = attention_on_object / total_camera_attention
             per_step_loss = -torch.log(attention_share_on_object + OBJECT_ATTENTION_LOSS_EPSILON)
 
@@ -306,6 +274,37 @@ class KineticACTPolicy(ACTPolicy):
             camera_has_valid_step.append(~is_excluded.all())
 
         valid_camera_count = torch.stack(camera_has_valid_step).sum().clamp_min(1)
+        return torch.stack(per_camera_losses).sum() / valid_camera_count
+
+    def _compute_object_attention_mask_loss(
+        self, batch: dict[str, Tensor], auxiliary_outputs: dict[str, Tensor]
+    ) -> Tensor:
+        """Compute the binary cross-entropy of the attention mask logits.
+
+        Args:
+            batch (dict[str, Tensor]): Training batch.
+            auxiliary_outputs (dict[str, Tensor]): Auxiliary outputs.
+
+        Returns:
+            Tensor: Object attention loss.
+        """
+        per_camera_losses = []
+        camera_has_valid_sample = []
+        for mask_label_key in self.config.object_mask_label_key_per_camera.values():
+            mask_logits = auxiliary_outputs[f"{mask_label_key}{ATTENTION_MASK_LOGITS_KEY_SUFFIX}"].float()
+            positive_class_weight = mask_logits.new_tensor(self.config.object_mask_positive_class_weight)
+            target_mask, is_missing = self._pool_object_mask_to_token_grid(
+                batch, mask_label_key, mask_logits.shape[-2:]
+            )
+            per_cell_loss = F.binary_cross_entropy_with_logits(
+                mask_logits, target_mask, pos_weight=positive_class_weight, reduction="none"
+            )
+            per_camera_losses.append(
+                self._average_over_valid_steps(per_cell_loss.mean(dim=(1, 2)), is_missing)
+            )
+            camera_has_valid_sample.append(~is_missing.all())
+
+        valid_camera_count = torch.stack(camera_has_valid_sample).sum().clamp_min(1)
         return torch.stack(per_camera_losses).sum() / valid_camera_count
 
     @staticmethod
@@ -349,13 +348,17 @@ class KineticACT(ACT):
     def __init__(self, config: KineticACTConfig):
         super().__init__(config)
 
+        head_input_dimension = config.dim_model
+        if config.stage_feature_dimension is not None:
+            # Shared by the stage and object distance heads.
+            self.stage_feature_projection = nn.Sequential(
+                nn.Linear(config.dim_model, config.stage_feature_dimension), nn.ReLU()
+            )
+            head_input_dimension = config.stage_feature_dimension
         if config.object_distance_label_key is not None:
-            self.object_distance_head = nn.Linear(config.dim_model, 1)
+            self.object_distance_head = nn.Linear(head_input_dimension, 1)
         if config.stage_label_key is not None:
-            self.stage_head = nn.Linear(config.dim_model, config.stage_class_count)
-        if config.object_mask_label_key_per_camera:
-            # Shared across the supervised cameras.
-            self.object_mask_head = nn.Linear(config.dim_model, 1)
+            self.stage_head = nn.Linear(head_input_dimension, config.stage_class_count)
 
         self.camera_keys = list(config.image_features)
         self.single_channel_camera_keys = {
@@ -370,6 +373,9 @@ class KineticACT(ACT):
             self.decoder.layers[-1].multihead_attn.register_forward_hook(
                 self._record_last_decoder_cross_attention_weights
             )
+
+        if config.use_attention_mask_projection:
+            self.attention_mask_projections = self._build_attention_mask_projections()
 
     def forward(
         self, batch: dict[str, Tensor]
@@ -394,7 +400,7 @@ class KineticACT(ACT):
         ) = self._build_encoder_inputs(batch, latent_sample)
 
         # Run the ACT transformer.
-        encoder_output, decoder_output = self._run_transformer(encoder_tokens, encoder_position_embedding)
+        _, decoder_output = self._run_transformer(encoder_tokens, encoder_position_embedding)
         last_decoder_cross_attention_weights = self.last_decoder_cross_attention_weights
         self.last_decoder_cross_attention_weights = None
 
@@ -403,7 +409,6 @@ class KineticACT(ACT):
 
         # Predict the auxiliary outputs.
         auxiliary_outputs = self._predict_auxiliary_outputs(
-            encoder_output,
             decoder_output,
             token_slice_per_camera,
             token_grid_shape_per_camera,
@@ -411,6 +416,31 @@ class KineticACT(ACT):
         )
 
         return actions, (latent_mean, latent_log_variance), auxiliary_outputs
+
+    def _build_attention_mask_projections(self) -> nn.ModuleList:
+        """Build one attention mask projection per camera with an object mask.
+
+        Returns:
+            nn.ModuleList: Attention mask projections.
+        """
+        encoder_token_count = 1
+        if self.config.robot_state_feature:
+            encoder_token_count += 1
+        if self.config.env_state_feature:
+            encoder_token_count += 1
+
+        token_count_per_camera: dict[str, int] = {}
+        for camera_key, feature in self.config.image_features.items():
+            # The backbone only reads the image size here. Its normalization layers are frozen.
+            with torch.no_grad():
+                feature_map = self.backbone(torch.zeros(1, 3, *feature.shape[-2:]))["feature_map"]
+            token_count_per_camera[camera_key] = feature_map.shape[-2] * feature_map.shape[-1]
+        encoder_token_count += sum(token_count_per_camera.values())
+
+        return nn.ModuleList(
+            nn.Linear(self.config.chunk_size * encoder_token_count, token_count_per_camera[camera_key])
+            for camera_key in self.config.object_mask_label_key_per_camera
+        )
 
     def _encode_latent(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor | None, Tensor | None]:
         """Encode the latent style variable.
@@ -594,16 +624,14 @@ class KineticACT(ACT):
 
     def _predict_auxiliary_outputs(
         self,
-        encoder_output: Tensor,
         decoder_output: Tensor,
         token_slice_per_camera: dict[str, slice],
         token_grid_shape_per_camera: dict[str, tuple[int, int]],
         last_decoder_cross_attention_weights: Tensor | None,
     ) -> dict[str, Tensor]:
-        """Predict the object distance, stage logits, object mask logits and per-camera decoder attention.
+        """Predict the object distance and stage logits, and the object attention outputs per camera.
 
         Args:
-            encoder_output (Tensor): Encoder output.
             decoder_output (Tensor): Decoder output.
             token_slice_per_camera (dict[str, slice]): Token slice per camera.
             token_grid_shape_per_camera (dict[str, tuple[int, int]]): Token grid shape per camera.
@@ -614,27 +642,38 @@ class KineticACT(ACT):
         """
         auxiliary_outputs: dict[str, Tensor] = {}
 
+        head_input = decoder_output
+        if self.config.stage_feature_dimension is not None:
+            head_input = self.stage_feature_projection(decoder_output)
+
         # Predict the object distance.
         if self.config.object_distance_label_key is not None:
-            auxiliary_outputs["object_distance"] = self.object_distance_head(decoder_output).squeeze(-1)
+            auxiliary_outputs["object_distance"] = self.object_distance_head(head_input).squeeze(-1)
 
         # Predict the stage logits.
         if self.config.stage_label_key is not None:
-            auxiliary_outputs["stage_logits"] = self.stage_head(decoder_output)
+            auxiliary_outputs["stage_logits"] = self.stage_head(head_input)
 
-        # Predict the object masks.
-        for camera_key, mask_label_key in self.config.object_mask_label_key_per_camera.items():
+        if last_decoder_cross_attention_weights is None:
+            return auxiliary_outputs
+
+        for camera_index, (camera_key, mask_label_key) in enumerate(
+            self.config.object_mask_label_key_per_camera.items()
+        ):
             grid_height, grid_width = token_grid_shape_per_camera[camera_key]
-            mask_logits = self.object_mask_head(encoder_output[token_slice_per_camera[camera_key]]).squeeze(
-                -1
-            )
-            auxiliary_outputs[mask_label_key] = einops.rearrange(
-                mask_logits, "(h w) b -> b h w", h=grid_height, w=grid_width
-            )
-
-            # Camera's decoder cross-attention on its token grid.
-            if last_decoder_cross_attention_weights is not None:
-                camera_attention = last_decoder_cross_attention_weights[..., token_slice_per_camera[camera_key]]
+            if self.config.use_attention_mask_projection:
+                # Map the attention weights of all queries and encoder tokens to the camera's mask grid.
+                mask_logits = self.attention_mask_projections[camera_index](
+                    last_decoder_cross_attention_weights.flatten(1)
+                )
+                auxiliary_outputs[f"{mask_label_key}{ATTENTION_MASK_LOGITS_KEY_SUFFIX}"] = mask_logits.view(
+                    -1, grid_height, grid_width
+                )
+            else:
+                # Camera's decoder cross-attention on its token grid.
+                camera_attention = last_decoder_cross_attention_weights[
+                    ..., token_slice_per_camera[camera_key]
+                ]
                 auxiliary_outputs[f"{mask_label_key}{LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX}"] = (
                     einops.rearrange(camera_attention, "b q (h w) -> b q h w", h=grid_height, w=grid_width)
                 )

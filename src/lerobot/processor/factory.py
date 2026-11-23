@@ -36,6 +36,7 @@ from .converters import (
 )
 from .device_processor import DeviceProcessorStep
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+from .observation_history_processor import ObservationHistoryProcessorStep
 from .pipeline import (
     IdentityProcessorStep,
     PolicyProcessorPipeline,
@@ -43,6 +44,7 @@ from .pipeline import (
     RobotProcessorPipeline,
 )
 from .relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
+from .relative_state_history_processor import RelativeStateHistoryProcessorStep
 from .rename_processor import RenameObservationsProcessorStep
 
 
@@ -172,28 +174,47 @@ def make_default_pre_post_processors(
     compose `make_default_policy_processor_steps` themselves instead.
     """
     s = make_default_policy_processor_steps(config, dataset_stats, normalizer_device=normalizer_device)
+    state_history_length = getattr(config, "state_history_length", 1)
+    image_history_length = getattr(config, "image_history_length", 1)
+    use_se3_relative_pose = getattr(config, "use_se3_relative_pose", False)
+    input_steps: list[ProcessorStep] = [s.rename_observations, s.add_batch_dim]
+    output_steps: list[ProcessorStep] = [s.unnormalize]
+
+    if state_history_length > 1 or image_history_length > 1:
+        input_steps.append(
+            ObservationHistoryProcessorStep(
+                state_history_length=state_history_length,
+                image_history_length=image_history_length,
+                observation_history_stride=getattr(config, "observation_history_stride", 1),
+            )
+        )
+
+    # Relative actions read the absolute current state, so they run before the state history is made relative.
     if getattr(config, "use_relative_actions", False):
         relative = RelativeActionsProcessorStep(
             enabled=True,
             exclude_joints=getattr(config, "relative_exclude_joints", []),
             action_names=getattr(config, "action_feature_names", None),
             mode=getattr(config, "relative_action_mode", "obs_t"),
+            use_se3_relative_pose=use_se3_relative_pose,
+            current_state_index=-1 if state_history_length > 1 else 0,
         )
-        absolute = AbsoluteActionsProcessorStep(enabled=True, relative_step=relative)
-        return make_policy_processor_pipelines(
-            input_steps=[
-                s.rename_observations,
-                s.add_batch_dim,
-                relative,
-                s.to_device,
-                s.normalize,
-            ],
-            output_steps=[s.unnormalize, absolute, s.to_cpu],
+        input_steps.append(relative)
+        output_steps.append(AbsoluteActionsProcessorStep(enabled=True, relative_step=relative))
+
+    if getattr(config, "use_relative_state_history", False):
+        input_steps.append(
+            RelativeStateHistoryProcessorStep(
+                enabled=True,
+                exclude_joints=getattr(config, "relative_exclude_joints", []),
+                state_names=getattr(config, "state_feature_names", None),
+                use_se3_relative_pose=use_se3_relative_pose,
+            )
         )
-    return make_policy_processor_pipelines(
-        input_steps=[s.rename_observations, s.add_batch_dim, s.to_device, s.normalize],
-        output_steps=[s.unnormalize, s.to_cpu],
-    )
+
+    input_steps.extend([s.to_device, s.normalize])
+    output_steps.append(s.to_cpu)
+    return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
 
 
 def _reconnect_relative_absolute_steps(

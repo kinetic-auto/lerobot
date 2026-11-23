@@ -39,10 +39,13 @@ from lerobot.model.cartesian_quantities import (
 )
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.model.urdf_inspection import (
+    UR_CALIBRATION_JOINT_MAPPING,
     UrdfJoint,
+    apply_arm_kinematics_calibration,
     frame_candidates,
     movable_joint_chain_to_frame,
     parse_urdf_joints,
+    read_arm_kinematics_calibration,
     write_kinematics_only_urdf,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
@@ -73,14 +76,16 @@ _JOINT_FEATURE_KEYS = {OBS_STATE: "observation.joint_state", ACTION: "action.joi
 class JointToCartesianConversionConfig:
     # Path to the robot URDF. Visual and collision meshes are stripped before load.
     urdf: str = ""
+    # UR kinematics calibration YAML.
+    kinematics_calibration_path: str | None = None
     # URDF link or joint to express the end effector in. Prompted when unset.
     target_frame: str | None = None
     # Dataset joint name to URDF joint name. Prompted when unset.
     joint_map: dict[str, str] | None = None
     # rad or deg. Default is radians.
     joint_units: str = "rad"
-    # placo Jacobian frame: local, world, or local_world_aligned.
-    jacobian_frame_reference: str = "local_world_aligned"
+    # placo Jacobian frame: local, world, or local_world_aligned. local expresses twist and wrench in the end-effector frame.
+    jacobian_frame_reference: str = "local"
     # Subtract static gravity torques before solving the end-effector wrench.
     subtract_gravity: bool = True
     # Prompt for the frame and joint map when they are not set.
@@ -273,6 +278,12 @@ def convert_joints_to_cartesian(
     with tempfile.TemporaryDirectory() as tmp:
         # Build kinematics from a mesh-stripped URDF.
         kinematics_urdf = write_kinematics_only_urdf(config.urdf, Path(tmp) / "kinematics.urdf")
+        if config.kinematics_calibration_path is not None:
+            apply_arm_kinematics_calibration(
+                kinematics_urdf,
+                config.kinematics_calibration_path,
+                _resolve_calibration_joint_mapping(joint_map),
+            )
         kinematics = RobotKinematics(
             urdf_path=str(kinematics_urdf),
             target_frame_name=target_frame,
@@ -385,6 +396,22 @@ def convert_joints_to_cartesian(
     return new_dataset, report
 
 
+def _resolve_calibration_joint_mapping(joint_map: Mapping[str, str]) -> dict[str, str]:
+    missing_dataset_joints = [
+        dataset_joint
+        for dataset_joint in UR_CALIBRATION_JOINT_MAPPING.values()
+        if dataset_joint not in joint_map
+    ]
+    if missing_dataset_joints:
+        raise ValueError(
+            f"The joint map {dict(joint_map)} has no URDF joint for the calibrated joints {missing_dataset_joints}."
+        )
+    return {
+        link_name: joint_map[dataset_joint]
+        for link_name, dataset_joint in UR_CALIBRATION_JOINT_MAPPING.items()
+    }
+
+
 def _validate_config(
     config: JointToCartesianConversionConfig, dataset: LeRobotDataset, output_dir: str | Path
 ) -> None:
@@ -394,6 +421,11 @@ def _validate_config(
         raise ValueError("urdf is required.")
     if not Path(config.urdf).is_file():
         raise ValueError(f"URDF not found: {config.urdf}")
+    if (
+        config.kinematics_calibration_path is not None
+        and not Path(config.kinematics_calibration_path).is_file()
+    ):
+        raise ValueError(f"Kinematics calibration not found: {config.kinematics_calibration_path}")
     if config.joint_units not in _JOINT_ANGLE_UNITS:
         raise ValueError(f"joint_units must be one of {_JOINT_ANGLE_UNITS}, got {config.joint_units!r}.")
     if config.jacobian_frame_reference not in _JACOBIAN_FRAME_REFERENCES:
@@ -1756,6 +1788,7 @@ def _write_provenance(
                 gripper_channels.append(name)
     payload = {
         "urdf": {"name": Path(config.urdf).name, "sha256": _sha256(config.urdf)},
+        "kinematics_calibration": _get_calibration_info(config.kinematics_calibration_path),
         "target_frame": target_frame,
         "joint_map": joint_map,
         "gripper_channels": gripper_channels,
@@ -1770,6 +1803,16 @@ def _write_provenance(
     }
     path = Path(dataset.root) / "meta" / "cartesian_conversion.json"
     path.write_text(json.dumps(_to_json_format(payload), indent=2) + "\n")
+
+
+def _get_calibration_info(kinematics_calibration_path: str | None) -> dict[str, Any] | None:
+    if kinematics_calibration_path is None:
+        return None
+    return {
+        "name": Path(kinematics_calibration_path).name,
+        "sha256": _sha256(kinematics_calibration_path),
+        "hash": read_arm_kinematics_calibration(kinematics_calibration_path).get("hash"),
+    }
 
 
 def _write_conversion_manifest(

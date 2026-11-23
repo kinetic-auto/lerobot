@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import xml.etree.ElementTree as ET  # nosec B405 test fixture, not network XML
+
+import pytest
+
 from lerobot.model.urdf_inspection import (
+    UR_CALIBRATION_JOINT_MAPPING,
+    apply_arm_kinematics_calibration,
     movable_joint_chain_to_frame,
     parse_urdf_joints,
+    read_arm_kinematics_calibration,
     write_kinematics_only_urdf,
 )
 
@@ -103,3 +110,100 @@ def test_parse_skips_nested_ros2_control_joints(tmp_path):
     assert [joint.name for joint in joints] == ["joint1"]
     assert joints[0].parent_link == "base_link"
     assert joints[0].child_link == "link1"
+
+
+def write_ur_chain_urdf(path, joint_prefix="robot_0_"):
+    joint_elements = []
+    parent_link = "base_link"
+    for joint_index, joint_name in enumerate(UR_CALIBRATION_JOINT_MAPPING.values()):
+        child_link = f"link_{joint_index}"
+        joint_elements.append(
+            f"""  <joint name="{joint_prefix}{joint_name}" type="revolute">
+    <parent link="{parent_link}"/>
+    <child link="{child_link}"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28" upper="6.28" effort="10" velocity="1"/>
+  </joint>
+  <link name="{child_link}"/>"""
+        )
+        parent_link = child_link
+    path.write_text(
+        '<?xml version="1.0"?>\n<robot name="ur">\n  <link name="base_link"/>\n'
+        + "\n".join(joint_elements)
+        + "\n</robot>\n"
+    )
+    return path
+
+
+def write_kinematics_calibration(path, link_names=None):
+    link_names = list(UR_CALIBRATION_JOINT_MAPPING) if link_names is None else link_names
+    lines = ["kinematics:"]
+    for link_index, link_name in enumerate(link_names):
+        lines.append(f"  {link_name}:")
+        for key, value in zip(
+            ("x", "y", "z", "roll", "pitch", "yaw"),
+            (0.1 * link_index, -0.2, 0.3, 0.01, -0.02, 0.03 * link_index),
+            strict=True,
+        ):
+            lines.append(f"    {key}: {value}")
+    lines.append("  hash: calib_123")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def calibration_joint_mapping(joint_prefix="robot_0_"):
+    return {
+        link_name: f"{joint_prefix}{joint_name}"
+        for link_name, joint_name in UR_CALIBRATION_JOINT_MAPPING.items()
+    }
+
+
+def test_arm_kinematics_calibration_updates_each_calibrated_joint_origin(tmp_path):
+    urdf_path = write_ur_chain_urdf(tmp_path / "ur.urdf")
+    calibration_path = write_kinematics_calibration(tmp_path / "robot_0_kinematics.yaml")
+
+    apply_arm_kinematics_calibration(urdf_path, calibration_path, calibration_joint_mapping())
+
+    calibration = read_arm_kinematics_calibration(calibration_path)
+    assert calibration["hash"] == "calib_123"
+    origin_by_joint = {
+        element.attrib["name"]: element.find("origin").attrib
+        for element in ET.parse(urdf_path).getroot().iter("joint")  # nosec B314
+    }
+    for link_name, joint_name in calibration_joint_mapping().items():
+        expected_position = [calibration[link_name][key] for key in ("x", "y", "z")]
+        expected_orientation = [calibration[link_name][key] for key in ("roll", "pitch", "yaw")]
+        assert [float(value) for value in origin_by_joint[joint_name]["xyz"].split()] == expected_position
+        assert [float(value) for value in origin_by_joint[joint_name]["rpy"].split()] == expected_orientation
+
+
+def test_arm_kinematics_calibration_raises_on_a_missing_link(tmp_path):
+    urdf_path = write_ur_chain_urdf(tmp_path / "ur.urdf")
+    calibration_path = write_kinematics_calibration(
+        tmp_path / "robot_0_kinematics.yaml", link_names=["shoulder", "upper_arm"]
+    )
+    with pytest.raises(ValueError, match="forearm"):
+        apply_arm_kinematics_calibration(urdf_path, calibration_path, calibration_joint_mapping())
+
+
+def test_arm_kinematics_calibration_raises_on_a_missing_joint(tmp_path):
+    urdf_path = write_ur_chain_urdf(tmp_path / "ur.urdf", joint_prefix="")
+    calibration_path = write_kinematics_calibration(tmp_path / "robot_0_kinematics.yaml")
+    with pytest.raises(ValueError, match="robot_0_shoulder_pan_joint"):
+        apply_arm_kinematics_calibration(urdf_path, calibration_path, calibration_joint_mapping())
+
+
+def test_arm_kinematics_calibration_raises_on_a_link_missing_a_key(tmp_path):
+    urdf_path = write_ur_chain_urdf(tmp_path / "ur.urdf")
+    calibration_path = write_kinematics_calibration(tmp_path / "robot_0_kinematics.yaml")
+    calibration_path.write_text(calibration_path.read_text().replace("    yaw: 0.0\n", "", 1))
+    with pytest.raises(ValueError, match="shoulder"):
+        apply_arm_kinematics_calibration(urdf_path, calibration_path, calibration_joint_mapping())
+
+
+def test_arm_kinematics_calibration_raises_without_a_kinematics_mapping(tmp_path):
+    calibration_path = tmp_path / "robot_0_kinematics.yaml"
+    calibration_path.write_text("shoulder: 1\n")
+    with pytest.raises(ValueError, match="kinematics"):
+        read_arm_kinematics_calibration(calibration_path)

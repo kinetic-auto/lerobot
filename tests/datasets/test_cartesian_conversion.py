@@ -43,7 +43,9 @@ from lerobot.model.cartesian_quantities import (
     FrameWrench,
     GripperChannels,
 )
+from lerobot.model.urdf_inspection import UR_CALIBRATION_JOINT_MAPPING
 from lerobot.utils.constants import ACTION, OBS_STATE
+from tests.model.test_urdf_inspection import write_kinematics_calibration, write_ur_chain_urdf
 
 PLANAR_URDF = """<?xml version="1.0"?>
 <robot name="planar">
@@ -473,6 +475,162 @@ def test_convert_state_effort_uses_action_positions(tmp_path, empty_lerobot_data
     )
     assert converted.meta.features[OBS_STATE]["names"] == WRENCH_NAMES
     assert converted.meta.features[ACTION]["names"] == EXPECTED_NAMES
+
+
+def test_convert_position_only_action_gives_pose_and_gripper(tmp_path, empty_lerobot_dataset_factory):
+    pytest.importorskip("placo")
+    state_names = packed_feature_names(DATASET_JOINTS, ["position", "effort"])
+    action_names = packed_feature_names(DATASET_JOINTS, ["position"])
+    dataset = _record_planar_dataset(
+        tmp_path,
+        empty_lerobot_dataset_factory,
+        features={
+            OBS_STATE: {"dtype": "float32", "shape": (len(state_names),), "names": state_names},
+            ACTION: {"dtype": "float32", "shape": (len(action_names),), "names": action_names},
+        },
+    )
+    converted, _report = convert_joints_to_cartesian(
+        dataset,
+        _conversion_config(tmp_path),
+        output_dir=tmp_path / "cartesian-position-action",
+        repo_id="local/cartesian-position-action",
+    )
+    assert converted.meta.features[OBS_STATE]["names"] == EXPECTED_NAMES
+    assert converted.meta.features[ACTION]["names"] == POSE_NAMES + ["gripper.position.x"]
+
+
+def _record_planar_dataset_with_effort(tmp_path, empty_lerobot_dataset_factory):
+    names = packed_feature_names(DATASET_JOINTS, ["position", "effort"])
+    features = {OBS_STATE: {"dtype": "float32", "shape": (len(names),), "names": names}}
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "source", features=features, use_videos=False)
+    for frame in range(12):
+        joint_positions = [0.4 + 0.05 * frame, 0.9, 0.02]
+        joint_efforts = [0.3, -0.2, 0.0]
+        dataset.add_frame(
+            {"task": "reach", OBS_STATE: np.array(joint_positions + joint_efforts, dtype=np.float32)}
+        )
+    dataset.save_episode()
+    dataset.finalize()
+    return dataset
+
+
+def _read_state_rows(dataset: LeRobotDataset) -> np.ndarray:
+    return np.stack([np.asarray(row) for row in dataset.hf_dataset[OBS_STATE]])
+
+
+def test_default_wrench_is_expressed_in_the_end_effector_frame(tmp_path, empty_lerobot_dataset_factory):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset_with_effort(tmp_path, empty_lerobot_dataset_factory)
+    end_effector_frame, _report = convert_joints_to_cartesian(
+        dataset,
+        _conversion_config(tmp_path, subtract_gravity=False, evaluate=False),
+        output_dir=tmp_path / "cartesian-local",
+        repo_id="local/cartesian-local",
+    )
+    base_axes, _report = convert_joints_to_cartesian(
+        dataset,
+        _conversion_config(
+            tmp_path, subtract_gravity=False, evaluate=False, jacobian_frame_reference="local_world_aligned"
+        ),
+        output_dir=tmp_path / "cartesian-aligned",
+        repo_id="local/cartesian-aligned",
+    )
+
+    provenance = json.loads((end_effector_frame.root / "meta" / "cartesian_conversion.json").read_text())
+    assert provenance["jacobian_frame_reference"] == "local"
+    end_effector_rows = _read_state_rows(
+        LeRobotDataset("local/cartesian-local", root=end_effector_frame.root)
+    )
+    base_axes_rows = _read_state_rows(LeRobotDataset("local/cartesian-aligned", root=base_axes.root))
+    wrench_start = len(POSE_NAMES) + 1
+    for end_effector_row, base_axes_row in zip(end_effector_rows, base_axes_rows, strict=True):
+        rotation = FramePoseRot6D.from_vector(base_axes_row[: len(POSE_NAMES)]).rotation
+        base_axes_force = base_axes_row[wrench_start : wrench_start + 3]
+        base_axes_torque = base_axes_row[wrench_start + 3 : wrench_start + 6]
+        np.testing.assert_allclose(end_effector_row[:wrench_start], base_axes_row[:wrench_start], atol=1e-6)
+        np.testing.assert_allclose(
+            end_effector_row[wrench_start : wrench_start + 3], rotation.T @ base_axes_force, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            end_effector_row[wrench_start + 3 : wrench_start + 6], rotation.T @ base_axes_torque, atol=1e-5
+        )
+    assert np.abs(base_axes_rows[:, wrench_start:]).max() > 0.01
+
+
+UR_DATASET_JOINTS = [*UR_CALIBRATION_JOINT_MAPPING.values(), "gripper"]
+UR_JOINT_MAP = {joint_name: f"robot_0_{joint_name}" for joint_name in UR_CALIBRATION_JOINT_MAPPING.values()}
+
+
+def _record_ur_dataset(tmp_path, empty_lerobot_dataset_factory):
+    names = packed_feature_names(UR_DATASET_JOINTS, ["position"])
+    features = {OBS_STATE: {"dtype": "float32", "shape": (len(names),), "names": names}}
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "ur-source", features=features, use_videos=False)
+    for frame in range(6):
+        joint_positions = [0.1 * frame, 0.2, -0.3, 0.4, 0.5, -0.6, 0.02]
+        dataset.add_frame({"task": "reach", OBS_STATE: np.array(joint_positions, dtype=np.float32)})
+    dataset.save_episode()
+    dataset.finalize()
+    return dataset
+
+
+def _ur_conversion_config(tmp_path, **overrides):
+    config = {
+        "urdf": str(write_ur_chain_urdf(tmp_path / "ur.urdf")),
+        "target_frame": "link_5",
+        "joint_map": UR_JOINT_MAP,
+        "interactive": False,
+        "plot_episodes": 0,
+        "evaluate": False,
+    }
+    config.update(overrides)
+    return JointToCartesianConversionConfig(**config)
+
+
+def test_kinematics_calibration_sets_the_joint_origins_used_for_the_pose(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    pytest.importorskip("placo")
+    dataset = _record_ur_dataset(tmp_path, empty_lerobot_dataset_factory)
+    calibration_path = write_kinematics_calibration(tmp_path / "robot_0_kinematics.yaml")
+    calibrated, _report = convert_joints_to_cartesian(
+        dataset,
+        _ur_conversion_config(tmp_path, kinematics_calibration_path=str(calibration_path)),
+        output_dir=tmp_path / "cartesian-calibrated",
+        repo_id="local/cartesian-calibrated",
+    )
+    uncalibrated, _report = convert_joints_to_cartesian(
+        dataset,
+        _ur_conversion_config(tmp_path),
+        output_dir=tmp_path / "cartesian-uncalibrated",
+        repo_id="local/cartesian-uncalibrated",
+    )
+
+    stored_urdf = (calibrated.root / "meta" / "kinematics.urdf").read_text()
+    assert '<origin xyz="0.0 -0.2 0.3" rpy="0.01 -0.02 0.0"' in stored_urdf
+    provenance = json.loads((calibrated.root / "meta" / "cartesian_conversion.json").read_text())
+    assert provenance["kinematics_calibration"]["name"] == "robot_0_kinematics.yaml"
+    assert provenance["kinematics_calibration"]["hash"] == "calib_123"
+    assert len(provenance["kinematics_calibration"]["sha256"]) == 64
+    calibrated_rows = _read_state_rows(LeRobotDataset("local/cartesian-calibrated", root=calibrated.root))
+    uncalibrated_rows = _read_state_rows(
+        LeRobotDataset("local/cartesian-uncalibrated", root=uncalibrated.root)
+    )
+    assert not np.allclose(calibrated_rows[:, :3], uncalibrated_rows[:, :3])
+
+
+def test_kinematics_calibration_raises_when_a_calibrated_joint_is_not_in_the_joint_map(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset(tmp_path, empty_lerobot_dataset_factory)
+    calibration_path = write_kinematics_calibration(tmp_path / "robot_0_kinematics.yaml")
+    with pytest.raises(ValueError, match="shoulder_pan_joint"):
+        convert_joints_to_cartesian(
+            dataset,
+            _conversion_config(tmp_path, kinematics_calibration_path=str(calibration_path)),
+            output_dir=tmp_path / "cartesian-planar-calibrated",
+            repo_id="local/cartesian-planar-calibrated",
+        )
 
 
 def test_interactive_false_without_frame_raises(tmp_path, empty_lerobot_dataset_factory):

@@ -274,12 +274,15 @@ lerobot-edit-dataset \
 - positions become a translation (metres, URDF base frame) plus the first two columns of the rotation matrix
 - velocities, when present, become a twist
 - efforts become an end-effector wrench, with static gravity torques removed by default
+- twist and wrench are expressed in the end-effector frame by default (`--operation.jacobian_frame_reference local`); `local_world_aligned` gives components along the URDF base axes instead
 - gripper joint positions become `gripper.position.x` (then `y`, `z` for extra fingers); gripper velocity and effort are dropped
 - fields you do not convert stay as the original joint channels (for example Cartesian pose with joint torques)
 
 `--operation.feature_keys` selects which of `observation.state` / `action` to rewrite (default: every one present). `--operation.convert_fields` selects `position`, `velocity`, and/or `effort` (default: every packed field on that feature). Pose, twist, and wrench still need joint positions for kinematics: on the feature being converted, or on the other of `observation.state` / `action` if that one still has them. A dataset with only actions, or with no position channels at all, is valid as long as the requested conversion does not need missing kinematics inputs.
 
 Requires `lerobot[kinematics]` (`placo`). URDFs whose meshes use `package://` paths are copied with `<visual>` and `<collision>` removed before load; that copy is stored at `meta/kinematics.urdf`.
+
+For a UR arm, `--operation.kinematics_calibration_path` takes the robot's kinematics calibration YAML (for example `robot_0_kinematics.yaml`). Its `shoulder`, `upper_arm`, `forearm`, `wrist_1`, `wrist_2` and `wrist_3` poses replace the origins of the matching arm joints in the URDF copy, so forward kinematics uses the robot's own calibration. The URDF is still required for the base, mount and tool frames. The joints are found through the joint map, so every UR arm joint must be mapped. `meta/cartesian_conversion.json` records the YAML's file name, sha256 and `hash`.
 
 Interactive run (prompts for the frame and the joint map):
 

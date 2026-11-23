@@ -30,7 +30,7 @@ lerobot-mcap-valid \
 Each frame holds:
 
 - `observation.state`: the joint positions followed by the joint efforts, with the gripper opening as the last position channel. The gripper effort channel is present and always zero; `estimated_torque_nm` is not read. Joints are matched by name, so their order in `/joint_states` does not matter.
-- `action`: the observation state `--action_lookahead_frames` frames later. The last frames of an episode, which have no later state, are dropped.
+- `action`: the joint and gripper positions of the observation state `--action_lookahead_frames` frames later. The last frames of an episode, which have no later state, are dropped. `--include_effort_in_actions true` keeps the efforts in the action as well.
 - `observation.images.pc1`, `observation.images.realsense`: RGB cameras, resized to the configured output size.
 - `observation.images.realsense_depth`: D405 depth in millimeters. `--align_depth` (the default) projects it into the D405 color camera using the intrinsics and `camera_link_to_optical` extrinsics from `--d405_color_intrinsics_path` and `--d405_depth_intrinsics_path`. `--align_depth false` stores the depth image as recorded, which is what a sim bag needs when its depth is already in the color image. The bags need no `camera_info` or `/tf_static` topic.
 
@@ -44,6 +44,7 @@ Flags:
 - `--include_flagged`: highest report severity to convert, `pass`, `warning` or `critical` (default: `warning`).
 - `--quality_report_path`: report to use instead of `<session>/mcap_valid_reports/report.json`.
 - `--fps` (default: 10), `--action_lookahead_frames` (default: 3), `--task`, `--robot_type`.
+- `--include_effort_in_actions`: keep the joint and gripper efforts in `action` (default: false, positions only).
 - `--camera_feature_names`: dataset camera names, matched to `topics_mapping` (default: `pc1`, `realsense`, `realsense_depth`). A name ending in `_depth` is stored as a depth map.
 - `--img_sizes`: `[width, height]` per camera name (default: `[640, 360]` for each camera).
 - `--joint_names`: joints in dataset order (default: the six UR joints, shoulder pan to wrist 3).
@@ -72,6 +73,20 @@ Then check the result with `lerobot-dataset-valid`: it loads the dataset and che
 ```bash
 lerobot-dataset-valid \
   --dataset-path /path/to/<dataset_name>
+```
+
+To express the dataset as end-effector pose, gripper opening and wrench, convert it with the robot's URDF and its kinematics calibration. Force and torque are written in the end-effector frame. See `docs/source/using_dataset_tools.mdx` for every flag.
+
+```bash
+lerobot-edit-dataset \
+  --repo_id local/<dataset_name> \
+  --root /path/to/<dataset_name> \
+  --new_root /path/to/<dataset_name>-cartesian \
+  --operation.type joints_to_cartesian \
+  --operation.urdf /path/to/robot.urdf \
+  --operation.kinematics_calibration_path /etc/opt/kinetic/installed_system/robot/robot_0_kinematics.yaml \
+  --operation.target_frame robot_0_link_6 \
+  --operation.interactive false
 ```
 
 ## Edit LeRobotDataset

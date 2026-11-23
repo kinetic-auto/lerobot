@@ -23,24 +23,31 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 pytest.importorskip("mcap", reason="mcap is required (install lerobot[mcap-dep])")
 pytest.importorskip("mcap_ros2", reason="mcap-ros2-support is required (install lerobot[mcap-dep])")
 
+from lerobot.datasets import mcap_conversion
+from lerobot.datasets.dataset_validation import CONVERSION_MANIFEST_FILE_NAME, check_features
+from lerobot.datasets.joint_layout import packed_feature_names
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.mcap_conversion import (
+    STATE_FIELDS,
     DepthAlignment,
     EpisodeStreams,
     McapConversionConfig,
     TimedMessages,
+    build_depth_encoder_config,
     build_features,
     build_state_matrix,
     build_time_grid,
+    convert_episode,
     decode_aligned_depth_image,
     decode_depth_image,
-    build_depth_encoder_config,
     depth_frame_decoder,
+    filter_episodes_by_quality,
     find_joint_indices,
     latest_message_indices,
     load_allow_list,
     resolve_quality_report_path,
-    filter_episodes_by_quality,
     validate_config,
+    write_manifest,
 )
 from lerobot.datasets.mcap_depth import (
     COMPRESSED_DEPTH_HEADER_BYTES,
@@ -61,8 +68,8 @@ from lerobot.datasets.mcap_validation import (
     TopicReport,
     build_topic_report,
     flag_topic_hz_degradation,
-    validate_episode,
     load_episode_severities,
+    validate_episode,
     write_reports,
 )
 
@@ -103,7 +110,7 @@ def make_streams(joint_start: float, camera_start: float, end: float) -> Episode
         gripper_timestamps=gripper_timestamps,
         gripper_positions=gripper_timestamps + 1000,
         gripper_efforts=-gripper_timestamps - 1000,
-        camera_frames={name: camera_messages for name in ("pc1", "realsense", "realsense_depth")},
+        camera_frames=dict.fromkeys(("pc1", "realsense", "realsense_depth"), camera_messages),
         depth_alignment=DepthAlignment(camera, camera, np.eye(4)),
     )
 
@@ -337,7 +344,86 @@ def test_build_features_flags_depth_and_sizes_cameras(tmp_path):
     assert features["observation.images.realsense"]["shape"] == (18, 32, 3)
     assert features["observation.images.realsense_depth"]["shape"] == (18, 32, 1)
     assert features["observation.images.realsense_depth"]["info"]["is_depth_map"] is True
-    assert features["action"]["shape"] == (2,)
+
+
+def state_names_for(config: McapConversionConfig) -> list[str]:
+    return packed_feature_names([*config.joint_names, config.gripper_joint_name], STATE_FIELDS)
+
+
+def test_build_features_gives_a_position_only_action_by_default(tmp_path):
+    config = make_conversion_config(tmp_path)
+    state_names = state_names_for(config)
+    features = build_features(config, state_names)
+    position_count = len(config.joint_names) + 1
+    assert features["action"]["names"] == state_names[:position_count]
+    assert features["action"]["shape"] == (position_count,)
+    assert all(name.endswith(".position") for name in features["action"]["names"])
+
+
+def test_build_features_keeps_efforts_in_the_action_when_asked(tmp_path):
+    config = make_conversion_config(tmp_path, include_effort_in_actions=True)
+    state_names = state_names_for(config)
+    features = build_features(config, state_names)
+    assert features["action"]["names"] == state_names
+    assert features["action"]["shape"] == features["observation.state"]["shape"]
+
+
+@pytest.mark.parametrize("include_effort_in_actions", [False, True])
+def test_convert_episode_writes_the_future_state_as_the_action(
+    tmp_path, monkeypatch, include_effort_in_actions
+):
+    config = make_conversion_config(
+        tmp_path,
+        joint_names=["joint_a", "joint_b"],
+        camera_feature_names=[],
+        fps=10,
+        action_lookahead_frames=3,
+        include_effort_in_actions=include_effort_in_actions,
+    )
+    streams = make_streams(joint_start=0.0, camera_start=0.0, end=2.0)
+    streams.camera_frames = {}
+    monkeypatch.setattr(mcap_conversion, "read_episode_streams", lambda *arguments: streams)
+    dataset = LeRobotDataset.create(
+        repo_id=config.repo_id,
+        fps=config.fps,
+        features=build_features(config, state_names_for(config)),
+        root=config.output_root,
+        use_videos=False,
+    )
+
+    frame_count = convert_episode(dataset, tmp_path / "episode.mcap", None, config)
+    dataset.finalize()
+
+    state = build_state_matrix(streams, build_time_grid(streams, config))
+    action_dimension = state.shape[1] if include_effort_in_actions else 3
+    expected_actions = state[3 : 3 + frame_count, :action_dimension]
+    reloaded = LeRobotDataset(config.repo_id, root=config.output_root)
+    actions = np.stack([np.asarray(row) for row in reloaded.hf_dataset["action"]])
+    np.testing.assert_allclose(actions, expected_actions, rtol=1e-6)
+    assert check_features(reloaded, Path(config.output_root)).endswith(f"{action_dimension}-dim action")
+
+
+def test_write_manifest_records_whether_actions_include_effort(tmp_path):
+    config = make_conversion_config(tmp_path)
+    write_manifest(tmp_path, [], {}, config)
+    manifest = json.loads((tmp_path / CONVERSION_MANIFEST_FILE_NAME).read_text())
+    assert manifest["include_effort_in_actions"] is False
+
+
+def test_check_features_rejects_an_action_that_is_not_the_leading_state_channels(tmp_path):
+    state_names = ["joint_a.position", "joint_a.effort"]
+    dataset = LeRobotDataset.create(
+        repo_id="local/test",
+        fps=10,
+        features={
+            "observation.state": {"dtype": "float32", "shape": (2,), "names": state_names},
+            "action": {"dtype": "float32", "shape": (1,), "names": ["joint_a.effort"]},
+        },
+        root=tmp_path / "dataset",
+        use_videos=False,
+    )
+    with pytest.raises(ValueError, match="joint_a.effort"):
+        check_features(dataset, tmp_path / "dataset")
 
 
 @pytest.mark.parametrize(

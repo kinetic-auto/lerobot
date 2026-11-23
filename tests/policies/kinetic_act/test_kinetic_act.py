@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.model.cartesian_quantities import FramePoseRot6D, FrameWrench
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACT
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
@@ -32,7 +33,13 @@ from lerobot.policies.kinetic_act.modeling_kinetic_act import (
     KineticACT,
     KineticACTPolicy,
 )
-from lerobot.processor import DepthRangeProcessorStep, NormalizerProcessorStep
+from lerobot.processor import (
+    DepthRangeProcessorStep,
+    NormalizerProcessorStep,
+    ObservationHistoryProcessorStep,
+    RelativeActionsProcessorStep,
+    RelativeStateHistoryProcessorStep,
+)
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 CHUNK_SIZE = 8
@@ -669,3 +676,133 @@ def test_validate_features_rejects_invalid_values(overrides, message):
 
     with pytest.raises(ValueError, match=message):
         config.validate_features()
+
+
+HISTORY_LENGTH = 2
+HISTORY_OVERRIDES = {"state_history_length": HISTORY_LENGTH, "image_history_length": HISTORY_LENGTH}
+
+
+def make_history_batch(batch_size: int = 2) -> dict[str, torch.Tensor]:
+    batch = make_train_batch(batch_size)
+    batch[OBS_STATE] = torch.randn(batch_size, HISTORY_LENGTH, STATE_DIM)
+    batch[RGB_CAMERA_KEY] = torch.randn(batch_size, HISTORY_LENGTH, 3, IMAGE_HEIGHT, IMAGE_WIDTH)
+    batch[DEPTH_CAMERA_KEY] = torch.randn(batch_size, HISTORY_LENGTH, 1, IMAGE_HEIGHT, IMAGE_WIDTH)
+    return batch
+
+
+def test_history_delta_indices_end_at_the_current_step():
+    config = make_kinetic_act_config(
+        state_history_length=3, image_history_length=2, observation_history_stride=4
+    )
+    assert config.state_observation_delta_indices == [-8, -4, 0]
+    assert config.image_observation_delta_indices == [-4, 0]
+    assert make_kinetic_act_config().state_observation_delta_indices is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"state_history_length": 0}, "state_history_length"),
+        ({"observation_history_stride": 0}, "observation_history_stride"),
+        ({"use_relative_state_history": True}, "state_history_length"),
+        ({"use_se3_relative_pose": True}, "use_relative_actions"),
+        (
+            {
+                "use_se3_relative_pose": True,
+                "use_relative_actions": True,
+                "relative_action_mode": "sequential",
+            },
+            "obs_t",
+        ),
+    ],
+)
+def test_history_and_relative_pose_settings_are_validated(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        make_kinetic_act_config(**overrides)
+
+
+def test_train_step_with_observation_history():
+    policy = KineticACTPolicy(make_kinetic_act_config(**HISTORY_OVERRIDES, **ALL_HEAD_OVERRIDES))
+    policy.train()
+
+    loss, _ = policy(make_history_batch())
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert policy.model.encoder_history_step_embedding.weight.grad is not None
+    assert tuple(policy.model.encoder_1d_feature_pos_embed.weight.shape) == (1 + HISTORY_LENGTH, 64)
+
+
+def test_select_action_with_observation_history_returns_one_action_per_batch_element():
+    batch_size = 2
+    policy = KineticACTPolicy(make_kinetic_act_config(**HISTORY_OVERRIDES))
+    policy.reset()
+    batch = make_history_batch(batch_size)
+    inference_batch = {key: batch[key] for key in (OBS_STATE, RGB_CAMERA_KEY, DEPTH_CAMERA_KEY)}
+
+    action = policy.select_action(inference_batch)
+
+    assert action.shape == (batch_size, ACTION_DIM)
+
+
+def test_object_mask_tokens_are_the_current_step_of_the_camera():
+    policy = KineticACTPolicy(make_kinetic_act_config(**HISTORY_OVERRIDES, **ALL_HEAD_OVERRIDES))
+    batch = policy._add_camera_image_list(make_history_batch())
+    latent_sample = torch.zeros(2, policy.config.latent_dim)
+
+    encoder_tokens, _, token_slice_per_camera, _ = policy.model._build_encoder_inputs(batch, latent_sample)
+
+    grid_token_count = TOKEN_GRID_SHAPE[0] * TOKEN_GRID_SHAPE[1]
+    first_camera_token_index = 1 + HISTORY_LENGTH
+    current_step_first_token_index = first_camera_token_index + grid_token_count
+    assert token_slice_per_camera[RGB_CAMERA_KEY] == slice(
+        current_step_first_token_index, current_step_first_token_index + grid_token_count
+    )
+    assert encoder_tokens.shape[0] == 1 + HISTORY_LENGTH + 2 * HISTORY_LENGTH * grid_token_count
+
+
+def test_attention_mask_projection_counts_the_history_tokens():
+    policy = KineticACTPolicy(make_kinetic_act_config(**HISTORY_OVERRIDES, **V3_OVERRIDES))
+    grid_token_count = TOKEN_GRID_SHAPE[0] * TOKEN_GRID_SHAPE[1]
+    encoder_token_count = 1 + HISTORY_LENGTH + 2 * HISTORY_LENGTH * grid_token_count
+
+    projection = policy.model.attention_mask_projections[0]
+
+    assert tuple(projection.weight.shape) == (grid_token_count, CHUNK_SIZE * encoder_token_count)
+
+
+def test_history_length_mismatch_names_the_input():
+    policy = KineticACTPolicy(make_kinetic_act_config(**HISTORY_OVERRIDES))
+    policy.reset()
+
+    with pytest.raises(ValueError, match=OBS_STATE):
+        policy.select_action(make_inference_batch())
+
+
+def test_preprocessor_orders_history_and_relative_steps():
+    pose_and_gripper_names = [*FramePoseRot6D.feature_names(), "gripper.position.x"]
+    config = make_kinetic_act_config(
+        **HISTORY_OVERRIDES,
+        use_relative_actions=True,
+        use_relative_state_history=True,
+        use_se3_relative_pose=True,
+        relative_exclude_joints=["force", "torque"],
+        action_feature_names=pose_and_gripper_names,
+        state_feature_names=[*pose_and_gripper_names, *FrameWrench.feature_names()],
+    )
+
+    preprocessor, _ = make_pre_post_processors(config, dataset_stats=None)
+
+    step_types = [type(step) for step in preprocessor.steps]
+    history_index = step_types.index(ObservationHistoryProcessorStep)
+    relative_actions_index = step_types.index(RelativeActionsProcessorStep)
+    relative_state_index = step_types.index(RelativeStateHistoryProcessorStep)
+    assert (
+        history_index
+        < relative_actions_index
+        < relative_state_index
+        < step_types.index(NormalizerProcessorStep)
+    )
+    relative_actions_step = preprocessor.steps[relative_actions_index]
+    assert relative_actions_step.current_state_index == -1
+    assert relative_actions_step.use_se3_relative_pose

@@ -45,6 +45,7 @@ Flags:
 - `--quality_report_path`: report to use instead of `<session>/mcap_valid_reports/report.json`.
 - `--fps` (default: 10), `--action_lookahead_frames` (default: 3), `--task`, `--robot_type`.
 - `--include_effort_in_actions`: keep the joint and gripper efforts in `action` (default: false, positions only).
+- `--include_gripper`: write the gripper channels to `observation.state` and `action` (default: true). With `false` the state and action hold the joints only, and the gripper topic is not required in the recording.
 - `--camera_feature_names`: dataset camera names, matched to `topics_mapping` (default: `pc1`, `realsense`, `realsense_depth`). A name ending in `_depth` is stored as a depth map.
 - `--img_sizes`: `[width, height]` per camera name (default: `[640, 360]` for each camera).
 - `--joint_names`: joints in dataset order (default: the six UR joints, shoulder pan to wrist 3).

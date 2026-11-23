@@ -14,20 +14,25 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import (
     _resolve_episode_split,
     _uses_recomputed_relative_action_stats,
+    apply_relative_state_history_stats,
     make_dataset,
     make_train_eval_datasets,
 )
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import EpisodeSplit
+from lerobot.model.cartesian_quantities import FramePoseRot6D, FrameWrench
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.kinetic_act.configuration_kinetic_act import KineticACTConfig
-from lerobot.utils.constants import PRETRAINED_MODEL_DIR, SPLIT_INFO
+from lerobot.utils.constants import OBS_STATE, PRETRAINED_MODEL_DIR, SPLIT_INFO
 from lerobot.utils.io_utils import write_json
 
 
@@ -142,3 +147,52 @@ def test_resume_split_rejects_changed_episode_selection(tmp_path):
 
 def test_relative_stats_leave_existing_relative_policies_unchanged():
     assert not _uses_recomputed_relative_action_stats(SimpleNamespace(use_relative_actions=True))
+
+
+def test_relative_state_history_stats_keep_rotation_unscaled_and_wrench_from_the_dataset(tmp_path):
+    state_names = [*FramePoseRot6D.feature_names(), "gripper.position.x", *FrameWrench.feature_names()]
+    dataset = LeRobotDataset.create(
+        repo_id="local/cartesian",
+        fps=10,
+        root=tmp_path / "dataset",
+        features={OBS_STATE: {"dtype": "float32", "shape": (len(state_names),), "names": state_names}},
+        use_videos=False,
+    )
+    for frame_index in range(6):
+        angle = 0.1 * frame_index
+        state = np.array(
+            [
+                0.1 * frame_index,
+                0.0,
+                0.5,
+                np.cos(angle),
+                np.sin(angle),
+                0.0,
+                -np.sin(angle),
+                np.cos(angle),
+                0.0,
+                0.02,
+            ]
+            + [float(frame_index)] * 6,
+            dtype=np.float32,
+        )
+        dataset.add_frame({"task": "open the door", OBS_STATE: state})
+    dataset.save_episode()
+    dataset.finalize()
+    dataset = LeRobotDataset("local/cartesian", root=tmp_path / "dataset")
+    dataset_wrench_mean = np.asarray(dataset.meta.stats[OBS_STATE]["mean"])[10:]
+    policy_config = SimpleNamespace(
+        relative_exclude_joints=["force", "torque"],
+        use_se3_relative_pose=True,
+        state_observation_delta_indices=[-1, 0],
+    )
+
+    apply_relative_state_history_stats(dataset, policy_config)
+
+    stats = dataset.meta.stats[OBS_STATE]
+    torch.testing.assert_close(stats["mean"][3:9], torch.zeros(6))
+    torch.testing.assert_close(stats["std"][3:9], torch.ones(6))
+    torch.testing.assert_close(stats["min"][3:9], -torch.ones(6))
+    torch.testing.assert_close(stats["q99"][3:9], torch.ones(6))
+    np.testing.assert_allclose(stats["mean"][10:].numpy(), dataset_wrench_mean, atol=1e-6)
+    assert stats["mean"][0] < 0

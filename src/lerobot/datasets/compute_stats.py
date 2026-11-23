@@ -19,9 +19,15 @@ import logging
 from collections.abc import Sequence
 
 import numpy as np
+import torch
 
 from lerobot.configs import is_depth_map
-from lerobot.processor import RelativeActionsProcessorStep
+from lerobot.processor import (
+    RelativeActionsProcessorStep,
+    RelativeStateHistoryProcessorStep,
+    TransitionKey,
+    create_transition,
+)
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .io_utils import load_image_as_numpy
@@ -841,4 +847,62 @@ def compute_sequential_action_stats(
 
     running_stats = RunningQuantileStats()
     running_stats.update(sequential)
+    return running_stats.get_statistics()
+
+
+# Windows converted per batch when computing relative statistics.
+RELATIVE_STATS_WINDOWS_PER_BATCH = 2048
+
+
+def compute_relative_action_chunk_stats(
+    hf_dataset, relative_actions_step: RelativeActionsProcessorStep, chunk_size: int
+) -> dict[str, np.ndarray]:
+    actions = torch.as_tensor(np.asarray(hf_dataset[ACTION], dtype=np.float32))
+    states = torch.as_tensor(np.asarray(hf_dataset[OBS_STATE], dtype=np.float32))
+    valid_starts = _get_valid_chunk_starts(np.asarray(hf_dataset["episode_index"]), chunk_size)
+    if len(valid_starts) == 0:
+        raise RuntimeError(f"No action chunk of {chunk_size} steps fits inside an episode.")
+
+    running_stats = RunningQuantileStats()
+    for batch_start in range(0, len(valid_starts), RELATIVE_STATS_WINDOWS_PER_BATCH):
+        chunk_starts = valid_starts[batch_start : batch_start + RELATIVE_STATS_WINDOWS_PER_BATCH]
+        chunk_frame_indices = chunk_starts[:, None] + np.arange(chunk_size)[None, :]
+        transition = create_transition(
+            observation={OBS_STATE: states[chunk_starts]}, action=actions[chunk_frame_indices]
+        )
+        relative_actions = relative_actions_step(transition)[TransitionKey.ACTION]
+        running_stats.update(relative_actions.reshape(-1, actions.shape[1]).numpy())
+    logging.info(f"Relative action stats from {len(valid_starts)} chunks of {chunk_size} steps.")
+    return running_stats.get_statistics()
+
+
+def compute_relative_state_history_stats(
+    hf_dataset,
+    relative_state_history_step: RelativeStateHistoryProcessorStep,
+    state_history_delta_indices: Sequence[int],
+) -> dict[str, np.ndarray]:
+    states = torch.as_tensor(np.asarray(hf_dataset[OBS_STATE], dtype=np.float32))
+    episode_indices = np.asarray(hf_dataset["episode_index"])
+    if len(states) == 0:
+        raise RuntimeError("Cannot compute relative state history stats for an empty dataset.")
+
+    # History steps before an episode start repeat its first frame, as LeRobotDataset pads them.
+    frame_indices = np.arange(len(states))
+    is_episode_first_frame = np.ones(len(states), dtype=bool)
+    is_episode_first_frame[1:] = episode_indices[1:] != episode_indices[:-1]
+    episode_first_frame_indices = np.maximum.accumulate(np.where(is_episode_first_frame, frame_indices, 0))
+    history_offsets = np.asarray(state_history_delta_indices)
+
+    running_stats = RunningQuantileStats()
+    for batch_start in range(0, len(states), RELATIVE_STATS_WINDOWS_PER_BATCH):
+        current_frame_indices = frame_indices[batch_start : batch_start + RELATIVE_STATS_WINDOWS_PER_BATCH]
+        history_frame_indices = np.maximum(
+            current_frame_indices[:, None] + history_offsets[None, :],
+            episode_first_frame_indices[current_frame_indices][:, None],
+        )
+        relative_state_history = relative_state_history_step.to_relative_state_history(
+            states[history_frame_indices]
+        )
+        running_stats.update(relative_state_history.reshape(-1, states.shape[1]).numpy())
+    logging.info(f"Relative state history stats from {len(states)} windows of {len(history_offsets)} steps.")
     return running_stats.get_statistics()

@@ -28,13 +28,16 @@ from lerobot.datasets.compute_stats import (
     aggregate_feature_stats,
     aggregate_stats,
     compute_episode_stats,
+    compute_relative_action_chunk_stats,
     compute_relative_action_stats,
+    compute_relative_state_history_stats,
     compute_sequential_action_stats,
     estimate_num_samples,
     get_feature_stats,
     sample_images,
     sample_indices,
 )
+from lerobot.processor import RelativeActionsProcessorStep, RelativeStateHistoryProcessorStep
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 
 
@@ -987,3 +990,41 @@ def test_aggregate_stats_incremental_resume():
     # Bounds should widen monotonically
     np.testing.assert_allclose(cumulative2["action"]["q01"], np.array([-25.0, -18.0]))
     np.testing.assert_allclose(cumulative2["action"]["q99"], np.array([35.0, 22.0]))
+
+
+def test_relative_action_chunk_stats_cover_every_step_of_the_chunk():
+    dataset = Dataset.from_dict(
+        {
+            ACTION: [[1.0], [3.0], [8.0], [102.0], [104.0]],
+            OBS_STATE: [[0.0], [1.0], [3.0], [100.0], [101.0]],
+            "episode_index": [0, 0, 0, 1, 1],
+        }
+    )
+    relative_actions_step = RelativeActionsProcessorStep(enabled=True, action_names=["arm"])
+
+    stats = compute_relative_action_chunk_stats(dataset, relative_actions_step, chunk_size=2)
+
+    # Chunks [1, 3] - 0, [3, 8] - 1 and [102, 104] - 100; the cross-episode chunk is left out.
+    np.testing.assert_allclose(stats["mean"], [np.mean([1.0, 3.0, 2.0, 7.0, 2.0, 4.0])], atol=1e-5)
+    np.testing.assert_allclose(stats["max"], [7.0], atol=1e-5)
+
+
+def test_relative_state_history_stats_pad_at_the_episode_start():
+    dataset = Dataset.from_dict(
+        {
+            OBS_STATE: [[1.0, 0.5], [4.0, 0.6], [10.0, 0.7], [11.0, 0.8]],
+            "episode_index": [0, 0, 1, 1],
+        }
+    )
+    relative_state_history_step = RelativeStateHistoryProcessorStep(
+        enabled=True, exclude_joints=["force"], state_names=["arm.position", "force.x"]
+    )
+
+    stats = compute_relative_state_history_stats(dataset, relative_state_history_step, [-1, 0])
+
+    # Windows (1, 1), (1, 4), (10, 10), (10, 11) relative to their last step; force stays as stored.
+    np.testing.assert_allclose(stats["min"], [-3.0, 0.5], atol=1e-5)
+    force_windows = [0.5, 0.5, 0.5, 0.6, 0.7, 0.7, 0.7, 0.8]
+    np.testing.assert_allclose(
+        stats["mean"], [np.mean([0, 0, -3, 0, 0, 0, -1, 0]), np.mean(force_windows)], atol=1e-5
+    )

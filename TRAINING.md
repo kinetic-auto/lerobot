@@ -251,6 +251,61 @@ lerobot-train \
 
 The object distance and stage logits are returned by `predict_action_chunk_with_auxiliary_outputs`. With the object attention loss on, it also returns the attention weights per masked camera, or the attention mask logits when the projection is used. `select_action` returns actions only, so recording, evaluation and the ROS 2 node work unchanged.
 
+### Relative poses and observation history (door opening)
+
+On a Cartesian dataset (pose, gripper and wrench state; pose and gripper action), `kinetic_act` can train on poses expressed in the current gripper frame, as UMI does, with a short history of states and images. The dataset stays absolute; the conversion happens in the preprocessor, and the normalization statistics are recomputed on the relative values when training starts.
+
+The relative pose and history flags are the last six of the command; the others are an ordinary `kinetic_act` run.
+
+```bash
+accelerate launch --multi_gpu --num_processes=2 \
+  $(which lerobot-train) \
+  --dataset.root=/data/datasets/ds-ur-door_unlatch-teleop-v2.6.0 \
+  --policy.type=kinetic_act \
+  --job_name=kinetic_act-door_unlatch-ur20_teleop-v2.6.0-20261117 \
+  --dataset.image_transforms.enable=true \
+  --dataset.image_transforms.max_num_transforms=3 \
+  --policy.chunk_size=50 \
+  --policy.n_action_steps=50 \
+  --policy.n_encoder_layers=4 \
+  --policy.n_decoder_layers=7 \
+  --policy.normalization_mapping='{"ACTION":"MEAN_STD","STATE":"MEAN_STD","VISUAL":"MEAN_STD"}' \
+  --policy.kl_weight=10.0 \
+  --policy.object_distance_label_key=observation.object_distance \
+  --policy.stage_label_key=observation.stage \
+  --policy.stage_class_count=3 \
+  --policy.stage_feature_dimension=128 \
+  --policy.object_mask_label_key_per_camera='{"observation.images.realsense":"observation.object_mask.realsense"}' \
+  --policy.object_attention_loss_weight=5.0 \
+  --policy.use_attention_mask_projection=true \
+  --policy.use_camera_identity_embedding=true \
+  --backbone=resnet18 \
+  --batch_size=16 \
+  --steps=100000 \
+  --save_freq=10000 \
+  --log_freq=200 \
+  --seed=1000 \
+  --dataset.split_ratio='[0.9,0.0,0.1]' \
+  --accelerator.mixed_precision=bf16 \
+  --wandb.enable=false \
+  --policy.use_relative_actions=true \
+  --policy.use_relative_state_history=true \
+  --policy.use_se3_relative_pose=true \
+  --policy.state_history_length=2 \
+  --policy.image_history_length=2 \
+  --policy.relative_exclude_joints='["force","torque"]'
+```
+
+`--dataset.root` must point at a Cartesian dataset: `--policy.use_se3_relative_pose` fails at startup when the state and action have no pose channels.
+
+- `--policy.use_se3_relative_pose`: the action chunk and the state history poses are expressed in the gripper frame at the current step, `inv(T_t) · T`, and composed back to absolute poses at inference. The gripper opening is the difference from its current value.
+- `--policy.use_relative_state_history`: every state history step is relative to the current step. Needs `--policy.state_history_length` of at least 2.
+- `--policy.state_history_length`, `--policy.image_history_length`: steps given to the model, current step included. `--policy.observation_history_stride` sets the frames between steps (default: 1). Each state step is one encoder token; each image step adds the camera's tokens with a learned history step embedding, so image history multiplies the image tokens.
+- `--policy.relative_exclude_joints='["force","torque"]'`: force and torque stay as stored, in the end-effector frame of their own step from the Cartesian conversion.
+- Statistics: the action statistics cover every step of the chunk, the state statistics every step of the history window, and the six rotation channels are left unscaled (mean 0, std 1).
+
+At inference the preprocessor buffers the last observations to build the history, so it expects one call per policy step and a `reset()` at each episode start. `KineticManipulationTask` (`lerobot.manipulation_tasks`) loads a task's checkpoint and processors on demand with `prepare_task(task_name)` and returns absolute action chunks from `predict_action_chunk`.
+
 ## Train on cloud GPU instance
 
 ### Lambda

@@ -24,6 +24,7 @@ import torch
 
 from lerobot.configs import DEPTH_MILLIMETER_UNIT
 from lerobot.utils.constants import ACTION, OBS_STATE
+
 from .lerobot_dataset import LeRobotDataset
 
 CONVERSION_MANIFEST_FILE_NAME = "mcap_conversion_manifest.json"
@@ -86,19 +87,27 @@ def check_features(dataset: LeRobotDataset, root: Path) -> str:
         if required_key not in features:
             raise ValueError(f"feature {required_key!r} is missing")
 
-    # Check if the state and action shapes are the same
-    # NOTE: This is a special case where actions are fetched from future observations.
-    if features[OBS_STATE]["shape"] != features[ACTION]["shape"]:
-        raise ValueError(
-            f"state shape {features[OBS_STATE]['shape']} differs from action shape "
-            f"{features[ACTION]['shape']}"
-        )
-
     # Check if the state names match the state dimension
     state_names = features[OBS_STATE]["names"]
     if len(state_names) != features[OBS_STATE]["shape"][0]:
         raise ValueError("state names do not match the state dimension")
-    detail = f"{len(state_names)}-dim state and action"
+
+    # Check if the action names are the leading state names
+    # NOTE: This is a special case where actions are fetched from future observations.
+    action_names = features[ACTION]["names"]
+    if len(action_names) != features[ACTION]["shape"][0]:
+        raise ValueError("action names do not match the action dimension")
+    if len(action_names) > len(state_names):
+        raise ValueError(f"action has {len(action_names)} channels but the state has {len(state_names)}")
+    mismatched_name_pairs = [
+        (action_name, state_name)
+        for action_name, state_name in zip(action_names, state_names, strict=False)
+        if action_name != state_name
+    ]
+    if mismatched_name_pairs:
+        action_name, state_name = mismatched_name_pairs[0]
+        raise ValueError(f"action channel {action_name!r} does not match state channel {state_name!r}")
+    detail = f"{len(state_names)}-dim state, {len(action_names)}-dim action"
 
     # Check if the dataset has any camera features
     if dataset.meta.video_keys:

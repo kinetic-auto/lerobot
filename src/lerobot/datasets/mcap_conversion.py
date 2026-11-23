@@ -39,7 +39,7 @@ from .mcap_depth import (
     load_depth_to_rgb_transform,
     validate_depth_image_dims,
 )
-from .mcap_episodes import episode_identifier, find_episode_paths, decode_topic_messages
+from .mcap_episodes import decode_topic_messages, episode_identifier, find_episode_paths
 from .mcap_topics import GRIPPER_FEEDBACK_NAME, ROBOT_STATE_NAME, load_mcap_topics
 from .mcap_validation import (
     JSON_REPORT_FILE_NAME,
@@ -64,6 +64,7 @@ class McapConversionConfig:
     task: str = "open the door"
     fps: int = 10
     action_lookahead_frames: int = 3
+    include_effort_in_actions: bool = False
     quality_report_path: str | None = None
     include_flagged: str = "warning"
     episode_allow_list_path: str | None = None
@@ -79,9 +80,7 @@ class McapConversionConfig:
         ]
     )
     gripper_joint_name: str = "gripper"
-    camera_feature_names: list[str] = field(
-        default_factory=lambda: ["pc1", "realsense", "realsense_depth"]
-    )
+    camera_feature_names: list[str] = field(default_factory=lambda: ["pc1", "realsense", "realsense_depth"])
     img_sizes: dict[str, list[int]] = field(
         default_factory=lambda: {
             "pc1": [640, 360],
@@ -149,7 +148,7 @@ def convert_session(config: McapConversionConfig) -> None:
                 skipped_reasons[episode_id] = f"conversion failed: {error}"
                 logging.error("Skipped %s: %s", episode_id, skipped_reasons[episode_id])
                 continue
-            
+
             if frame_count is None:
                 skipped_reasons[episode_id] = "shorter than the action lookahead after time alignment"
                 logging.warning("Skipped %s: %s", episode_id, skipped_reasons[episode_id])
@@ -168,7 +167,7 @@ def convert_session(config: McapConversionConfig) -> None:
         dataset.finalize()
 
     # Write the manifest
-    write_manifest(Path(config.output_root), converted_episodes, skipped_reasons)
+    write_manifest(Path(config.output_root), converted_episodes, skipped_reasons, config)
 
     if not converted_episodes:
         raise ValueError(f"No episode could be converted. Skipped: {skipped_reasons}")
@@ -202,12 +201,8 @@ def validate_config(config: McapConversionConfig) -> None:
             )
     if not config.joint_names:
         raise ValueError("joint_names must not be empty.")
-    if config.align_depth and not (
-        config.d405_color_intrinsics_path and config.d405_depth_intrinsics_path
-    ):
-        raise ValueError(
-            "align_depth requires d405_color_intrinsics_path and d405_depth_intrinsics_path."
-        )
+    if config.align_depth and not (config.d405_color_intrinsics_path and config.d405_depth_intrinsics_path):
+        raise ValueError("align_depth requires d405_color_intrinsics_path and d405_depth_intrinsics_path.")
 
 
 def filter_episodes_by_quality(config: McapConversionConfig) -> tuple[list[Path], dict[str, str]]:
@@ -253,9 +248,7 @@ def load_allow_list(allow_list_path: str | None) -> set[str] | None:
 
 def load_depth_alignment(config: McapConversionConfig) -> DepthAlignment:
     if config.d405_depth_intrinsics_path is None or config.d405_color_intrinsics_path is None:
-        raise ValueError(
-            "align_depth requires d405_color_intrinsics_path and d405_depth_intrinsics_path."
-        )
+        raise ValueError("align_depth requires d405_color_intrinsics_path and d405_depth_intrinsics_path.")
     depth_intrinsics_path = Path(config.d405_depth_intrinsics_path).expanduser()
     color_intrinsics_path = Path(config.d405_color_intrinsics_path).expanduser()
     return DepthAlignment(
@@ -266,9 +259,10 @@ def load_depth_alignment(config: McapConversionConfig) -> DepthAlignment:
 
 
 def build_features(config: McapConversionConfig, state_names: list[str]) -> dict[str, dict]:
+    action_names = build_action_names(state_names, config)
     features: dict[str, dict] = {
         OBS_STATE: {"dtype": "float32", "shape": (len(state_names),), "names": state_names},
-        ACTION: {"dtype": "float32", "shape": (len(state_names),), "names": state_names},
+        ACTION: {"dtype": "float32", "shape": (len(action_names),), "names": action_names},
     }
     for feature_name in config.camera_feature_names:
         width, height = config.img_sizes[feature_name]
@@ -282,6 +276,12 @@ def build_features(config: McapConversionConfig, state_names: list[str]) -> dict
             feature["info"] = {"is_depth_map": True}
         features[f"{OBS_IMAGES}.{feature_name}"] = feature
     return features
+
+
+def build_action_names(state_names: list[str], config: McapConversionConfig) -> list[str]:
+    if config.include_effort_in_actions:
+        return state_names
+    return packed_feature_names([*config.joint_names, config.gripper_joint_name], ["position"])
 
 
 def build_depth_encoder_config(config: McapConversionConfig) -> DepthEncoderConfig | None:
@@ -317,13 +317,15 @@ def convert_episode(
         else None
     )
 
+    action_dimension = dataset.meta.features[ACTION]["shape"][0]
+
     # Add the frames to the dataset
     added_frame_count = 0
     try:
         for frame_index in range(frame_count):
             frame = {
                 OBS_STATE: state[frame_index],
-                ACTION: state[frame_index + config.action_lookahead_frames],
+                ACTION: state[frame_index + config.action_lookahead_frames, :action_dimension],
                 "task": config.task,
             }
             if camera_observations is not None:
@@ -554,7 +556,14 @@ def store_depth_image(
 
 
 def write_manifest(
-    output_root: Path, converted_episodes: list[dict[str, Any]], skipped_reasons: dict[str, str]
+    output_root: Path,
+    converted_episodes: list[dict[str, Any]],
+    skipped_reasons: dict[str, str],
+    config: McapConversionConfig,
 ) -> None:
-    manifest = {"converted": converted_episodes, "skipped": skipped_reasons}
+    manifest = {
+        "include_effort_in_actions": config.include_effort_in_actions,
+        "converted": converted_episodes,
+        "skipped": skipped_reasons,
+    }
     (output_root / CONVERSION_MANIFEST_FILE_NAME).write_text(json.dumps(manifest, indent=2))

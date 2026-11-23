@@ -17,9 +17,22 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET  # nosec B405 local robot description, not network XML
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import yaml  # type: ignore[import-untyped]
 
 MOVABLE_JOINT_TYPES = frozenset({"revolute", "continuous", "prismatic"})
 _MESH_ELEMENTS = frozenset({"visual", "collision"})
+UR_CALIBRATION_JOINT_MAPPING = {
+    "shoulder": "shoulder_pan_joint",
+    "upper_arm": "shoulder_lift_joint",
+    "forearm": "elbow_joint",
+    "wrist_1": "wrist_1_joint",
+    "wrist_2": "wrist_2_joint",
+    "wrist_3": "wrist_3_joint",
+}
+_CALIBRATION_POSITION_KEYS = ("x", "y", "z")
+_CALIBRATION_ORIENTATION_KEYS = ("roll", "pitch", "yaw")
 
 
 @dataclass(frozen=True)
@@ -187,3 +200,57 @@ def _strip_namespaces(element: ET.Element) -> None:
     element.attrib = {_local_name(key): value for key, value in element.attrib.items()}
     for child in list(element):
         _strip_namespaces(child)
+
+
+def apply_arm_kinematics_calibration(
+    urdf_path: str | Path,
+    kinematics_calibration_path: str | Path,
+    calibration_joint_mapping: dict[str, str],
+) -> Path:
+    calibration = read_arm_kinematics_calibration(kinematics_calibration_path)
+    missing_links = [link_name for link_name in calibration_joint_mapping if link_name not in calibration]
+    if missing_links:
+        raise ValueError(f"Kinematics calibration {kinematics_calibration_path} lacks links {missing_links}.")
+    incomplete_links = [
+        link_name
+        for link_name in calibration_joint_mapping
+        if not isinstance(calibration[link_name], dict)
+        or any(
+            key not in calibration[link_name]
+            for key in (*_CALIBRATION_POSITION_KEYS, *_CALIBRATION_ORIENTATION_KEYS)
+        )
+    ]
+    if incomplete_links:
+        raise ValueError(
+            f"Kinematics calibration {kinematics_calibration_path} links {incomplete_links} "
+            f"need every one of {[*_CALIBRATION_POSITION_KEYS, *_CALIBRATION_ORIENTATION_KEYS]}."
+        )
+
+    tree = ET.parse(urdf_path)  # nosec B314
+    joint_by_name = {
+        element.attrib["name"]: element for element in tree.getroot() if _local_name(element.tag) == "joint"
+    }
+    missing_joints = [name for name in calibration_joint_mapping.values() if name not in joint_by_name]
+    if missing_joints:
+        raise ValueError(f"URDF {urdf_path} lacks the calibrated joints {missing_joints}.")
+
+    for link_name, joint_name in calibration_joint_mapping.items():
+        _update_joint_origin(joint_by_name[joint_name], calibration[link_name])
+    tree.write(urdf_path, xml_declaration=True, encoding="unicode")
+    return Path(urdf_path)
+
+
+def read_arm_kinematics_calibration(kinematics_calibration_path: str | Path) -> dict[str, Any]:
+    with open(kinematics_calibration_path) as calibration_file:
+        calibration_data = yaml.safe_load(calibration_file)
+    if not isinstance(calibration_data, dict) or not isinstance(calibration_data.get("kinematics"), dict):
+        raise ValueError(f"Kinematics calibration {kinematics_calibration_path} has no 'kinematics' mapping.")
+    return calibration_data["kinematics"]
+
+
+def _update_joint_origin(joint: ET.Element, link_calibration: dict[str, float]) -> None:
+    origin = next((child for child in joint if _local_name(child.tag) == "origin"), None)
+    if origin is None:
+        origin = ET.SubElement(joint, "origin")
+    origin.attrib["xyz"] = " ".join(repr(float(link_calibration[key])) for key in _CALIBRATION_POSITION_KEYS)
+    origin.attrib["rpy"] = " ".join(repr(float(link_calibration[key])) for key in _CALIBRATION_ORIENTATION_KEYS)

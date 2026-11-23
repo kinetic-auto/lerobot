@@ -69,6 +69,7 @@ from .hil_processor import (
 )
 from .newline_task_processor import NewLineTaskProcessorStep
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
+from .observation_history_processor import ObservationHistoryProcessorStep
 from .observation_processor import VanillaObservationProcessorStep
 from .pipeline import (
     ActionProcessorStep,
@@ -103,6 +104,7 @@ from .relative_action_processor import (
     to_sequential_actions,
     validate_relative_action_names,
 )
+from .relative_state_history_processor import RelativeStateHistoryProcessorStep
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
 from .render_messages_processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
@@ -147,6 +149,8 @@ __all__ = [
     "AbsoluteActionsProcessorStep",
     "RELATIVE_ACTION_MODES",
     "RelativeActionsProcessorStep",
+    "ObservationHistoryProcessorStep",
+    "RelativeStateHistoryProcessorStep",
     "bind_relative_anchor",
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",

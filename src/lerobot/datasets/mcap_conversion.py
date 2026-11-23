@@ -65,6 +65,7 @@ class McapConversionConfig:
     fps: int = 10
     action_lookahead_frames: int = 3
     include_effort_in_actions: bool = False
+    include_gripper: bool = True
     quality_report_path: str | None = None
     include_flagged: str = "warning"
     episode_allow_list_path: str | None = None
@@ -123,7 +124,7 @@ def convert_session(config: McapConversionConfig) -> None:
 
     selected_paths, skipped_reasons = filter_episodes_by_quality(config)
     depth_alignment = load_depth_alignment(config) if config.align_depth else None
-    state_names = packed_feature_names([*config.joint_names, config.gripper_joint_name], STATE_FIELDS)
+    state_names = packed_feature_names(build_state_joint_names(config), STATE_FIELDS)
 
     # Create the dataset
     dataset = LeRobotDataset.create(
@@ -281,7 +282,13 @@ def build_features(config: McapConversionConfig, state_names: list[str]) -> dict
 def build_action_names(state_names: list[str], config: McapConversionConfig) -> list[str]:
     if config.include_effort_in_actions:
         return state_names
-    return packed_feature_names([*config.joint_names, config.gripper_joint_name], ["position"])
+    return packed_feature_names(build_state_joint_names(config), ["position"])
+
+
+def build_state_joint_names(config: McapConversionConfig) -> list[str]:
+    if config.include_gripper:
+        return [*config.joint_names, config.gripper_joint_name]
+    return list(config.joint_names)
 
 
 def build_depth_encoder_config(config: McapConversionConfig) -> DepthEncoderConfig | None:
@@ -305,7 +312,7 @@ def convert_episode(
         return None
 
     # State observations
-    state = build_state_matrix(streams, time_grid)
+    state = build_state_matrix(streams, time_grid, config)
     if not np.isfinite(state).all():
         raise ValueError(f"{mcap_path} has non-finite joint or gripper values.")
 
@@ -374,7 +381,8 @@ def read_episode_streams(
                 image_payloads[topic].append(bytes(message.data))
 
     require_messages(mcap_path, state_topic, len(joint_rows))
-    require_messages(mcap_path, gripper_topic, len(gripper_rows))
+    if config.include_gripper:
+        require_messages(mcap_path, gripper_topic, len(gripper_rows))
     for topic, timestamps in image_timestamps.items():
         require_messages(mcap_path, topic, len(timestamps))
 
@@ -410,9 +418,10 @@ def require_messages(mcap_path: Path, topic: str, message_count: int) -> None:
 def build_time_grid(streams: EpisodeStreams, config: McapConversionConfig) -> np.ndarray | None:
     all_timestamps = [
         streams.joint_timestamps,
-        streams.gripper_timestamps,
         *[frames.timestamps for frames in streams.camera_frames.values()],
     ]
+    if config.include_gripper:
+        all_timestamps.append(streams.gripper_timestamps)
     start_time = max(timestamps[0] for timestamps in all_timestamps)
     end_time = min(timestamps[-1] for timestamps in all_timestamps)
     grid_length = int(np.floor((end_time - start_time) * config.fps)) + 1
@@ -425,15 +434,16 @@ def latest_message_indices(timestamps: np.ndarray, time_grid: np.ndarray) -> np.
     return np.clip(np.searchsorted(timestamps, time_grid, side="right") - 1, 0, None)
 
 
-def build_state_matrix(streams: EpisodeStreams, time_grid: np.ndarray) -> np.ndarray:
+def build_state_matrix(
+    streams: EpisodeStreams, time_grid: np.ndarray, config: McapConversionConfig
+) -> np.ndarray:
     joint_rows = latest_message_indices(streams.joint_timestamps, time_grid)
-    gripper_rows = latest_message_indices(streams.gripper_timestamps, time_grid)
-    positions = np.concatenate(
-        [streams.joint_positions[joint_rows], streams.gripper_positions[gripper_rows, None]], axis=1
-    )
-    efforts = np.concatenate(
-        [streams.joint_efforts[joint_rows], streams.gripper_efforts[gripper_rows, None]], axis=1
-    )
+    positions = streams.joint_positions[joint_rows]
+    efforts = streams.joint_efforts[joint_rows]
+    if config.include_gripper:
+        gripper_rows = latest_message_indices(streams.gripper_timestamps, time_grid)
+        positions = np.concatenate([positions, streams.gripper_positions[gripper_rows, None]], axis=1)
+        efforts = np.concatenate([efforts, streams.gripper_efforts[gripper_rows, None]], axis=1)
     # Block layout matches packed_feature_names: every position first, then every effort
     return np.concatenate([positions, efforts], axis=1).astype(np.float32)
 
@@ -563,6 +573,7 @@ def write_manifest(
 ) -> None:
     manifest = {
         "include_effort_in_actions": config.include_effort_in_actions,
+        "include_gripper": config.include_gripper,
         "converted": converted_episodes,
         "skipped": skipped_reasons,
     }

@@ -299,6 +299,8 @@ def replay_episode(
 ) -> EpisodeReplay:
     """Run the policy frame by frame over one episode."""
     policy.reset()
+    preprocessor.reset()
+    postprocessor.reset()
     predicted: list[np.ndarray] = []
     ground_truth: list[np.ndarray] = []
     observed_state: list[np.ndarray] = []

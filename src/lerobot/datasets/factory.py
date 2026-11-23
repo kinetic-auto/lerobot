@@ -19,12 +19,19 @@ from dataclasses import dataclass
 from pprint import pformat
 from typing import Literal, cast
 
+import numpy as np
 import torch
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.processor import RelativeActionsProcessorStep, validate_relative_action_names
+from lerobot.processor import (
+    RelativeActionsProcessorStep,
+    RelativeStateHistoryProcessorStep,
+    validate_relative_action_names,
+)
+from lerobot.processor.relative_features import build_relative_mask
+from lerobot.processor.relative_pose import find_pose_dimension_indices
 from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import (
     ACTION,
@@ -38,7 +45,11 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.io_utils import load_json
 
-from .compute_stats import compute_relative_action_stats, compute_sequential_action_stats
+from .compute_stats import (
+    compute_relative_action_chunk_stats,
+    compute_relative_state_history_stats,
+    compute_sequential_action_stats,
+)
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
@@ -322,6 +333,7 @@ def apply_relative_action_stats(
         exclude_joints=getattr(policy_cfg, "relative_exclude_joints", []),
         action_names=action_names,
         mode=getattr(policy_cfg, "relative_action_mode", "obs_t"),
+        use_se3_relative_pose=getattr(policy_cfg, "use_se3_relative_pose", False),
     )
     mask = mask_step._build_mask(dataset.meta.features[ACTION]["shape"][0])
     validate_relative_action_names(action_names, state_names, mask)
@@ -335,12 +347,11 @@ def apply_relative_action_stats(
             getattr(policy_cfg, "relative_exclude_joints", []),
         )
     else:
-        stats = compute_relative_action_stats(
-            dataset.hf_dataset,
-            dataset.meta.features,
-            chunk_size=1,
-            exclude_joints=getattr(policy_cfg, "relative_exclude_joints", []),
+        stats = compute_relative_action_chunk_stats(
+            dataset.hf_dataset, mask_step, chunk_size=getattr(policy_cfg, "chunk_size", 1)
         )
+        if mask_step.use_se3_relative_pose:
+            _leave_rotation_unscaled(stats, mask_step.find_pose_indices())
     stats["std"] = stats["std"].clip(min=1e-6)
     dataset.meta.stats[ACTION] = {
         key: torch.as_tensor(value, dtype=torch.float32) for key, value in stats.items()
@@ -348,18 +359,86 @@ def apply_relative_action_stats(
     logging.info("Applied %s relative-action normalization statistics.", mask_step.mode)
 
 
+def _leave_rotation_unscaled(stats: dict[str, np.ndarray], pose_indices: list[int]) -> None:
+    # The six rotation channels follow the three position channels of a pose.
+    rotation_indices = pose_indices[3:]
+    stats["mean"][rotation_indices] = 0.0
+    stats["std"][rotation_indices] = 1.0
+    # Bounds of -1 and 1 make the min-max and quantile normalizations leave the rotation unchanged too.
+    for lower_bound_key in ("min", "q01", "q10"):
+        if lower_bound_key in stats:
+            stats[lower_bound_key][rotation_indices] = -1.0
+    for upper_bound_key in ("max", "q90", "q99"):
+        if upper_bound_key in stats:
+            stats[upper_bound_key][rotation_indices] = 1.0
+    if "q50" in stats:
+        stats["q50"][rotation_indices] = 0.0
+
+
+def apply_relative_state_history_stats(
+    dataset: LeRobotDataset | MultiLeRobotDataset | StreamingLeRobotDataset,
+    policy_cfg: PreTrainedConfig | RewardModelConfig,
+) -> None:
+    if not isinstance(dataset, LeRobotDataset):
+        raise ValueError("Relative state history statistics require a single map-style LeRobotDataset.")
+
+    state_names = flatten_feature_names(dataset.meta.features[OBS_STATE].get("names"))
+    exclude_joints = getattr(policy_cfg, "relative_exclude_joints", [])
+    relative_state_history_step = RelativeStateHistoryProcessorStep(
+        enabled=True,
+        exclude_joints=exclude_joints,
+        state_names=state_names,
+        use_se3_relative_pose=getattr(policy_cfg, "use_se3_relative_pose", False),
+    )
+    state_history_delta_indices = getattr(policy_cfg, "state_observation_delta_indices", None)
+    if state_history_delta_indices is None:
+        raise ValueError("Relative state history statistics need a state history of at least two steps.")
+    stats = compute_relative_state_history_stats(
+        dataset.hf_dataset, relative_state_history_step, state_history_delta_indices
+    )
+
+    # Excluded channels are not made relative, so they keep the statistics of the dataset.
+    excluded_indices = [
+        index
+        for index, is_relative in enumerate(
+            build_relative_mask(state_names, exclude_joints, len(stats["mean"]))
+        )
+        if not is_relative
+    ]
+    for key, dataset_values in dataset.meta.stats[OBS_STATE].items():
+        per_channel_values = np.asarray(dataset_values, dtype=np.float64)
+        if key in stats and per_channel_values.shape == stats["mean"].shape:
+            stats[key][excluded_indices] = per_channel_values[excluded_indices]
+    pose_indices = find_pose_dimension_indices(state_names or [])
+    if relative_state_history_step.use_se3_relative_pose and pose_indices is not None:
+        _leave_rotation_unscaled(stats, pose_indices)
+
+    stats["std"] = stats["std"].clip(min=1e-6)
+    dataset.meta.stats[OBS_STATE] = {
+        key: torch.as_tensor(value, dtype=torch.float32) for key, value in stats.items()
+    }
+    logging.info("Applied relative state history normalization statistics.")
+
+
+def _apply_relative_statistics(
+    dataset: LeRobotDataset | MultiLeRobotDataset | StreamingLeRobotDataset,
+    policy_cfg: PreTrainedConfig | RewardModelConfig,
+) -> None:
+    if _uses_recomputed_relative_action_stats(policy_cfg):
+        apply_relative_action_stats(dataset, policy_cfg)
+    if getattr(policy_cfg, "use_relative_state_history", False):
+        apply_relative_state_history_stats(dataset, policy_cfg)
+
+
 def make_train_eval_datasets(cfg: TrainPipelineConfig) -> TrainEvalDatasets:
     full_dataset = make_dataset(cfg)
     policy_cfg = cfg.trainable_config
-    recompute_relative_stats = _uses_recomputed_relative_action_stats(policy_cfg)
     if not isinstance(full_dataset, LeRobotDataset):
-        if recompute_relative_stats:
-            apply_relative_action_stats(full_dataset, policy_cfg)
+        _apply_relative_statistics(full_dataset, policy_cfg)
         return TrainEvalDatasets(full_dataset, None, None, None)
 
     if cfg.dataset.eval_split == 0.0 and cfg.dataset.split_ratio is None:
-        if recompute_relative_stats:
-            apply_relative_action_stats(full_dataset, policy_cfg)
+        _apply_relative_statistics(full_dataset, policy_cfg)
         return TrainEvalDatasets(full_dataset, None, None, None)
 
     base_episodes = (
@@ -407,8 +486,7 @@ def make_train_eval_datasets(cfg: TrainPipelineConfig) -> TrainEvalDatasets:
         if test_episodes
         else None
     )
-    if recompute_relative_stats:
-        apply_relative_action_stats(train_dataset, policy_cfg)
+    _apply_relative_statistics(train_dataset, policy_cfg)
     logging.info(
         "Dataset split: %d train, %d validation, %d test episodes.",
         len(train_episodes),

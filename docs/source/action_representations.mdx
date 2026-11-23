@@ -179,6 +179,15 @@ Training validates this alignment before computing relative-action statistics. A
 statistics from the training split by default; set `recompute_relative_action_stats=false` to retain
 existing compatible statistics.
 
+### SE(3) relative poses and relative state history (kinetic_act)
+
+On an end-effector dataset whose channels are named `ee.position.*` and `ee.orientation.rot6d.*`, `use_se3_relative_pose=true` makes the pose channels relative by composition instead of subtraction: each pose `T` becomes `inv(T_t) · T`, where `T_t` is the pose at the current step, and the prediction is composed back as `T_t · T_relative`. The result is expressed in the current gripper frame, so it does not depend on the robot base frame. The other channels keep the subtraction, and channels in `relative_exclude_joints` stay as stored.
+
+`kinetic_act` can also take a history of states and images (`state_history_length`, `image_history_length`, `observation_history_stride`). With `use_relative_state_history=true`, every history step is expressed relative to the current step in the same way, as UMI does for its observations. The preprocessor order is:
+
+
+The relative actions read the absolute current state, so they run before the state history is made relative. The normalization statistics are recomputed on the relative values when training starts: the action statistics over every step of the chunk, the state statistics over every step of the history window. The six rotation channels are left unscaled.
+
 ### Combining relative actions with RTC
 
 [RTC](https://arxiv.org/abs/2506.07339) runs policy inference at high frequency and sends actions to the robot as they are predicted rather than waiting for a full chunk. `obs_t` relative actions and RTC are compatible because every chunk references the same current state. Sequential mode is not supported by RTC because RTC prefix replacement requires independent state-relative actions.

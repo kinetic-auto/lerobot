@@ -35,6 +35,7 @@ from lerobot.datasets.mcap_conversion import (
     TimedMessages,
     build_depth_encoder_config,
     build_features,
+    build_state_joint_names,
     build_state_matrix,
     build_time_grid,
     convert_episode,
@@ -327,11 +328,26 @@ def test_build_time_grid_is_none_when_shorter_than_the_lookahead(tmp_path):
     assert build_time_grid(make_streams(joint_start=0.0, camera_start=0.0, end=0.25), config) is None
 
 
-def test_build_state_matrix_packs_positions_then_efforts():
+def test_build_state_matrix_packs_positions_then_efforts(tmp_path):
     streams = make_streams(joint_start=0.0, camera_start=0.0, end=2.0)
-    state = build_state_matrix(streams, np.array([1.0]))
+    state = build_state_matrix(streams, np.array([1.0]), make_conversion_config(tmp_path))
     # joint 0, joint 1, gripper opening, then the same order for effort
     np.testing.assert_allclose(state[0], [1.0, 101.0, 1001.0, -1.0, -101.0, -1001.0], atol=0.06)
+
+
+def test_build_state_matrix_leaves_the_gripper_out_when_excluded(tmp_path):
+    streams = make_streams(joint_start=0.0, camera_start=0.0, end=2.0)
+    config = make_conversion_config(tmp_path, include_gripper=False)
+    state = build_state_matrix(streams, np.array([1.0]), config)
+    np.testing.assert_allclose(state[0], [1.0, 101.0, -1.0, -101.0], atol=0.06)
+
+
+def test_build_time_grid_ignores_the_gripper_stream_when_excluded(tmp_path):
+    config = make_conversion_config(tmp_path, fps=10, action_lookahead_frames=3, include_gripper=False)
+    streams = make_streams(joint_start=0.0, camera_start=1.0, end=5.0)
+    streams.gripper_timestamps = np.array([])
+    time_grid = build_time_grid(streams, config)
+    assert time_grid[0] == pytest.approx(1.0)
 
 
 def test_build_features_flags_depth_and_sizes_cameras(tmp_path):
@@ -347,7 +363,7 @@ def test_build_features_flags_depth_and_sizes_cameras(tmp_path):
 
 
 def state_names_for(config: McapConversionConfig) -> list[str]:
-    return packed_feature_names([*config.joint_names, config.gripper_joint_name], STATE_FIELDS)
+    return packed_feature_names(build_state_joint_names(config), STATE_FIELDS)
 
 
 def test_build_features_gives_a_position_only_action_by_default(tmp_path):
@@ -358,6 +374,16 @@ def test_build_features_gives_a_position_only_action_by_default(tmp_path):
     assert features["action"]["names"] == state_names[:position_count]
     assert features["action"]["shape"] == (position_count,)
     assert all(name.endswith(".position") for name in features["action"]["names"])
+
+
+def test_build_features_leaves_the_gripper_out_when_excluded(tmp_path):
+    config = make_conversion_config(tmp_path, include_gripper=False)
+    state_names = state_names_for(config)
+    features = build_features(config, state_names)
+    joint_count = len(config.joint_names)
+    assert features["observation.state"]["shape"] == (2 * joint_count,)
+    assert features["action"]["shape"] == (joint_count,)
+    assert not any(config.gripper_joint_name in name for name in state_names)
 
 
 def test_build_features_keeps_efforts_in_the_action_when_asked(tmp_path):
@@ -394,7 +420,7 @@ def test_convert_episode_writes_the_future_state_as_the_action(
     frame_count = convert_episode(dataset, tmp_path / "episode.mcap", None, config)
     dataset.finalize()
 
-    state = build_state_matrix(streams, build_time_grid(streams, config))
+    state = build_state_matrix(streams, build_time_grid(streams, config), config)
     action_dimension = state.shape[1] if include_effort_in_actions else 3
     expected_actions = state[3 : 3 + frame_count, :action_dimension]
     reloaded = LeRobotDataset(config.repo_id, root=config.output_root)
@@ -408,6 +434,7 @@ def test_write_manifest_records_whether_actions_include_effort(tmp_path):
     write_manifest(tmp_path, [], {}, config)
     manifest = json.loads((tmp_path / CONVERSION_MANIFEST_FILE_NAME).read_text())
     assert manifest["include_effort_in_actions"] is False
+    assert manifest["include_gripper"] is True
 
 
 def test_check_features_rejects_an_action_that_is_not_the_leading_state_channels(tmp_path):

@@ -692,8 +692,26 @@ def train(cfg: TrainPipelineConfig):
                 "exclude_joints": getattr(active_cfg, "relative_exclude_joints", []),
                 "action_names": getattr(active_cfg, "action_feature_names", None),
                 "mode": getattr(active_cfg, "relative_action_mode", "obs_t"),
+                "use_se3_relative_pose": getattr(active_cfg, "use_se3_relative_pose", False),
+                "current_state_index": -1 if getattr(active_cfg, "state_history_length", 1) > 1 else 0,
             }
             postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
+        if (
+            getattr(active_cfg, "state_history_length", 1) > 1
+            or getattr(active_cfg, "image_history_length", 1) > 1
+        ):
+            preprocessor_overrides["observation_history_processor"] = {
+                "state_history_length": getattr(active_cfg, "state_history_length", 1),
+                "image_history_length": getattr(active_cfg, "image_history_length", 1),
+                "observation_history_stride": getattr(active_cfg, "observation_history_stride", 1),
+            }
+        if getattr(active_cfg, "use_relative_state_history", False):
+            preprocessor_overrides["relative_state_history_processor"] = {
+                "enabled": True,
+                "exclude_joints": getattr(active_cfg, "relative_exclude_joints", []),
+                "state_names": getattr(active_cfg, "state_feature_names", None),
+                "use_se3_relative_pose": getattr(active_cfg, "use_se3_relative_pose", False),
+            }
         processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
         processor_kwargs["postprocessor_overrides"] = postprocessor_overrides
 

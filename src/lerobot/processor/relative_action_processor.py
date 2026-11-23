@@ -25,6 +25,12 @@ from lerobot.utils.constants import OBS_STATE
 
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
 from .pipeline import PolicyProcessorPipeline, ProcessorStep, ProcessorStepRegistry
+from .relative_features import (
+    build_relative_mask,
+    to_se3_absolute_features,
+    to_se3_relative_features,
+)
+from .relative_pose import find_pose_dimension_indices
 
 if TYPE_CHECKING:  # a runtime import would be circular: ``pretrained`` imports from this package
     from lerobot.policies.pretrained import PreTrainedPolicy
@@ -160,35 +166,36 @@ class RelativeActionsProcessorStep(ProcessorStep):
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
     mode: str = "obs_t"
+    use_se3_relative_pose: bool = False
+    current_state_index: int = 0
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
     _count_queued_actions: Callable[[], int] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.mode not in RELATIVE_ACTION_MODES:
             raise ValueError(f"Unknown relative action mode {self.mode!r}; expected {RELATIVE_ACTION_MODES}.")
+        if self.use_se3_relative_pose and self.mode != "obs_t":
+            raise ValueError(f"SE(3) relative poses need relative action mode 'obs_t', got {self.mode!r}.")
+        if self.use_se3_relative_pose and self.action_names is not None:
+            self.find_pose_indices()
+
+    def find_pose_indices(self) -> list[int]:
+        pose_indices = find_pose_dimension_indices(self.action_names or [])
+        if pose_indices is None:
+            raise ValueError(
+                f"SE(3) relative poses need pose channels in the action names {self.action_names}."
+            )
+        return pose_indices
 
     def _build_mask(self, action_dim: int) -> list[bool]:
-        if not self.exclude_joints or self.action_names is None:
-            return [True] * action_dim
-
-        exclude_tokens = [str(name).lower() for name in self.exclude_joints if name]
-        if not exclude_tokens:
-            return [True] * action_dim
-
-        mask = []
-        for name in self.action_names[:action_dim]:
-            action_name = str(name).lower()
-            is_excluded = any(token == action_name or token in action_name for token in exclude_tokens)
-            mask.append(not is_excluded)
-
-        if len(mask) < action_dim:
-            mask.extend([True] * (action_dim - len(mask)))
-
-        return mask
+        return build_relative_mask(self.action_names, self.exclude_joints, action_dim)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
+
+        if state is not None and state.ndim == 3:
+            state = state[:, self.current_state_index]
 
         # Cache state for the paired AbsoluteActionsProcessorStep -- but hold it for as long
         # as the policy is still serving the chunk that was generated against it. A fresh
@@ -207,6 +214,10 @@ class RelativeActionsProcessorStep(ProcessorStep):
         mask = self._build_mask(action.shape[-1])
         if self.mode == "sequential":
             new_transition[TransitionKey.ACTION] = to_sequential_actions(action, state, mask)
+        elif self.use_se3_relative_pose:
+            new_transition[TransitionKey.ACTION] = to_se3_relative_features(
+                action, state, mask, self.find_pose_indices()
+            )
         else:
             new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
         return new_transition
@@ -231,6 +242,8 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
             "mode": self.mode,
+            "use_se3_relative_pose": self.use_se3_relative_pose,
+            "current_state_index": self.current_state_index,
         }
 
     def transform_features(
@@ -286,6 +299,10 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
                 absolute_action = from_sequential_actions(action, cached_state, mask)
             else:
                 absolute_action = self._integrate_streamed_action(action, cached_state, mask)
+        elif self.relative_step.use_se3_relative_pose:
+            absolute_action = to_se3_absolute_features(
+                action, cached_state, mask, self.relative_step.find_pose_indices()
+            )
         else:
             absolute_action = to_absolute_actions(action, cached_state, mask)
         new_transition[TransitionKey.ACTION] = absolute_action

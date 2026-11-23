@@ -43,6 +43,12 @@ class KineticACTConfig(ACTConfig):
         use_attention_mask_projection: Whether the object attention loss projects the attention weights of all encoder tokens to the mask grid.
         use_camera_identity_embedding: Whether to add a learned embedding per camera.
         valid_depth_range_meters: Depth range in meters. Values outside it are set to 0. None leaves depth unchanged.
+        state_history_length: State steps given to the model, current step included.
+        image_history_length: Image steps per camera given to the model, current step included.
+        observation_history_stride: Frames between consecutive history steps.
+        use_relative_state_history: Whether the state history is expressed relative to the current step.
+        use_se3_relative_pose: Whether pose channels are made relative by SE(3) composition.
+        state_feature_names: Channel names of the dataset state.
     """
 
     object_distance_label_key: str | None = None
@@ -58,6 +64,48 @@ class KineticACTConfig(ACTConfig):
     use_attention_mask_projection: bool = False
     use_camera_identity_embedding: bool = False
     valid_depth_range_meters: tuple[float, float] | None = None
+    state_history_length: int = 1
+    image_history_length: int = 1
+    observation_history_stride: int = 1
+    use_relative_state_history: bool = False
+    use_se3_relative_pose: bool = False
+    state_feature_names: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        history_settings = {
+            "state_history_length": self.state_history_length,
+            "image_history_length": self.image_history_length,
+            "observation_history_stride": self.observation_history_stride,
+        }
+        for setting_name, value in history_settings.items():
+            if value < 1:
+                raise ValueError(f"`{setting_name}` must be at least 1. Got {value}.")
+        if self.use_relative_state_history and self.state_history_length < 2:
+            raise ValueError("`use_relative_state_history` needs `state_history_length` of at least 2.")
+        if self.use_se3_relative_pose and not (self.use_relative_actions or self.use_relative_state_history):
+            raise ValueError(
+                "`use_se3_relative_pose` needs `use_relative_actions` or `use_relative_state_history`."
+            )
+        if self.use_se3_relative_pose and self.relative_action_mode != "obs_t":
+            raise ValueError(
+                f"`use_se3_relative_pose` needs `relative_action_mode` 'obs_t'. Got {self.relative_action_mode!r}."
+            )
+
+    @property
+    def state_observation_delta_indices(self) -> list[int] | None:
+        return self._history_delta_indices(self.state_history_length)
+
+    @property
+    def image_observation_delta_indices(self) -> list[int] | None:
+        return self._history_delta_indices(self.image_history_length)
+
+    def _history_delta_indices(self, history_length: int) -> list[int] | None:
+        if history_length == 1:
+            return None
+        return list(
+            range(-(history_length - 1) * self.observation_history_stride, 1, self.observation_history_stride)
+        )
 
     @property
     def auxiliary_label_keys(self) -> list[str]:
@@ -88,15 +136,25 @@ class KineticACTConfig(ACTConfig):
                 f"Available features: {sorted(dataset_features)}."
             )
 
-        # Auxillary labels are used for training only and are not inputs to the model.
+        # Auxiliary labels are used for training only and are not inputs to the model.
         for label_key in self.auxiliary_label_keys:
             self.input_features.pop(label_key, None)
+
+        state_feature = dataset_features.get(OBS_STATE)
+        state_names = state_feature.get("names") if isinstance(state_feature, dict) else None
+        if state_names is not None:
+            from lerobot.datasets.utils import flatten_feature_names
+
+            self.state_feature_names = flatten_feature_names(state_names)
 
     def validate_features(self) -> None:
         super().validate_features()
 
         # Validate the auxiliary label keys.
         self._validate_label_keys()
+
+        if self.use_relative_state_history and OBS_STATE not in self.input_features:
+            raise ValueError("`use_relative_state_history` needs an observation.state input feature.")
 
         if self.stage_label_key is not None and self.stage_class_count < 2:
             raise ValueError(f"`stage_class_count` must be at least 2. Got {self.stage_class_count}.")

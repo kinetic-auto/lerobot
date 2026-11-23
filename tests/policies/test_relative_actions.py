@@ -17,6 +17,7 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.datasets.compute_stats import get_feature_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.model.cartesian_quantities import FramePoseRot6D, FrameWrench
 from lerobot.processor import (
     DataProcessorPipeline,
     TransitionKey,
@@ -34,6 +35,7 @@ from lerobot.processor.relative_action_processor import (
     to_sequential_actions,
     validate_relative_action_names,
 )
+from lerobot.processor.relative_pose import convert_absolute_poses_to_relative_poses
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 CHUNK_SIZE = 10
@@ -440,7 +442,14 @@ def test_cached_anchor_and_queue_binding_not_in_config():
     step(create_transition(observation={OBS_STATE: torch.tensor([[1.0, 2.0, 3.0, 4.0]])}))
     step.bind_action_queue(lambda: 0)
     assert step.get_cached_state() is not None
-    assert set(step.get_config()) == {"enabled", "exclude_joints", "action_names", "mode"}
+    assert set(step.get_config()) == {
+        "enabled",
+        "exclude_joints",
+        "action_names",
+        "mode",
+        "use_se3_relative_pose",
+        "current_state_index",
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -528,3 +537,84 @@ def test_bare_loop_holds_the_anchor_across_a_chunk():
         relative_step(create_transition(observation={OBS_STATE: anchor + tick}))
         action = absolute_step(create_transition(action=select_action()))[TransitionKey.ACTION]
         torch.testing.assert_close(action, anchor + offset)
+
+
+# --------------------------------------------------------------------------------------
+# SE(3) relative poses
+# --------------------------------------------------------------------------------------
+# Cartesian datasets: the state is pose, gripper and wrench (16-D), the action pose and gripper
+# (10-D). Pose dims are expressed in the current pose frame, the gripper is a difference.
+
+_POSE_NAMES = FramePoseRot6D.feature_names()
+_SE3_ACTION_NAMES = [*_POSE_NAMES, "gripper.position.x"]
+_SE3_STATE_NAMES = [*_SE3_ACTION_NAMES, *FrameWrench.feature_names()]
+
+
+def _random_pose_vectors(batch_shape: tuple[int, ...]) -> torch.Tensor:
+    rotations = torch.linalg.qr(torch.randn(*batch_shape, 3, 3, dtype=torch.float64)).Q
+    rotations = rotations * torch.linalg.det(rotations).sign()[..., None, None]
+    translations = torch.randn(*batch_shape, 3, dtype=torch.float64)
+    return torch.cat([translations, rotations[..., :, 0], rotations[..., :, 1]], dim=-1)
+
+
+def _se3_state_and_actions(batch_size: int = 2) -> tuple[torch.Tensor, torch.Tensor]:
+    state = torch.cat(
+        [
+            _random_pose_vectors((batch_size,)),
+            torch.rand(batch_size, 1, dtype=torch.float64),
+            torch.randn(batch_size, 6, dtype=torch.float64),
+        ],
+        dim=-1,
+    )
+    actions = torch.cat(
+        [
+            _random_pose_vectors((batch_size, CHUNK_SIZE)),
+            torch.rand(batch_size, CHUNK_SIZE, 1, dtype=torch.float64),
+        ],
+        dim=-1,
+    )
+    return state, actions
+
+
+def test_se3_relative_and_absolute_action_steps_restore_the_original_actions():
+    relative_step = RelativeActionsProcessorStep(
+        enabled=True, action_names=_SE3_ACTION_NAMES, use_se3_relative_pose=True
+    )
+    absolute_step = AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)
+    state, actions = _se3_state_and_actions()
+
+    relative = relative_step(create_transition(observation={OBS_STATE: state}, action=actions))
+    relative_actions = relative[TransitionKey.ACTION]
+    restored = absolute_step(create_transition(action=relative_actions))[TransitionKey.ACTION]
+
+    torch.testing.assert_close(restored, actions)
+    expected_poses = convert_absolute_poses_to_relative_poses(actions[..., :9], state[:, None, :9])
+    torch.testing.assert_close(relative_actions[..., :9], expected_poses)
+    torch.testing.assert_close(relative_actions[..., 9], actions[..., 9] - state[:, None, 9])
+
+
+def test_se3_relative_actions_use_the_latest_state_of_a_state_history_as_reference():
+    relative_step = RelativeActionsProcessorStep(
+        enabled=True, action_names=_SE3_ACTION_NAMES, use_se3_relative_pose=True, current_state_index=-1
+    )
+    current_state, actions = _se3_state_and_actions()
+    previous_state, _ = _se3_state_and_actions()
+    state_history = torch.stack([previous_state, current_state], dim=1)
+
+    from_history = relative_step(create_transition(observation={OBS_STATE: state_history}, action=actions))
+    from_current = relative_step(create_transition(observation={OBS_STATE: current_state}, action=actions))
+
+    torch.testing.assert_close(from_history[TransitionKey.ACTION], from_current[TransitionKey.ACTION])
+    torch.testing.assert_close(relative_step.get_cached_state(), current_state)
+
+
+def test_se3_relative_actions_raises_on_sequential_mode():
+    with pytest.raises(ValueError, match="obs_t"):
+        RelativeActionsProcessorStep(
+            action_names=_SE3_ACTION_NAMES, use_se3_relative_pose=True, mode="sequential"
+        )
+
+
+def test_se3_relative_actions_raises_on_action_names_without_a_pose():
+    with pytest.raises(ValueError, match="pose channels"):
+        RelativeActionsProcessorStep(action_names=["j0.pos", "j1.pos"], use_se3_relative_pose=True)

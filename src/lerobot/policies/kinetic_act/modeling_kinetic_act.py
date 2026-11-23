@@ -31,6 +31,8 @@ from .configuration_kinetic_act import MISSING_MASK_CELL_VALUE, KineticACTConfig
 LAST_DECODER_CROSS_ATTENTION_WEIGHTS_KEY_SUFFIX = ".last_decoder_cross_attention_weights"
 ATTENTION_MASK_LOGITS_KEY_SUFFIX = ".attention_mask_logits"
 OBJECT_ATTENTION_LOSS_EPSILON = 1e-6
+STATE_DIMENSIONS_WITHOUT_HISTORY = 2
+IMAGE_DIMENSIONS_WITHOUT_HISTORY = 4
 
 
 class KineticACTPolicy(ACTPolicy):
@@ -367,6 +369,15 @@ class KineticACT(ACT):
         if config.use_camera_identity_embedding:
             self.encoder_camera_identity_embedding = nn.Embedding(len(self.camera_keys), config.dim_model)
 
+        # One encoder token per state history step: [latent, state steps oldest to current, environment state].
+        if config.robot_state_feature and config.state_history_length > 1:
+            one_dimensional_token_count = (
+                1 + config.state_history_length + (1 if config.env_state_feature else 0)
+            )
+            self.encoder_1d_feature_pos_embed = nn.Embedding(one_dimensional_token_count, config.dim_model)
+        if config.image_history_length > 1:
+            self.encoder_history_step_embedding = nn.Embedding(config.image_history_length, config.dim_model)
+
         # Add a hook to record cross-attention weights during forward pass for object-attention loss.
         self.last_decoder_cross_attention_weights: Tensor | None = None
         if config.object_attention_loss_weight > 0:
@@ -425,7 +436,7 @@ class KineticACT(ACT):
         """
         encoder_token_count = 1
         if self.config.robot_state_feature:
-            encoder_token_count += 1
+            encoder_token_count += self.config.state_history_length
         if self.config.env_state_feature:
             encoder_token_count += 1
 
@@ -435,7 +446,7 @@ class KineticACT(ACT):
             with torch.no_grad():
                 feature_map = self.backbone(torch.zeros(1, 3, *feature.shape[-2:]))["feature_map"]
             token_count_per_camera[camera_key] = feature_map.shape[-2] * feature_map.shape[-1]
-        encoder_token_count += sum(token_count_per_camera.values())
+        encoder_token_count += self.config.image_history_length * sum(token_count_per_camera.values())
 
         return nn.ModuleList(
             nn.Linear(self.config.chunk_size * encoder_token_count, token_count_per_camera[camera_key])
@@ -471,7 +482,9 @@ class KineticACT(ACT):
             self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
         )  # (B, 1, D)
         if self.config.robot_state_feature:
-            robot_state_embedding = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+            # The VAE encoder sees the current step of a state history.
+            current_state = batch[OBS_STATE][:, -1] if batch[OBS_STATE].ndim == 3 else batch[OBS_STATE]
+            robot_state_embedding = self.vae_encoder_robot_state_input_proj(current_state)
             robot_state_embedding = robot_state_embedding.unsqueeze(1)  # (B, 1, D)
         action_embedding = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -525,9 +538,15 @@ class KineticACT(ACT):
         encoder_tokens = [self.encoder_latent_input_proj(latent_sample)]
         encoder_position_embedding = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
 
-        # Add the robot state.
+        # Add the robot state, one token per history step.
         if self.config.robot_state_feature:
-            encoder_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            state_history = _ensure_history_axis(
+                batch[OBS_STATE],
+                STATE_DIMENSIONS_WITHOUT_HISTORY,
+                self.config.state_history_length,
+                OBS_STATE,
+            )
+            encoder_tokens.extend(self.encoder_robot_state_input_proj(state_history).unbind(dim=1))
 
         # Add the environment state.
         if self.config.env_state_feature:
@@ -540,6 +559,16 @@ class KineticACT(ACT):
             for camera_index, (camera_key, image) in enumerate(
                 zip(self.camera_keys, batch[OBS_IMAGES], strict=True)
             ):
+                # Run every history step of the camera through the backbone as one batch.
+                image_history = _ensure_history_axis(
+                    image,
+                    IMAGE_DIMENSIONS_WITHOUT_HISTORY,
+                    self.config.image_history_length,
+                    camera_key,
+                )
+                history_length = image_history.shape[1]
+                image = image_history.flatten(0, 1)
+
                 # Expand single-channel cameras to three channels.
                 if camera_key in self.single_channel_camera_keys:
                     image = image.expand(-1, 3, -1, -1)
@@ -554,20 +583,32 @@ class KineticACT(ACT):
                     camera_identity = self.encoder_camera_identity_embedding.weight[camera_index]
                     camera_position_embedding = camera_position_embedding + camera_identity.view(1, -1, 1, 1)
 
+                # Add the history step embedding, one per step from oldest to current.
+                camera_position_embedding = camera_position_embedding.expand(history_length, -1, -1, -1)
+                if self.config.image_history_length > 1:
+                    history_step_embedding = self.encoder_history_step_embedding.weight.view(
+                        history_length, -1, 1, 1
+                    )
+                    camera_position_embedding = camera_position_embedding + history_step_embedding
+
                 # Project the camera features.
                 camera_features = self.encoder_img_feat_input_proj(camera_features)
 
+                # The object mask supervises the tokens of the current step, the last block of the camera.
                 grid_height, grid_width = camera_features.shape[-2:]
-                first_token_index = len(encoder_tokens)
+                grid_token_count = grid_height * grid_width
+                current_step_first_token_index = len(encoder_tokens) + (history_length - 1) * grid_token_count
                 token_slice_per_camera[camera_key] = slice(
-                    first_token_index, first_token_index + grid_height * grid_width
+                    current_step_first_token_index, current_step_first_token_index + grid_token_count
                 )
                 token_grid_shape_per_camera[camera_key] = (grid_height, grid_width)
 
                 # Rearrange features to (sequence, batch, dim).
-                camera_features = einops.rearrange(camera_features, "b c h w -> (h w) b c")
+                camera_features = einops.rearrange(
+                    camera_features, "(b t) c h w -> (t h w) b c", t=history_length
+                )
                 camera_position_embedding = einops.rearrange(
-                    camera_position_embedding, "b c h w -> (h w) b c"
+                    camera_position_embedding, "t c h w -> (t h w) 1 c"
                 )
 
                 # Add the camera features
@@ -679,3 +720,13 @@ class KineticACT(ACT):
                 )
 
         return auxiliary_outputs
+
+
+def _ensure_history_axis(
+    value: Tensor, dimensions_without_history: int, history_length: int, key: str
+) -> Tensor:
+    if value.ndim == dimensions_without_history:
+        value = value.unsqueeze(1)
+    if value.shape[1] != history_length:
+        raise ValueError(f"{key} has {value.shape[1]} history steps but the policy expects {history_length}.")
+    return value

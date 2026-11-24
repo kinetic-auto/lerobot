@@ -27,6 +27,7 @@ from .pipeline import ObservationProcessorStep, ProcessorStepRegistry
 # Dimensions of one batched observation (without history).
 STATE_DIMENSIONS_WITHOUT_HISTORY = 2
 IMAGE_DIMENSIONS_WITHOUT_HISTORY = 4
+PADDING_MASK_KEY_SUFFIX = "_is_pad"
 
 
 @ProcessorStepRegistry.register("observation_history_processor")
@@ -46,11 +47,19 @@ class ObservationHistoryProcessorStep(ObservationProcessorStep):
         stacked_observation = dict(observation)
         for observation_key, observation_value in observation.items():
             history_length = self._get_history_length(observation_key)
-            if history_length > 1 and isinstance(observation_value, Tensor) and not self._has_history(observation_key, observation_value):
-                stacked_observation[observation_key] = self._stack_history(observation_key, observation_value, history_length)
+            if (
+                history_length > 1
+                and isinstance(observation_value, Tensor)
+                and not self._has_history(observation_key, observation_value)
+            ):
+                stacked_observation[observation_key] = self._stack_history(
+                    observation_key, observation_value, history_length
+                )
         return stacked_observation
 
     def _get_history_length(self, key: str) -> int:
+        if key.endswith(PADDING_MASK_KEY_SUFFIX):
+            return 1
         if key == OBS_STATE:
             return self.state_history_length
         if key.startswith(OBS_IMAGE):
@@ -58,7 +67,9 @@ class ObservationHistoryProcessorStep(ObservationProcessorStep):
         return 1
 
     def _has_history(self, key: str, value: Tensor) -> bool:
-        return value.ndim > (STATE_DIMENSIONS_WITHOUT_HISTORY if key == OBS_STATE else IMAGE_DIMENSIONS_WITHOUT_HISTORY)
+        return value.ndim > (
+            STATE_DIMENSIONS_WITHOUT_HISTORY if key == OBS_STATE else IMAGE_DIMENSIONS_WITHOUT_HISTORY
+        )
 
     def _stack_history(self, key: str, value: Tensor, history_length: int) -> Tensor:
         buffer_length = (history_length - 1) * self.observation_history_stride + 1

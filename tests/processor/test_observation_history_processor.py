@@ -67,6 +67,21 @@ def test_observations_with_a_time_axis_are_returned_unchanged():
     assert observation[IMAGE_KEY] is image_history
 
 
+def test_padding_masks_are_returned_unchanged_across_batch_sizes():
+    step = ObservationHistoryProcessorStep(state_history_length=2, image_history_length=2)
+    padding_mask_key = f"{IMAGE_KEY}_is_pad"
+
+    for batch_size in (4, 1):
+        padding_mask = torch.zeros(batch_size, 2, dtype=torch.bool)
+        observation = {
+            OBS_STATE: torch.zeros(batch_size, 2, 3),
+            IMAGE_KEY: torch.zeros(batch_size, 2, 3, 4, 4),
+            padding_mask_key: padding_mask,
+        }
+        processed = step(create_transition(observation=observation))[TransitionKey.OBSERVATION]
+        assert processed[padding_mask_key] is padding_mask
+
+
 def test_step_is_rebuilt_from_its_registry_name_and_config():
     step = ObservationHistoryProcessorStep(
         state_history_length=2, image_history_length=3, observation_history_stride=4

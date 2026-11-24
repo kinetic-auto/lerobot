@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from lerobot.common.train_monitor import TrainMonitor, build_monitor_message, metadata_rows
+from lerobot.common.train_monitor import (
+    TrainMonitor,
+    build_kv_message,
+    build_monitor_message,
+    metadata_rows,
+)
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.act.configuration_act import ACTConfig
@@ -37,16 +41,41 @@ def _config(tmp_path: Path) -> TrainPipelineConfig:
     return cfg
 
 
-def test_thread_message_omits_the_parent_title():
-    parent_text, parent_blocks = build_monitor_message("Training custom-job", [("job_name", "custom-job")])
-    reply_text, reply_blocks = build_monitor_message(None, [("step", "1000"), ("loss", "0.2500")])
+def _link_urls(blocks: object) -> list[str]:
+    urls: list[str] = []
 
-    assert parent_text.startswith("Training custom-job")
-    assert "job_name: custom-job" in parent_text
-    assert parent_blocks[0]["text"]["text"] == "*Training custom-job*"
-    assert reply_text == "step: 1000\nloss: 0.2500"
-    assert "Training" not in reply_text
-    assert all("Training" not in str(block) for block in reply_blocks)
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "link" and isinstance(node.get("url"), str):
+                urls.append(node["url"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(blocks)
+    return urls
+
+
+def test_kv_message_uses_the_section_icon():
+    text, blocks = build_kv_message("model", {"policy": "act"})
+
+    assert text == ":brain: Model\npolicy: act"
+    assert blocks[0]["text"]["text"] == "*:brain: Model*"
+    assert blocks[1]["type"] == "table"
+
+
+def test_monitor_line_is_status_progress_and_elapsed():
+    text, blocks = build_monitor_message("running", "10%", "2m 4s")
+
+    assert text == ":bar_chart: running  |  10%  |  2m 4s"
+    assert blocks == [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*:bar_chart: running  |  10%  |  2m 4s*"},
+        }
+    ]
 
 
 def test_metadata_rows_include_run_fields(tmp_path, monkeypatch):
@@ -54,11 +83,13 @@ def test_metadata_rows_include_run_fields(tmp_path, monkeypatch):
     monkeypatch.setattr("lerobot.common.train_monitor.host_name", lambda: "train-box")
     rows = dict(metadata_rows(_config(tmp_path)))
 
-    assert rows["job_name"] == "custom-job"
     assert rows["dataset"] == "user/dataset"
     assert rows["policy"] == "act"
     assert rows["log_freq"] == "200"
     assert rows["save_freq"] == "10000"
+    assert rows["output_dir"] == "model_zoo/dataset/custom-job"
+    assert rows["tensorboard"] == "model_zoo/dataset/custom-job/tensorboard"
+    assert rows["s3"] == "s3://lerobot-train-outputs/model_zoo/dataset/custom-job/"
     assert rows["hostname"] == "train-box"
     assert rows["git_sha"] == "abc1234"
     assert "chunk_size" in rows
@@ -70,65 +101,108 @@ def test_parent_message_posts_metadata_and_saves_thread(tmp_path, monkeypatch):
     monkeypatch.setattr("lerobot.common.train_monitor.host_name", lambda: "train-box")
     cfg = _config(tmp_path)
     client = MagicMock()
-    client.post_message.return_value = {"ts": "1710000000.000100", "channel": "C1"}
+    client.chat_postMessage.side_effect = [
+        {"ts": "1710000000.000100", "channel": "C1"},
+        {"ts": "1710000000.000110", "channel": "C1"},
+        {"ts": "1710000000.000120", "channel": "C1"},
+        {"ts": "1710000000.000130", "channel": "C1"},
+        {"ts": "1710000000.000200", "channel": "C1"},
+    ]
     monitor = TrainMonitor(cfg, client=client, writer=MagicMock())
 
     monitor.start(0)
 
-    kwargs = client.post_message.call_args.kwargs
-    assert kwargs["channel"] == "C1"
-    assert "thread_ts" not in kwargs
-    assert kwargs["text"].startswith("Training custom-job")
-    assert "job_name: custom-job" in kwargs["text"]
-    assert "dataset: user/dataset" in kwargs["text"]
-    assert kwargs["blocks"][0]["text"]["text"] == "*Training custom-job*"
+    posts = client.chat_postMessage.call_args_list
+    parent = posts[0].kwargs
+    assert parent["channel"] == "C1"
+    assert "thread_ts" not in parent
+    assert parent["text"] == ":robot_face: Training custom-job"
+    assert parent["blocks"] == [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*:robot_face: Training custom-job*"}}
+    ]
+    assert sum(block["type"] == "table" for block in parent["blocks"]) == 0
+    headings = [post.kwargs["blocks"][0]["text"]["text"] for post in posts[1:4]]
+    assert headings == [
+        "*:brain: Model*",
+        "*:file_folder: Data*",
+        "*:gear: Training*",
+    ]
+    for post in posts[1:4]:
+        assert post.kwargs["thread_ts"] == "1710000000.000100"
+        assert post.kwargs["blocks"][1]["type"] == "table"
+    training = posts[3].kwargs
+    assert "dataset: user/dataset" in posts[2].kwargs["text"]
+    s3_links = [url for url in _link_urls(training["blocks"]) if "s3.console.aws.amazon.com" in url]
+    assert s3_links == [
+        "https://s3.console.aws.amazon.com/s3/buckets/lerobot-train-outputs"
+        "?region=us-west-1&prefix=model_zoo/dataset/custom-job/"
+    ]
+    monitor_reply = posts[4].kwargs
+    assert monitor_reply["thread_ts"] == "1710000000.000100"
+    assert monitor_reply["text"].startswith(":bar_chart: running  |  0%  |  ")
+    assert [block["type"] for block in monitor_reply["blocks"]] == ["section"]
+    assert "loss" not in monitor_reply["text"]
     saved = load_json(cfg.output_dir / "monitor" / "slack_thread.json")
-    assert saved == {"thread_ts": "1710000000.000100", "channel": "C1"}
+    assert saved == {
+        "thread_ts": "1710000000.000100",
+        "channel": "C1",
+        "progress_ts": "1710000000.000200",
+    }
 
 
-def test_resume_replies_in_the_existing_thread(tmp_path):
+def test_resume_updates_the_existing_reply(tmp_path):
     cfg = _config(tmp_path)
     cfg.resume = True
     write_json(
-        {"thread_ts": "1710000000.000100", "channel": "C1"},
+        {
+            "thread_ts": "1710000000.000100",
+            "channel": "C1",
+            "progress_ts": "1710000000.000200",
+        },
         cfg.output_dir / "monitor" / "slack_thread.json",
     )
     client = MagicMock()
-    client.post_message.return_value = {"ts": "1710000000.000200", "channel": "C1"}
+    client.chat_update.return_value = {"ok": True, "ts": "1710000000.000200", "channel": "C1"}
     monitor = TrainMonitor(cfg, client=client, writer=MagicMock())
 
     monitor.start(1000)
 
-    assert client.post_message.call_count == 1
-    kwargs = client.post_message.call_args.kwargs
-    assert kwargs["thread_ts"] == "1710000000.000100"
+    client.chat_postMessage.assert_not_called()
+    kwargs = client.chat_update.call_args.kwargs
+    assert kwargs["ts"] == "1710000000.000200"
+    assert kwargs["channel"] == "C1"
+    assert "thread_ts" not in kwargs
     assert "Training" not in kwargs["text"]
-    assert "status: resumed" in kwargs["text"]
-    assert "step: 1000" in kwargs["text"]
-    assert "output_dir:" in kwargs["text"]
+    assert kwargs["text"].startswith(":bar_chart: resumed  |  1%  |  ")
+    assert [block["type"] for block in kwargs["blocks"]] == ["section"]
     saved = load_json(cfg.output_dir / "monitor" / "slack_thread.json")
     assert saved["thread_ts"] == "1710000000.000100"
+    assert saved["progress_ts"] == "1710000000.000200"
 
 
 def test_finish_reply_has_duration_and_losses_without_a_title(tmp_path):
     cfg = _config(tmp_path)
     client = MagicMock()
+    client.chat_update.return_value = {"ok": True}
     monitor = TrainMonitor(cfg, client=client, writer=MagicMock())
     monitor.thread_ts = "1710000000.000100"
+    monitor.progress_ts = "1710000000.000200"
     monitor.channel = "C1"
     monitor.latest_train_loss = 0.25
     monitor.latest_test_loss = 0.4
 
     monitor.finish(1000)
 
-    kwargs = client.post_message.call_args.kwargs
-    assert kwargs["thread_ts"] == "1710000000.000100"
+    client.chat_postMessage.assert_not_called()
+    kwargs = client.chat_update.call_args.kwargs
+    assert kwargs["ts"] == "1710000000.000200"
+    assert "thread_ts" not in kwargs
     assert "Training" not in kwargs["text"]
-    assert "step: 1000" in kwargs["text"]
-    assert "duration:" in kwargs["text"]
-    assert "output_dir:" in kwargs["text"]
-    assert "train_loss: 0.2500" in kwargs["text"]
-    assert "test_loss: 0.4000" in kwargs["text"]
+    assert kwargs["text"].startswith(":bar_chart: finished  |  1%  |  ")
+    assert [block["type"] for block in kwargs["blocks"]] == ["section"]
+    assert "train_loss" not in kwargs["text"]
+    assert "eval_loss" not in kwargs["text"]
+    assert "test_loss" not in kwargs["text"]
 
 
 def test_missing_token_does_not_raise(tmp_path, monkeypatch, caplog):
@@ -148,7 +222,7 @@ def test_missing_token_does_not_raise(tmp_path, monkeypatch, caplog):
 def test_slack_api_error_does_not_raise(tmp_path, caplog):
     cfg = _config(tmp_path)
     client = MagicMock()
-    client.post_message.side_effect = RuntimeError("slack down")
+    client.chat_postMessage.side_effect = RuntimeError("slack down")
     monitor = TrainMonitor(cfg, client=client, writer=MagicMock())
 
     with caplog.at_level(logging.ERROR):
@@ -158,38 +232,103 @@ def test_slack_api_error_does_not_raise(tmp_path, caplog):
     assert not (cfg.output_dir / "monitor" / "slack_thread.json").exists()
 
 
-def test_stdlib_slack_client_posts_json(tmp_path, monkeypatch):
+def test_web_client_posts_parent(tmp_path, monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
     cfg = _config(tmp_path)
-    captured: dict[str, object] = {}
+    created: dict[str, object] = {}
 
-    class _Response:
-        def __enter__(self):
-            return self
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
 
-        def __exit__(self, *_args):
-            return False
+        def chat_postMessage(self, **kwargs: object) -> dict[str, object]:  # noqa: N802
+            self.calls.append(kwargs)
+            return {"ok": True, "ts": f"1.{len(self.calls)}", "channel": "C1"}
 
-        def read(self):
-            return b'{"ok": true, "ts": "1.2", "channel": "C1"}'
+    def fake_web_client(token: str) -> _Client:
+        created["token"] = token
+        client = _Client()
+        created["client"] = client
+        return client
 
-    def fake_urlopen(request, timeout=0):
-        captured["url"] = request.full_url
-        captured["auth"] = request.get_header("Authorization")
-        captured["body"] = request.data
-        captured["timeout"] = timeout
-        return _Response()
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("lerobot.common.train_monitor._web_client", fake_web_client)
     monitor = TrainMonitor(cfg, writer=MagicMock())
     monitor.start(0)
 
-    assert captured["url"] == "https://slack.com/api/chat.postMessage"
-    assert captured["auth"] == "Bearer xoxb-test"
-    body = json.loads(captured["body"])
-    assert body["channel"] == "C1"
-    assert body["text"].startswith("Training custom-job")
-    assert "thread_ts" not in body
+    assert created["token"] == "xoxb-test"
+    client = created["client"]
+    assert isinstance(client, _Client)
+    assert client.calls[0]["channel"] == "C1"
+    assert str(client.calls[0]["text"]).startswith(":robot_face: Training custom-job")
+    assert "thread_ts" not in client.calls[0]
+    assert client.calls[1]["thread_ts"] == "1.1"
+
+
+def test_checkpoints_update_one_thread_reply(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "lerobot.common.train_monitor.render_loss_plot",
+        lambda *_args, **_kwargs: b"\x89PNG",
+    )
+    cfg = _config(tmp_path)
+    client = MagicMock()
+    client.chat_postMessage.side_effect = [
+        {"ts": "1710000000.000100", "channel": "C1"},
+        {"ts": "1710000000.000110", "channel": "C1"},
+        {"ts": "1710000000.000120", "channel": "C1"},
+        {"ts": "1710000000.000130", "channel": "C1"},
+        {"ts": "1710000000.000200", "channel": "C1"},
+    ]
+    client.files_upload_v2.side_effect = [
+        {"files": [{"id": "F1"}]},
+        {"files": [{"id": "F2"}]},
+        {"files": [{"id": "F3"}]},
+    ]
+    client.chat_update.return_value = {"ok": True}
+    monitor = TrainMonitor(cfg, client=client, writer=MagicMock())
+
+    monitor.start(0)
+
+    posts = client.chat_postMessage.call_args_list
+    assert len(posts) == 5
+    assert "thread_ts" not in posts[0].kwargs
+    assert posts[4].kwargs["thread_ts"] == "1710000000.000100"
+
+    monitor.log_scalars({"loss": 0.9}, step=1)
+    assert client.chat_update.call_count == 0
+
+    monitor.log_scalars({"eval_loss": 0.8}, step=2, mode="eval")
+    assert client.chat_postMessage.call_count == 5
+    first = client.chat_update.call_args.kwargs
+    assert first["ts"] == "1710000000.000200"
+    assert first["channel"] == "C1"
+    assert "thread_ts" not in first
+    assert first["text"].startswith(":bar_chart: running  |  0%  |  ")
+    assert "train_loss" not in first["text"]
+    assert "eval_loss" not in first["text"]
+    image = next(block for block in first["blocks"] if block["type"] == "image")
+    assert image["alt_text"] == "loss"
+    assert image["slack_file"] == {"id": "F1"}
+    assert client.files_upload_v2.call_args_list[0].kwargs["request_file_info"] is False
+    client.files_info.assert_not_called()
+    client.files_delete.assert_not_called()
+
+    monitor.log_scalars({"loss": 0.4}, step=3, mode="test")
+    second = client.chat_update.call_args.kwargs
+    assert second["ts"] == "1710000000.000200"
+    assert second["text"].startswith(":bar_chart: running  |  0%  |  ")
+    assert "test_loss" not in second["text"]
+    image = next(block for block in second["blocks"] if block["type"] == "image")
+    assert image["slack_file"] == {"id": "F2"}
+    client.files_delete.assert_called_once_with(file="F1")
+
+    monitor.finish(3)
+    assert client.chat_postMessage.call_count == 5
+    finished = client.chat_update.call_args.kwargs
+    assert finished["ts"] == "1710000000.000200"
+    assert finished["text"].startswith(":bar_chart: finished  |  0%  |  ")
+    assert "train_loss" not in finished["text"]
+    assert "Training" not in finished["text"]
+    client.files_delete.assert_any_call(file="F2")
 
 
 def test_scalar_events_record_train_and_test_loss(tmp_path):

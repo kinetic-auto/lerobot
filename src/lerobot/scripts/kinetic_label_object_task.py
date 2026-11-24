@@ -57,7 +57,7 @@ from lerobot.datasets import LeRobotDataset
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.datasets.dataset_tools import add_features
 from lerobot.datasets.io_utils import load_stats, write_stats
-from lerobot.datasets.joint_layout import feature_channel_names
+from lerobot.datasets.joint_layout import SENSOR_WRENCH_FEATURE_KEY, feature_channel_names
 from lerobot.policies.kinetic_act.configuration_kinetic_act import MISSING_MASK_CELL_VALUE
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import _transformers_available, require_package
@@ -78,6 +78,11 @@ STAGE_THRESHOLD_FIELD_NAMES = (
     "grasp_distance_meters",
     "pull_joint_displacement_threshold",
 )
+# The force rule finds the grasp from the force-torque sensor, so it needs no gripper threshold.
+FORCE_RULE_STAGE_THRESHOLD_FIELD_NAMES = ("grasp_distance_meters", "pull_joint_displacement_threshold")
+FORCE_CHANNEL_NAME_SUFFIXES = ("force.x", "force.y", "force.z")
+# Frames at the episode start whose mean force is the no-contact baseline.
+FORCE_BASELINE_FRAMES = 5
 OBJECT_DISTANCE_FEATURE_KEY = "observation.object_distance"
 STAGE_FEATURE_KEY = "observation.stage"
 OBJECT_MASK_FEATURE_KEY_PREFIX = "observation.object_mask"
@@ -90,18 +95,20 @@ PULL_STAGE = 2
 
 @dataclass
 class StageThresholds:
-    gripper_closed_threshold: float
+    gripper_closed_threshold: float | None
     grasp_distance_meters: float
     pull_joint_displacement_threshold: float
     gripper_still_frames: int = 0
     gripper_still_speed_threshold: float | None = None
+    grasp_force_threshold_newtons: float | None = None
 
 
 @dataclass
 class StageChannelIndices:
-    gripper_command: int
+    gripper_command: int | None
     gripper_state: int | None
     joint_positions: list[int]
+    forces: list[int] | None = None
 
 
 @dataclass
@@ -128,6 +135,10 @@ class LabelObjectTaskConfig:
     gripper_state_channel_name: str | None = None
     gripper_still_frames: int = 0
     gripper_still_speed_threshold: float | None = None
+    # Force change from the episode start, in newtons, that starts the grasp. None uses the gripper.
+    grasp_force_threshold_newtons: float | None = None
+    # Feature that holds the force-torque sensor force channels.
+    wrench_feature_key: str = SENSOR_WRENCH_FEATURE_KEY
     debug_output_directory: str | None = None
     label_cache_directory: str | None = None
     debug_frames_per_episode: int = 6
@@ -151,6 +162,16 @@ class LabelObjectTaskConfig:
         return self.writes_object_distance or self.writes_stage
 
     @property
+    def uses_force_grasp_rule(self) -> bool:
+        return self.writes_stage and self.grasp_force_threshold_newtons is not None
+
+    @property
+    def required_stage_threshold_names(self) -> tuple[str, ...]:
+        if self.uses_force_grasp_rule:
+            return FORCE_RULE_STAGE_THRESHOLD_FIELD_NAMES
+        return STAGE_THRESHOLD_FIELD_NAMES
+
+    @property
     def requires_gripper_state(self) -> bool:
         return self.writes_stage and self.gripper_still_frames > 0
 
@@ -160,7 +181,7 @@ class LabelObjectTaskConfig:
 
     @property
     def stage_thresholds(self) -> StageThresholds:
-        missing_names = [name for name in STAGE_THRESHOLD_FIELD_NAMES if getattr(self, name) is None]
+        missing_names = [name for name in self.required_stage_threshold_names if getattr(self, name) is None]
         if missing_names:
             raise ValueError(f"The stage label requires {missing_names}.")
         return StageThresholds(
@@ -169,6 +190,7 @@ class LabelObjectTaskConfig:
             pull_joint_displacement_threshold=self.pull_joint_displacement_threshold,
             gripper_still_frames=self.gripper_still_frames,
             gripper_still_speed_threshold=self.gripper_still_speed_threshold,
+            grasp_force_threshold_newtons=self.grasp_force_threshold_newtons,
         )
 
     @property
@@ -202,9 +224,10 @@ class EpisodeSegmentation:
 
 @dataclass
 class StageInputs:
-    gripper_commands: np.ndarray
+    gripper_commands: np.ndarray | None
     gripper_positions: np.ndarray | None
     joint_positions: np.ndarray
+    forces: np.ndarray | None = None
 
 
 class SegmentationCache:
@@ -335,9 +358,20 @@ def validate_config(config: LabelObjectTaskConfig) -> None:
             f"Got {config.labels_to_write}."
         )
     if config.writes_stage:
-        missing_names = [name for name in STAGE_THRESHOLD_FIELD_NAMES if getattr(config, name) is None]
+        missing_names = [
+            name for name in config.required_stage_threshold_names if getattr(config, name) is None
+        ]
         if missing_names:
             raise ValueError(f"Writing the stage label requires {missing_names}.")
+    if config.grasp_force_threshold_newtons is not None and config.grasp_force_threshold_newtons <= 0:
+        raise ValueError(
+            f"`grasp_force_threshold_newtons` must be positive. Got {config.grasp_force_threshold_newtons}."
+        )
+    if config.uses_force_grasp_rule and config.gripper_still_frames > 0:
+        raise ValueError(
+            "`gripper_still_frames` is a gripper rule and cannot be combined with "
+            "`grasp_force_threshold_newtons`."
+        )
     if config.gripper_still_frames < 0:
         raise ValueError(f"`gripper_still_frames` must not be negative. Got {config.gripper_still_frames}.")
     if config.requires_gripper_state and (
@@ -376,7 +410,9 @@ def validate_dataset_features(dataset: LeRobotDataset, config: LabelObjectTaskCo
         )
     if config.needs_object_distance:
         validate_depth_feature(dataset, config)
-    if config.writes_stage:
+    if config.uses_force_grasp_rule:
+        find_force_channel_indices(dataset, config)
+    elif config.writes_stage:
         action_names = feature_channel_names(features[ACTION])
         if config.gripper_action_channel_name not in action_names:
             raise ValueError(
@@ -515,17 +551,29 @@ def read_stage_inputs(
     dataset: LeRobotDataset, frame_indices: list[int], config: LabelObjectTaskConfig
 ) -> StageInputs:
     stage_channel_indices = find_stage_channel_indices(dataset, config)
-    actions = read_column(dataset, ACTION, frame_indices)
     states = read_column(dataset, OBS_STATE, frame_indices)
     # The gripper is compared with its thresholds in float64, as when it was read frame by frame.
     return StageInputs(
-        gripper_commands=actions[:, stage_channel_indices.gripper_command].astype(np.float64),
+        gripper_commands=(
+            None
+            if stage_channel_indices.gripper_command is None
+            else read_column(dataset, ACTION, frame_indices)[:, stage_channel_indices.gripper_command].astype(
+                np.float64
+            )
+        ),
         gripper_positions=(
             None
             if stage_channel_indices.gripper_state is None
             else states[:, stage_channel_indices.gripper_state].astype(np.float64)
         ),
         joint_positions=states[:, stage_channel_indices.joint_positions],
+        forces=(
+            None
+            if stage_channel_indices.forces is None
+            else read_column(dataset, config.wrench_feature_key, frame_indices)[
+                :, stage_channel_indices.forces
+            ].astype(np.float64)
+        ),
     )
 
 
@@ -536,8 +584,12 @@ def read_column(dataset: LeRobotDataset, column_name: str, frame_indices: list[i
 def find_stage_channel_indices(dataset: LeRobotDataset, config: LabelObjectTaskConfig) -> StageChannelIndices:
     state_channel_names = feature_channel_names(dataset.meta.features[OBS_STATE])
     return StageChannelIndices(
-        gripper_command=feature_channel_names(dataset.meta.features[ACTION]).index(
-            config.gripper_action_channel_name
+        gripper_command=(
+            None
+            if config.uses_force_grasp_rule
+            else feature_channel_names(dataset.meta.features[ACTION]).index(
+                config.gripper_action_channel_name
+            )
         ),
         gripper_state=(
             state_channel_names.index(config.resolved_gripper_state_channel_name)
@@ -545,7 +597,30 @@ def find_stage_channel_indices(dataset: LeRobotDataset, config: LabelObjectTaskC
             else None
         ),
         joint_positions=find_position_channel_indices(state_channel_names),
+        forces=find_force_channel_indices(dataset, config) if config.uses_force_grasp_rule else None,
     )
+
+
+def find_force_channel_indices(dataset: LeRobotDataset, config: LabelObjectTaskConfig) -> list[int]:
+    wrench_feature = dataset.meta.features.get(config.wrench_feature_key)
+    if wrench_feature is None:
+        raise ValueError(
+            f"`wrench_feature_key` {config.wrench_feature_key!r} is not a dataset feature. "
+            "The force rule needs the force-torque sensor channels."
+        )
+    channel_names = feature_channel_names(wrench_feature)
+    force_channel_indices = [
+        channel_index
+        for suffix in FORCE_CHANNEL_NAME_SUFFIXES
+        for channel_index, name in enumerate(channel_names)
+        if name == suffix or name.endswith(f".{suffix}")
+    ]
+    if len(force_channel_indices) != len(FORCE_CHANNEL_NAME_SUFFIXES):
+        raise ValueError(
+            f"{config.wrench_feature_key!r} must hold one channel for each of {FORCE_CHANNEL_NAME_SUFFIXES}. "
+            f"Channels: {channel_names}."
+        )
+    return force_channel_indices
 
 
 def label_object_distance_and_stage(
@@ -578,6 +653,7 @@ def label_object_distance_and_stage(
             stage_inputs.joint_positions,
             config.stage_thresholds,
             stage_inputs.gripper_positions,
+            stage_inputs.forces,
         )
         label_arrays[STAGE_FEATURE_KEY] = stage
     logging.info(
@@ -730,15 +806,16 @@ def median_filter_distances(distances: np.ndarray, window_frames: int) -> np.nda
 
 
 def assign_stage_labels(
-    gripper_commands: np.ndarray,
+    gripper_commands: np.ndarray | None,
     object_distances: np.ndarray,
     joint_positions: np.ndarray,
     thresholds: StageThresholds,
     gripper_positions: np.ndarray | None = None,
+    forces: np.ndarray | None = None,
 ) -> np.ndarray:
     # Stages latch at their first crossing, so a label never goes backwards within an episode.
-    stage = np.full(len(gripper_commands), APPROACH_STAGE, dtype=np.int64)
-    grasp_onset = find_grasp_onset(gripper_commands, gripper_positions, object_distances, thresholds)
+    stage = np.full(len(object_distances), APPROACH_STAGE, dtype=np.int64)
+    grasp_onset = find_grasp_onset(gripper_commands, gripper_positions, object_distances, thresholds, forces)
     if grasp_onset is None:
         return stage
 
@@ -753,12 +830,22 @@ def assign_stage_labels(
 
 
 def find_grasp_onset(
-    gripper_commands: np.ndarray,
+    gripper_commands: np.ndarray | None,
     gripper_positions: np.ndarray | None,
     object_distances: np.ndarray,
     thresholds: StageThresholds,
+    forces: np.ndarray | None = None,
 ) -> int | None:
     is_near_object = object_distances < thresholds.grasp_distance_meters
+    if thresholds.grasp_force_threshold_newtons is not None:
+        if forces is None:
+            raise ValueError("The force rule needs the force-torque sensor forces.")
+        # The grasp starts when the force has changed from its no-contact value at the episode start.
+        force_change = np.linalg.norm(forces - forces[:FORCE_BASELINE_FRAMES].mean(axis=0), axis=1)
+        is_grasping = (force_change > thresholds.grasp_force_threshold_newtons) & is_near_object
+        return int(np.argmax(is_grasping)) if is_grasping.any() else None
+    if gripper_commands is None:
+        raise ValueError("The gripper rule needs the gripper commands.")
     if thresholds.gripper_still_frames == 0:
         is_grasping = (gripper_commands < thresholds.gripper_closed_threshold) & is_near_object
         return int(np.argmax(is_grasping)) if is_grasping.any() else None

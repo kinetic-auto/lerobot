@@ -33,8 +33,13 @@ from lerobot.datasets.cartesian_conversion import (
     convert_joint_frame,
     convert_joints_to_cartesian,
     propose_joint_map,
+    transform_wrench_to_target_frame,
 )
-from lerobot.datasets.joint_layout import packed_feature_names
+from lerobot.datasets.joint_layout import (
+    SENSOR_WRENCH_CHANNEL_NAMES,
+    SENSOR_WRENCH_FEATURE_KEY,
+    packed_feature_names,
+)
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.model.cartesian_quantities import (
     CartesianFrameSample,
@@ -555,6 +560,158 @@ def test_default_wrench_is_expressed_in_the_end_effector_frame(tmp_path, empty_l
             end_effector_row[wrench_start + 3 : wrench_start + 6], rotation.T @ base_axes_torque, atol=1e-5
         )
     assert np.abs(base_axes_rows[:, wrench_start:]).max() > 0.01
+
+
+SENSOR_FRAME = "link2"
+SENSOR_WRENCH = np.array([1.0, 2.0, 3.0, 0.4, 0.5, 0.6])
+
+
+def test_transform_wrench_to_target_frame_adds_the_torque_of_the_frame_offset():
+    sensor_frame_in_world = np.eye(4)
+    target_frame_in_world = np.eye(4)
+    target_frame_in_world[:3, 3] = [1.0, 0.0, 0.0]
+    wrench = transform_wrench_to_target_frame(
+        SENSOR_WRENCH, sensor_frame_in_world, target_frame_in_world, "local"
+    )
+    np.testing.assert_allclose(wrench.force, SENSOR_WRENCH[:3])
+    np.testing.assert_allclose(
+        wrench.torque, SENSOR_WRENCH[3:] + np.cross([-1.0, 0.0, 0.0], SENSOR_WRENCH[:3])
+    )
+
+
+def test_transform_wrench_to_target_frame_returns_the_wrench_for_the_same_frame():
+    frame_in_world = np.eye(4)
+    frame_in_world[:3, :3] = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    frame_in_world[:3, 3] = [0.3, -0.2, 0.5]
+    wrench = transform_wrench_to_target_frame(SENSOR_WRENCH, frame_in_world, frame_in_world, "local")
+    np.testing.assert_allclose(wrench.to_vector(), SENSOR_WRENCH, atol=1e-12)
+
+
+@pytest.mark.parametrize("jacobian_frame_reference", ["local", "world", "local_world_aligned"])
+def test_transformed_sensor_wrench_does_the_same_work_as_the_sensor_wrench(
+    planar_kinematics, tmp_path, jacobian_frame_reference
+):
+    from lerobot.model.kinematics import RobotKinematics
+
+    sensor_kinematics = RobotKinematics(
+        str(_write_urdf(tmp_path)),
+        target_frame_name=SENSOR_FRAME,
+        joint_names=["follower_r_joint1", "follower_r_joint2"],
+    )
+    joint_positions_degrees = np.rad2deg([0.4, 0.9])
+    joint_velocities = np.array([0.3, -0.7])
+    sensor_twist = sensor_kinematics.frame_jacobian(joint_positions_degrees, "local") @ joint_velocities
+    target_twist = (
+        planar_kinematics.frame_jacobian(joint_positions_degrees, jacobian_frame_reference) @ joint_velocities
+    )
+
+    sample = convert_joint_frame(
+        planar_kinematics,
+        joint_positions_degrees,
+        None,
+        np.zeros(2),
+        _layout(),
+        gripper_by_field={"position": np.array([0.02])},
+        jacobian_frame_reference=jacobian_frame_reference,
+        sensor_wrench=SENSOR_WRENCH,
+        wrench_sensor_frame=SENSOR_FRAME,
+    )
+    target_wrench = next(quantity for quantity in sample.quantities if isinstance(quantity, FrameWrench))
+
+    assert target_wrench.to_vector() @ target_twist == pytest.approx(SENSOR_WRENCH @ sensor_twist)
+
+
+def _record_planar_dataset_with_sensor_wrench(tmp_path, empty_lerobot_dataset_factory, action_fields):
+    state_names = packed_feature_names(DATASET_JOINTS, ["position", "effort"])
+    action_names = packed_feature_names(DATASET_JOINTS, action_fields)
+    features = {
+        OBS_STATE: {"dtype": "float32", "shape": (len(state_names),), "names": state_names},
+        ACTION: {"dtype": "float32", "shape": (len(action_names),), "names": action_names},
+        SENSOR_WRENCH_FEATURE_KEY: {"dtype": "float32", "shape": (6,), "names": SENSOR_WRENCH_CHANNEL_NAMES},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "source", features=features, use_videos=False)
+    for frame in range(12):
+        state = np.array([0.4 + 0.05 * frame, 0.9, 0.02, 0.3, -0.2, 0.0], dtype=np.float32)
+        dataset.add_frame(
+            {
+                "task": "reach",
+                OBS_STATE: state,
+                ACTION: state[: len(action_names)],
+                SENSOR_WRENCH_FEATURE_KEY: (SENSOR_WRENCH * (1 + frame)).astype(np.float32),
+            }
+        )
+    dataset.save_episode()
+    dataset.finalize()
+    return dataset
+
+
+def test_ft_sensor_wrench_source_writes_the_sensor_wrench_at_the_target_frame(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset_with_sensor_wrench(tmp_path, empty_lerobot_dataset_factory, ["position"])
+    converted, _report = convert_joints_to_cartesian(
+        dataset,
+        _conversion_config(tmp_path, wrench_source="ft_sensor_wrench", wrench_sensor_frame=SENSOR_FRAME),
+        output_dir=tmp_path / "cartesian",
+        repo_id="local/cartesian",
+    )
+
+    reloaded = LeRobotDataset("local/cartesian", root=converted.root)
+    assert SENSOR_WRENCH_FEATURE_KEY not in reloaded.meta.features
+    assert reloaded.meta.features[OBS_STATE]["names"] == EXPECTED_NAMES
+    wrench_start = len(POSE_NAMES) + 1
+    for frame, state_row in enumerate(_read_state_rows(reloaded)):
+        sensor_wrench = SENSOR_WRENCH * (1 + frame)
+        # The tcp is 1 m along x from link2 with the same orientation.
+        expected_torque = sensor_wrench[3:] + np.cross([-1.0, 0.0, 0.0], sensor_wrench[:3])
+        np.testing.assert_allclose(state_row[wrench_start : wrench_start + 3], sensor_wrench[:3], rtol=1e-5)
+        np.testing.assert_allclose(state_row[wrench_start + 3 :], expected_torque, rtol=1e-5)
+    provenance = json.loads((converted.root / "meta" / "cartesian_conversion.json").read_text())
+    assert provenance["wrench_source"] == "ft_sensor_wrench"
+    assert provenance["wrench_sensor_frame"] == SENSOR_FRAME
+
+
+def test_ft_sensor_wrench_source_raises_without_the_sensor_wrench_feature(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset_with_effort(tmp_path, empty_lerobot_dataset_factory)
+    with pytest.raises(ValueError, match="--wrench_topic"):
+        convert_joints_to_cartesian(
+            dataset,
+            _conversion_config(tmp_path, wrench_source="ft_sensor_wrench", wrench_sensor_frame=SENSOR_FRAME),
+            output_dir=tmp_path / "cartesian",
+            repo_id="local/cartesian",
+        )
+
+
+def test_ft_sensor_wrench_source_raises_on_an_action_with_effort(tmp_path, empty_lerobot_dataset_factory):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset_with_sensor_wrench(
+        tmp_path, empty_lerobot_dataset_factory, ["position", "effort"]
+    )
+    with pytest.raises(ValueError, match="action"):
+        convert_joints_to_cartesian(
+            dataset,
+            _conversion_config(tmp_path, wrench_source="ft_sensor_wrench", wrench_sensor_frame=SENSOR_FRAME),
+            output_dir=tmp_path / "cartesian",
+            repo_id="local/cartesian",
+        )
+
+
+def test_ft_sensor_wrench_source_raises_on_a_sensor_frame_missing_from_the_urdf(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    pytest.importorskip("placo")
+    dataset = _record_planar_dataset_with_sensor_wrench(tmp_path, empty_lerobot_dataset_factory, ["position"])
+    with pytest.raises(ValueError, match="tool0"):
+        convert_joints_to_cartesian(
+            dataset,
+            _conversion_config(tmp_path, wrench_source="ft_sensor_wrench"),
+            output_dir=tmp_path / "cartesian",
+            repo_id="local/cartesian",
+        )
 
 
 UR_DATASET_JOINTS = [*UR_CALIBRATION_JOINT_MAPPING.values(), "gripper"]

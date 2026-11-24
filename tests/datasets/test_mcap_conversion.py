@@ -25,7 +25,11 @@ pytest.importorskip("mcap_ros2", reason="mcap-ros2-support is required (install 
 
 from lerobot.datasets import mcap_conversion
 from lerobot.datasets.dataset_validation import CONVERSION_MANIFEST_FILE_NAME, check_features
-from lerobot.datasets.joint_layout import packed_feature_names
+from lerobot.datasets.joint_layout import (
+    SENSOR_WRENCH_CHANNEL_NAMES,
+    SENSOR_WRENCH_FEATURE_KEY,
+    packed_feature_names,
+)
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.mcap_conversion import (
     STATE_FIELDS,
@@ -38,6 +42,7 @@ from lerobot.datasets.mcap_conversion import (
     build_state_joint_names,
     build_state_matrix,
     build_time_grid,
+    build_wrench_matrix,
     convert_episode,
     decode_aligned_depth_image,
     decode_depth_image,
@@ -427,6 +432,73 @@ def test_convert_episode_writes_the_future_state_as_the_action(
     actions = np.stack([np.asarray(row) for row in reloaded.hf_dataset["action"]])
     np.testing.assert_allclose(actions, expected_actions, rtol=1e-6)
     assert check_features(reloaded, Path(config.output_root)).endswith(f"{action_dimension}-dim action")
+
+
+WRENCH_TOPIC = "/force_torque_sensor_broadcaster/wrench"
+
+
+def add_wrench_stream(streams: EpisodeStreams, start: float, end: float) -> EpisodeStreams:
+    streams.wrench_timestamps = np.arange(start, end, 0.02)
+    streams.wrench_values = np.stack([streams.wrench_timestamps + offset for offset in range(6)], axis=1)
+    return streams
+
+
+def test_build_features_adds_the_sensor_wrench_when_its_topic_is_set(tmp_path):
+    config = make_conversion_config(tmp_path, wrench_topic=WRENCH_TOPIC)
+    features = build_features(config, state_names_for(config))
+    assert features[SENSOR_WRENCH_FEATURE_KEY]["shape"] == (6,)
+    assert features[SENSOR_WRENCH_FEATURE_KEY]["names"] == SENSOR_WRENCH_CHANNEL_NAMES
+    assert SENSOR_WRENCH_FEATURE_KEY not in build_features(
+        make_conversion_config(tmp_path), state_names_for(config)
+    )
+
+
+def test_build_wrench_matrix_holds_the_latest_sensor_message():
+    streams = add_wrench_stream(make_streams(joint_start=0.0, camera_start=0.0, end=2.0), start=0.0, end=2.0)
+    wrench = build_wrench_matrix(streams, np.array([1.0]))
+    np.testing.assert_allclose(wrench[0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], atol=0.021)
+
+
+def test_build_time_grid_starts_when_the_sensor_wrench_has_data(tmp_path):
+    config = make_conversion_config(tmp_path, fps=10, action_lookahead_frames=3, wrench_topic=WRENCH_TOPIC)
+    streams = add_wrench_stream(make_streams(joint_start=0.0, camera_start=0.0, end=5.0), start=2.0, end=5.0)
+    assert build_time_grid(streams, config)[0] == pytest.approx(2.0)
+
+
+def test_convert_episode_writes_the_sensor_wrench(tmp_path, monkeypatch):
+    config = make_conversion_config(
+        tmp_path,
+        joint_names=["joint_a", "joint_b"],
+        camera_feature_names=[],
+        fps=10,
+        action_lookahead_frames=3,
+        wrench_topic=WRENCH_TOPIC,
+    )
+    streams = add_wrench_stream(make_streams(joint_start=0.0, camera_start=0.0, end=2.0), start=0.0, end=2.0)
+    streams.camera_frames = {}
+    monkeypatch.setattr(mcap_conversion, "read_episode_streams", lambda *arguments: streams)
+    dataset = LeRobotDataset.create(
+        repo_id=config.repo_id,
+        fps=config.fps,
+        features=build_features(config, state_names_for(config)),
+        root=config.output_root,
+        use_videos=False,
+    )
+
+    frame_count = convert_episode(dataset, tmp_path / "episode.mcap", None, config)
+    dataset.finalize()
+
+    expected_wrench = build_wrench_matrix(streams, build_time_grid(streams, config))[:frame_count]
+    reloaded = LeRobotDataset(config.repo_id, root=config.output_root)
+    written_wrench = np.stack([np.asarray(row) for row in reloaded.hf_dataset[SENSOR_WRENCH_FEATURE_KEY]])
+    np.testing.assert_allclose(written_wrench, expected_wrench, rtol=1e-6)
+
+
+def test_write_manifest_records_the_sensor_wrench_topic_and_frame(tmp_path):
+    write_manifest(tmp_path, [], {}, make_conversion_config(tmp_path, wrench_topic=WRENCH_TOPIC))
+    manifest = json.loads((tmp_path / CONVERSION_MANIFEST_FILE_NAME).read_text())
+    assert manifest["wrench_topic"] == WRENCH_TOPIC
+    assert manifest["wrench_frame_name"] == "tool0_controller"
 
 
 def test_write_manifest_records_whether_actions_include_effort(tmp_path):

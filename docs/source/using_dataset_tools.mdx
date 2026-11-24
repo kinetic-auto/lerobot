@@ -284,6 +284,14 @@ Requires `lerobot[kinematics]` (`placo`). URDFs whose meshes use `package://` pa
 
 For a UR arm, `--operation.kinematics_calibration_path` takes the robot's kinematics calibration YAML (for example `robot_0_kinematics.yaml`). Its `shoulder`, `upper_arm`, `forearm`, `wrist_1`, `wrist_2` and `wrist_3` poses replace the origins of the matching arm joints in the URDF copy, so forward kinematics uses the robot's own calibration. The URDF is still required for the base, mount and tool frames. The joints are found through the joint map, so every UR arm joint must be mapped. `meta/cartesian_conversion.json` records the YAML's file name, sha256 and `hash`.
 
+`--operation.wrench_source` selects where the end-effector force and torque come from. `joint_effort` (the default) solves them from the joint efforts through the Jacobian. `ft_sensor_wrench` takes the force-torque sensor reading stored in `observation.wrench` and expresses it at the target frame: the force is rotated, and the torque is rotated and corrected for the offset between the two frames. `--operation.wrench_sensor_frame` names the URDF link the reading is expressed in (default: `tool0`).
+
+With `ft_sensor_wrench`:
+
+- The new dataset has no `observation.wrench` feature. The reading is already in `observation.state` as the `ee.force.*` and `ee.torque.*` channels, so it is not stored a second time. The source dataset keeps it.
+- `--operation.subtract_gravity` has no effect. That setting removes the effort of holding the arm up from the joint efforts; the sensor sits at the tool and does not measure it. The sensor values are written as recorded, apart from the change of frame.
+- The `action` must not hold effort channels. There is one sensor reading per frame and it goes to `observation.state`, so there is nothing to convert an action's efforts with, and the conversion stops with an error. The default action holds positions only; this applies to datasets converted with `--include_effort_in_actions true`.
+
 Interactive run (prompts for the frame and the joint map):
 
 ```bash

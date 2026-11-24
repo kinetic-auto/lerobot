@@ -18,6 +18,9 @@ from typing import Any
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 VALID_JOINT_FIELDS = ("position", "velocity", "effort")
+# Force-torque sensor reading as recorded, in the frame of the sensor messages.
+SENSOR_WRENCH_FEATURE_KEY = "observation.wrench"
+SENSOR_WRENCH_CHANNEL_NAMES = ["force.x", "force.y", "force.z", "torque.x", "torque.y", "torque.z"]
 
 
 def packed_feature_names(joint_names: Sequence[str], fields: Sequence[str]) -> list[str]:

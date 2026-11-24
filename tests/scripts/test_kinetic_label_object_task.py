@@ -919,3 +919,136 @@ def test_segment_object_masks_forwards_the_batch_once():
     assert len(results) == 2
     np.testing.assert_array_equal(results[0], masks[0].numpy())
     np.testing.assert_array_equal(results[1], masks[0].numpy())
+
+
+FORCE_RISES_AT_FRAME = 7
+CONTACT_FORCE_NEWTONS = 20.0
+FORCE_THRESHOLDS = StageThresholds(
+    gripper_closed_threshold=None,
+    grasp_distance_meters=GRASP_DISTANCE_METERS,
+    pull_joint_displacement_threshold=0.15,
+    grasp_force_threshold_newtons=8.0,
+)
+
+
+def write_source_dataset_with_sensor_forces(
+    root, force_feature_key: str, force_channel_names: list[str]
+) -> None:
+    force_feature_is_the_state = force_feature_key == "observation.state"
+    joint_names = ["joint1.position", "joint2.position"]
+    state_names = [*joint_names, *(force_channel_names if force_feature_is_the_state else [])]
+    features = {
+        "observation.state": {"dtype": "float32", "shape": (len(state_names),), "names": state_names},
+        "action": {"dtype": "float32", "shape": (len(joint_names),), "names": joint_names},
+        "observation.images.realsense": {
+            "dtype": "image",
+            "shape": (IMAGE_HEIGHT, IMAGE_WIDTH, 3),
+            "names": ["height", "width", "channels"],
+        },
+        "observation.images.realsense_depth": {
+            "dtype": "image",
+            "shape": (IMAGE_HEIGHT, IMAGE_WIDTH, 1),
+            "names": ["height", "width", "channels"],
+            "info": {"is_depth_map": True},
+        },
+    }
+    if not force_feature_is_the_state:
+        features[force_feature_key] = {
+            "dtype": "float32",
+            "shape": (len(force_channel_names),),
+            "names": force_channel_names,
+        }
+    dataset = LeRobotDataset.create("local/source", FPS, features, root=root, use_videos=False)
+    for _ in range(EPISODE_COUNT):
+        for frame in range(FRAMES_PER_EPISODE):
+            joint = 0.1 * max(0, frame - ARM_STARTS_MOVING_AT_FRAME)
+            # A constant sensor offset is present from the first frame; contact adds force along x.
+            force = np.array([3.0, -2.0, 1.0], dtype=np.float32)
+            if frame >= FORCE_RISES_AT_FRAME:
+                force[0] += CONTACT_FORCE_NEWTONS
+            forces = np.zeros(len(force_channel_names), dtype=np.float32)
+            forces[:3] = force
+            row = {
+                "observation.state": np.array([joint, 0.0], dtype=np.float32),
+                "action": np.array([joint, 0.0], dtype=np.float32),
+                "observation.images.realsense": np.full((IMAGE_HEIGHT, IMAGE_WIDTH, 3), 128, np.uint8),
+                "observation.images.realsense_depth": np.full(
+                    (IMAGE_HEIGHT, IMAGE_WIDTH, 1), 2000 - 100 * frame, np.uint16
+                ),
+                "task": "pull handle",
+            }
+            if force_feature_is_the_state:
+                row["observation.state"] = np.concatenate([row["observation.state"], forces])
+            else:
+                row[force_feature_key] = forces
+            dataset.add_frame(row)
+        dataset.save_episode()
+    dataset.finalize()
+
+
+def make_force_rule_config(tmp_path, **overrides) -> LabelObjectTaskConfig:
+    return make_config(
+        tmp_path,
+        gripper_closed_threshold=None,
+        grasp_force_threshold_newtons=FORCE_THRESHOLDS.grasp_force_threshold_newtons,
+        labels_to_write=["stage"],
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    ("force_feature_key", "force_channel_names"),
+    [
+        ("observation.wrench", ["force.x", "force.y", "force.z", "torque.x", "torque.y", "torque.z"]),
+        ("observation.state", ["ee.force.x", "ee.force.y", "ee.force.z"]),
+    ],
+)
+def test_label_dataset_starts_the_grasp_at_the_sensor_force_without_a_gripper_channel(
+    tmp_path, monkeypatch, force_feature_key, force_channel_names
+):
+    write_source_dataset_with_sensor_forces(tmp_path / "source", force_feature_key, force_channel_names)
+    stub_segmentation(monkeypatch)
+
+    label_dataset(make_force_rule_config(tmp_path, wrench_feature_key=force_feature_key))
+
+    labelled = LeRobotDataset("local/labelled", root=tmp_path / "labelled")
+    expected_stage = np.tile([0] * FORCE_RISES_AT_FRAME + [1] * 3 + [2] * 2, EPISODE_COUNT)
+    np.testing.assert_array_equal(np.asarray(labelled.hf_dataset["observation.stage"]), expected_stage)
+
+
+def test_label_dataset_with_the_force_rule_raises_without_the_wrench_feature(tmp_path, monkeypatch):
+    write_source_dataset(tmp_path / "source")
+    monkeypatch.setattr(label_script, "load_sam3_segmenter", lambda model_name_or_path, device: None)
+
+    with pytest.raises(ValueError, match="wrench_feature_key"):
+        label_dataset(make_force_rule_config(tmp_path))
+
+
+def test_validate_config_raises_on_the_force_rule_with_gripper_still_frames(tmp_path):
+    with pytest.raises(ValueError, match="gripper_still_frames"):
+        validate_config(
+            make_force_rule_config(tmp_path, gripper_still_frames=2, gripper_still_speed_threshold=0.01)
+        )
+
+
+def test_validate_config_raises_on_a_force_threshold_that_is_not_positive(tmp_path):
+    with pytest.raises(ValueError, match="grasp_force_threshold_newtons"):
+        validate_config(make_config(tmp_path, grasp_force_threshold_newtons=0.0))
+
+
+def test_assign_stage_labels_starts_the_grasp_when_the_sensor_force_changes():
+    forces = np.array([[3.0, 0.0, 0.0]] * 6 + [[3.0, 12.0, 0.0]] * 2)
+    object_distances = np.full(8, 1.0)
+    joint_positions = np.array([[0.0]] * 7 + [[0.3]])
+
+    stage = assign_stage_labels(None, object_distances, joint_positions, FORCE_THRESHOLDS, forces=forces)
+
+    np.testing.assert_array_equal(stage, [APPROACH_STAGE] * 6 + [GRASP_STAGE, PULL_STAGE])
+
+
+def test_assign_stage_labels_with_the_force_rule_still_requires_the_object_to_be_near():
+    forces = np.array([[0.0, 0.0, 0.0]] * 5 + [[20.0, 0.0, 0.0]] * 3)
+
+    stage = assign_stage_labels(None, np.full(8, 2.0), np.zeros((8, 1)), FORCE_THRESHOLDS, forces=forces)
+
+    np.testing.assert_array_equal(stage, [APPROACH_STAGE] * 8)

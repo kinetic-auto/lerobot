@@ -46,6 +46,7 @@ Flags:
 - `--fps` (default: 10), `--action_lookahead_frames` (default: 3), `--task`, `--robot_type`.
 - `--include_effort_in_actions`: keep the joint and gripper efforts in `action` (default: false, positions only).
 - `--include_gripper`: write the gripper channels to `observation.state` and `action` (default: true). With `false` the state and action hold the joints only, and the gripper topic is not required in the recording.
+- `--wrench_topic`: force-torque sensor topic to write as `observation.wrench`, force x, y, z then torque x, y, z, as recorded (default: unset, no sensor feature). For the teleop recordings it is `/force_torque_sensor_broadcaster/wrench`. `--wrench_frame_name` is the frame the messages must be in (default: `tool0_controller`); an episode in another frame is skipped.
 - `--camera_feature_names`: dataset camera names, matched to `topics_mapping` (default: `pc1`, `realsense`, `realsense_depth`). A name ending in `_depth` is stored as a depth map.
 - `--img_sizes`: `[width, height]` per camera name (default: `[640, 360]` for each camera).
 - `--joint_names`: joints in dataset order (default: the six UR joints, shoulder pan to wrist 3).
@@ -77,6 +78,8 @@ lerobot-dataset-valid \
 ```
 
 To express the dataset as end-effector pose, gripper opening and wrench, convert it with the robot's URDF and its kinematics calibration. Force and torque are written in the end-effector frame. See `docs/source/using_dataset_tools.mdx` for every flag.
+
+By default the force and torque are solved from the joint efforts. With `--operation.wrench_source ft_sensor_wrench` they come from the force-torque sensor reading in `observation.wrench` (a dataset converted with `--wrench_topic`), moved from `--operation.wrench_sensor_frame` (default: `tool0`, the URDF link that coincides with `tool0_controller`) to the target frame.
 
 ```bash
 lerobot-edit-dataset \
@@ -182,6 +185,7 @@ Flags:
 - `--labels_to_write`: labels to add, any of `object_distance`, `stage` and `object_mask` (default: all three). The mask needs only the RGB feature. The distance needs the aligned depth. The stage is computed from the distance, so it needs the depth as well.
 - `--gripper_closed_threshold`, `--grasp_distance_meters`, `--pull_joint_displacement_threshold` (required with the `stage` label): grasp starts when the gripper command is below the first and the object distance below the second. Pull starts when the joint positions have moved more than the third from where the grasp started. Stages never go backwards within an episode.
 - `--gripper_still_frames`, `--gripper_still_speed_threshold`, `--gripper_state_channel_name`: make the grasp stricter, so it starts only once the measured gripper is closed and has stopped moving (default: off, the command alone decides). The gripper position, read from the channel of `observation.state` (default: the same name as `--gripper_action_channel_name`), must be below `--gripper_closed_threshold` and change by less than `--gripper_still_speed_threshold` per frame for `--gripper_still_frames` consecutive frames. The grasp is labelled from the first frame of that still window. The speed threshold is required when the frame count is positive.
+- `--grasp_force_threshold_newtons`, `--wrench_feature_key`: find the grasp from the force-torque sensor instead of the gripper (default: unset, the gripper rule). The grasp starts at the first frame where the force has changed by more than the threshold from its mean over the first 5 frames of the episode, and the object distance is below `--grasp_distance_meters`. `--gripper_closed_threshold` and the gripper channel are then not needed, so it works on a dataset converted with `--include_gripper false`. The force channels are read from `--wrench_feature_key` (default: `observation.wrench`, written by `lerobot-mcap-convert --wrench_topic`); pass `observation.state` for a Cartesian dataset converted with `--operation.wrench_source ft_sensor_wrench`, where they are the `ee.force.*` channels. Cannot be combined with `--gripper_still_frames`.
 - `--mark_missing_labels`: when SAM 3 finds no object in a frame, write a missing marker instead of filling the gap (default: true). A missing distance is NaN and a missing mask is filled with 255. With `false`, the distance is carried forward from the last valid frame and the mask is empty. The stage is never missing, because it does not depend on the detection of a single frame.
 - `--mask_score_threshold`, `--mask_downsample_factor`, `--distance_median_filter_frames`: SAM 3 score cutoff (default: 0.2), mask label resolution as image size divided by the factor (default: 16), and an odd median filter window over the distance (default: 5).
 - Progress: a frame progress bar shows the speed and the episode in progress, with one log line per episode giving its frame count and the frames where SAM 3 found no object.

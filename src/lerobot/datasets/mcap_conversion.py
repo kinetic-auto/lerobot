@@ -29,7 +29,11 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.depth_range import zero_depth_outside_valid_range
 
 from .dataset_validation import CONVERSION_MANIFEST_FILE_NAME
-from .joint_layout import packed_feature_names
+from .joint_layout import (
+    SENSOR_WRENCH_CHANNEL_NAMES,
+    SENSOR_WRENCH_FEATURE_KEY,
+    packed_feature_names,
+)
 from .lerobot_dataset import LeRobotDataset
 from .mcap_depth import (
     CameraParameters,
@@ -66,6 +70,10 @@ class McapConversionConfig:
     action_lookahead_frames: int = 3
     include_effort_in_actions: bool = False
     include_gripper: bool = True
+    # Force-torque sensor topic written to observation.wrench. None leaves the sensor out.
+    wrench_topic: str | None = None
+    # Frame the force-torque sensor messages must be expressed in.
+    wrench_frame_name: str = "tool0_controller"
     quality_report_path: str | None = None
     include_flagged: str = "warning"
     episode_allow_list_path: str | None = None
@@ -116,6 +124,8 @@ class EpisodeStreams:
     gripper_efforts: np.ndarray
     camera_frames: dict[str, TimedMessages]
     depth_alignment: DepthAlignment | None
+    wrench_timestamps: np.ndarray | None = None
+    wrench_values: np.ndarray | None = None
 
 
 def convert_session(config: McapConversionConfig) -> None:
@@ -276,6 +286,12 @@ def build_features(config: McapConversionConfig, state_names: list[str]) -> dict
         if is_depth:
             feature["info"] = {"is_depth_map": True}
         features[f"{OBS_IMAGES}.{feature_name}"] = feature
+    if config.wrench_topic is not None:
+        features[SENSOR_WRENCH_FEATURE_KEY] = {
+            "dtype": "float32",
+            "shape": (len(SENSOR_WRENCH_CHANNEL_NAMES),),
+            "names": list(SENSOR_WRENCH_CHANNEL_NAMES),
+        }
     return features
 
 
@@ -316,6 +332,11 @@ def convert_episode(
     if not np.isfinite(state).all():
         raise ValueError(f"{mcap_path} has non-finite joint or gripper values.")
 
+    # Force-torque sensor observations
+    wrench = build_wrench_matrix(streams, time_grid) if config.wrench_topic is not None else None
+    if wrench is not None and not np.isfinite(wrench).all():
+        raise ValueError(f"{mcap_path} has non-finite force-torque sensor values.")
+
     # Camera observations
     frame_count = len(time_grid) - config.action_lookahead_frames
     camera_observations = (
@@ -335,6 +356,8 @@ def convert_episode(
                 ACTION: state[frame_index + config.action_lookahead_frames, :action_dimension],
                 "task": config.task,
             }
+            if wrench is not None:
+                frame[SENSOR_WRENCH_FEATURE_KEY] = wrench[frame_index]
             if camera_observations is not None:
                 frame.update(next(camera_observations))
             dataset.add_frame(frame)
@@ -358,12 +381,17 @@ def read_episode_streams(
     }
     depth_topics = set(topics.depth_topics)
     joint_rows: list[tuple[float, np.ndarray, np.ndarray]] = []
+    wrench_rows: list[tuple[float, list[float]]] = []
     gripper_rows: list[tuple[float, float, float]] = []
     image_timestamps: dict[str, list[float]] = {topic: [] for topic in camera_topics.values()}
     image_payloads: dict[str, list[Any]] = {topic: [] for topic in camera_topics.values()}
     joint_indices: list[int] | None = None
 
-    for topic, timestamp, message in decode_topic_messages(mcap_path, topics.required_topics()):
+    topics_to_read = topics.required_topics()
+    if config.wrench_topic is not None:
+        topics_to_read.append(config.wrench_topic)
+
+    for topic, timestamp, message in decode_topic_messages(mcap_path, topics_to_read):
         if topic == state_topic:
             if joint_indices is None:
                 joint_indices = find_joint_indices(list(message.name), config.joint_names)
@@ -373,6 +401,14 @@ def read_episode_streams(
         elif topic == gripper_topic:
             # Torque is unused. Sim bags store NaN, so the effort channel is zero for every source.
             gripper_rows.append((timestamp, message.opening_m, 0.0))
+        elif topic == config.wrench_topic:
+            if message.header.frame_id != config.wrench_frame_name:
+                raise ValueError(
+                    f"{mcap_path} has {topic} in frame {message.header.frame_id!r}, "
+                    f"not `wrench_frame_name` {config.wrench_frame_name!r}."
+                )
+            force, torque = message.wrench.force, message.wrench.torque
+            wrench_rows.append((timestamp, [force.x, force.y, force.z, torque.x, torque.y, torque.z]))
         elif topic in image_timestamps:
             image_timestamps[topic].append(timestamp)
             if topic in depth_topics:
@@ -383,6 +419,8 @@ def read_episode_streams(
     require_messages(mcap_path, state_topic, len(joint_rows))
     if config.include_gripper:
         require_messages(mcap_path, gripper_topic, len(gripper_rows))
+    if config.wrench_topic is not None:
+        require_messages(mcap_path, config.wrench_topic, len(wrench_rows))
     for topic, timestamps in image_timestamps.items():
         require_messages(mcap_path, topic, len(timestamps))
 
@@ -398,6 +436,16 @@ def read_episode_streams(
             for feature_name, topic in camera_topics.items()
         },
         depth_alignment=depth_alignment,
+        wrench_timestamps=(
+            np.array([wrench_row[0] for wrench_row in wrench_rows])
+            if config.wrench_topic is not None
+            else None
+        ),
+        wrench_values=(
+            np.array([wrench_row[1] for wrench_row in wrench_rows])
+            if config.wrench_topic is not None
+            else None
+        ),
     )
 
 
@@ -422,6 +470,8 @@ def build_time_grid(streams: EpisodeStreams, config: McapConversionConfig) -> np
     ]
     if config.include_gripper:
         all_timestamps.append(streams.gripper_timestamps)
+    if streams.wrench_timestamps is not None:
+        all_timestamps.append(streams.wrench_timestamps)
     start_time = max(timestamps[0] for timestamps in all_timestamps)
     end_time = min(timestamps[-1] for timestamps in all_timestamps)
     grid_length = int(np.floor((end_time - start_time) * config.fps)) + 1
@@ -446,6 +496,13 @@ def build_state_matrix(
         efforts = np.concatenate([efforts, streams.gripper_efforts[gripper_rows, None]], axis=1)
     # Block layout matches packed_feature_names: every position first, then every effort
     return np.concatenate([positions, efforts], axis=1).astype(np.float32)
+
+
+def build_wrench_matrix(streams: EpisodeStreams, time_grid: np.ndarray) -> np.ndarray:
+    if streams.wrench_timestamps is None or streams.wrench_values is None:
+        raise ValueError("The episode streams hold no force-torque sensor messages.")
+    wrench_rows = latest_message_indices(streams.wrench_timestamps, time_grid)
+    return streams.wrench_values[wrench_rows].astype(np.float32)
 
 
 def decode_camera_observations(
@@ -574,6 +631,8 @@ def write_manifest(
     manifest = {
         "include_effort_in_actions": config.include_effort_in_actions,
         "include_gripper": config.include_gripper,
+        "wrench_topic": config.wrench_topic,
+        "wrench_frame_name": config.wrench_frame_name if config.wrench_topic is not None else None,
         "converted": converted_episodes,
         "skipped": skipped_reasons,
     }

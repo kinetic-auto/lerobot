@@ -149,6 +149,19 @@ class WandBConfig:
 
 
 @dataclass
+class MonitorConfig:
+    """Slack thread plus TensorBoard logging for an offline training run.
+
+    The bot token is not a field here. It is read from ``SLACK_BOT_TOKEN`` so it is
+    not written into ``train_config.json``. The channel is ``slack_channel`` or
+    ``SLACK_CHANNEL``.
+    """
+
+    enable: bool = False
+    slack_channel: str | None = None
+
+
+@dataclass
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.

@@ -259,7 +259,8 @@ Single GPU:
     --log_freq=200 \\
     --dataset.split_ratio='[0.9,0.0,0.1]' \\
     --accelerator.mixed_precision=bf16 \\
-    --wandb.enable=false
+    --wandb.enable=false \\
+    --monitor.enable=true
 
 Multi-GPU (DDP; set --num_processes to the GPU count):
 
@@ -281,9 +282,13 @@ Multi-GPU (DDP; set --num_processes to the GPU count):
     --log_freq=200 \\
     --dataset.split_ratio='[0.9,0.0,0.1]' \\
     --accelerator.mixed_precision=bf16 \\
-    --wandb.enable=false
+    --wandb.enable=false \\
+    --monitor.enable=true
 
 Runs land in model_zoo/${DATASET_NAME}/<job_name> on the box.
+Train and test loss curves are in that run's tensorboard/ directory.
+  tensorboard --logdir model_zoo/${DATASET_NAME}/<job_name>/tensorboard
+The Slack thread needs SLACK_BOT_TOKEN and SLACK_CHANNEL in the container environment.
 EOF
 }
 

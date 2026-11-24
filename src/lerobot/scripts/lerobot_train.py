@@ -15,7 +15,7 @@
 # limitations under the License.
 """Train a policy.
 
-Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wandb extras)
+Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wandb, plus slack-sdk and tensorboard)
 
 Launch with torchrun for distributed runs; every parallelism/acceleration knob lives on the
 config (`--parallelism.*`, `--accelerator.*`) so a run is reproducible from its
@@ -47,6 +47,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from lerobot.common.train_monitor import TrainMonitor
 from lerobot.common.train_utils import (
     build_checkpoint_metadata,
     get_step_checkpoint_dir,
@@ -907,6 +908,7 @@ def train(cfg: TrainPipelineConfig):
         dp_world_size=parallel_dims.dp_world_size,
     )
 
+    monitor: TrainMonitor | None = None
     if is_main_process():
         progbar = tqdm(
             total=cfg.steps - step,
@@ -919,6 +921,9 @@ def train(cfg: TrainPipelineConfig):
         logging.info(
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
+        if cfg.monitor.enable:
+            monitor = TrainMonitor(cfg)
+            monitor.start(step)
 
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
@@ -966,25 +971,30 @@ def train(cfg: TrainPipelineConfig):
                 if train_tracker.step_s.avg > 0:
                     train_tracker.samples_per_s = samples_per_step / train_tracker.step_s.avg
                 logging.info(train_tracker)
-                if wandb_logger:
+                if wandb_logger or monitor is not None:
                     # Policy sub-losses (latent_loss, action_loss, ...) are aggregated into the
                     # tracker by update_policy, so to_dict() already carries their windowed,
                     # rank-reduced averages — no per-step output_dict passthrough needed.
-                    wandb_log_dict = train_tracker.to_dict()
+                    train_log_dict = train_tracker.to_dict()
                     # Log sample weighting statistics if enabled
                     if sample_weighter is not None:
                         weighter_stats = sample_weighter.get_stats()
-                        wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
+                        train_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     if ema is not None and ema.cur_decay_value is not None:
-                        wandb_log_dict["ema/decay"] = ema.cur_decay_value
-                        wandb_log_dict["ema/step"] = ema.optimization_step
-                    wandb_logger.log_dict(wandb_log_dict, step)
+                        train_log_dict["ema/decay"] = ema.cur_decay_value
+                        train_log_dict["ema/step"] = ema.optimization_step
+                    if monitor is not None:
+                        monitor.log_scalars(train_log_dict, step)
+                    if wandb_logger:
+                        wandb_logger.log_dict(train_log_dict, step)
             train_tracker.reset_averages()
 
         if is_eval_step:
             eval_loss = _compute_validation_loss(policy, eval_dataloader, accelerator, preprocess_batch)
             if is_main_process():
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                if monitor is not None:
+                    monitor.log_scalars({"eval_loss": eval_loss}, step=step, mode="eval")
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
 
@@ -992,6 +1002,8 @@ def train(cfg: TrainPipelineConfig):
             test_loss = _compute_validation_loss(policy, test_dataloader, accelerator, preprocess_batch)
             if is_main_process():
                 logging.info(f"step {step}: test_loss={test_loss:.4f}")
+                if monitor is not None:
+                    monitor.log_scalars({"loss": test_loss}, step=step, mode="test")
                 if wandb_logger:
                     wandb_logger.log_dict({"test_loss": test_loss}, step=step, mode="eval")
 
@@ -1099,6 +1111,8 @@ def train(cfg: TrainPipelineConfig):
     if is_main_process():
         progbar.close()
         logging.info("End of training")
+        if monitor is not None:
+            monitor.finish(step)
 
     # --- publish (collective-safe: all ranks; the model commit gathers sharded weights) ---------
     if getattr(active_cfg, "push_to_hub", False):

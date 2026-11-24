@@ -128,6 +128,8 @@ training = [
     "lerobot[dataset]",
     "wandb>=0.24.0,<0.28.0",
     "lerobot[accelerate-dep]",
+    "slack-sdk>=3.33.1,<4.0.0",
+    "tensorboard>=2.19.0,<3.0.0",
 ]
 hardware = [
     "lerobot[pynput-dep]",

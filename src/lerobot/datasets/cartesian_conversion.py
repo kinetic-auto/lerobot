@@ -55,7 +55,13 @@ from .compute_stats import compute_episode_stats
 from .dataset_tools import modify_features, recompute_stats
 from .dataset_validation import CONVERSION_MANIFEST_FILE_NAME as MCAP_CONVERSION_MANIFEST_FILE_NAME
 from .io_utils import write_episodes
-from .joint_layout import VALID_JOINT_FIELDS, feature_channel_names, io_block_layout
+from .joint_layout import (
+    SENSOR_WRENCH_CHANNEL_NAMES,
+    SENSOR_WRENCH_FEATURE_KEY,
+    VALID_JOINT_FIELDS,
+    feature_channel_names,
+    io_block_layout,
+)
 from .lerobot_dataset import LeRobotDataset
 from .utils import DATA_DIR, DEFAULT_EPISODES_PATH
 
@@ -64,6 +70,9 @@ CARTESIAN_CONVERSION_MANIFEST_FILE_NAME = "cartesian_conversion_manifest.json"
 _EE_NAME_HINTS = ("tcp", "hand", "ee", "wrist")
 _JOINT_ANGLE_UNITS = ("rad", "deg")
 _JACOBIAN_FRAME_REFERENCES = ("local", "world", "local_world_aligned")
+JOINT_EFFORT_WRENCH_SOURCE = "joint_effort"
+FT_SENSOR_WRENCH_SOURCE = "ft_sensor_wrench"
+_WRENCH_SOURCES = (JOINT_EFFORT_WRENCH_SOURCE, FT_SENSOR_WRENCH_SOURCE)
 _GRIPPER_OPEN_SIDES = ("max", "min")
 _SINGULAR_JACOBIAN_COND_THRESHOLD = 1e3
 _FORCE_HISTOGRAM_EDGES_N = (0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, float("inf"))
@@ -88,6 +97,11 @@ class JointToCartesianConversionConfig:
     jacobian_frame_reference: str = "local"
     # Subtract static gravity torques before solving the end-effector wrench.
     subtract_gravity: bool = True
+    # Source of the end-effector force and torque: joint_effort solves them from the joint efforts,
+    # ft_sensor_wrench transforms the force-torque sensor reading of observation.wrench.
+    wrench_source: str = JOINT_EFFORT_WRENCH_SOURCE
+    # URDF link the force-torque sensor reading is expressed in.
+    wrench_sensor_frame: str = "tool0"
     # Prompt for the frame and joint map when they are not set.
     interactive: bool = True
     # Write the IK round-trip, EE pose frame-delta, and wrench stats.
@@ -225,6 +239,9 @@ def convert_joints_to_cartesian(
     # Resolve the URDF chain, joint map, and arm/gripper split.
     dataset_joint_names = _union_joint_names(list(feature_layouts.values()))
     urdf_joints = parse_urdf_joints(config.urdf)
+    use_sensor_wrench = config.wrench_source == FT_SENSOR_WRENCH_SOURCE
+    if use_sensor_wrench:
+        _validate_sensor_wrench_layouts(feature_layouts, urdf_joints, config.wrench_sensor_frame)
     kinematic_chain_to_target_frame, joint_map, target_frame = _resolve_frame_and_map(
         urdf_joints, dataset_joint_names, config
     )
@@ -255,8 +272,10 @@ def convert_joints_to_cartesian(
             break
 
     # Read packed columns.
-    columns = _read_parquet_columns(dataset, [*load_keys, "episode_index"])
+    sensor_wrench_keys = [SENSOR_WRENCH_FEATURE_KEY] if use_sensor_wrench else []
+    columns = _read_parquet_columns(dataset, [*load_keys, *sensor_wrench_keys, "episode_index"])
     matrices = {key: columns[key] for key in load_keys}
+    sensor_wrench_matrix = columns[SENSOR_WRENCH_FEATURE_KEY] if use_sensor_wrench else None
     episode_index = np.asarray(columns["episode_index"], dtype=np.int64).reshape(-1)
     if len(episode_index) == 0:
         raise ValueError("Dataset has no frames to convert.")
@@ -273,6 +292,9 @@ def convert_joints_to_cartesian(
     if first_layout.gripper_joints:
         logging.info("Gripper joints: %s", ", ".join(first_layout.gripper_joints))
     logging.info("Joint map: %s", joint_map)
+    logging.info("Wrench source: %s", config.wrench_source)
+    if use_sensor_wrench:
+        logging.info("Wrench sensor frame: %s", config.wrench_sensor_frame)
 
     # Convert the features and write the new dataset.
     with tempfile.TemporaryDirectory() as tmp:
@@ -319,6 +341,7 @@ def convert_joints_to_cartesian(
                 q_matrix=matrices[q_key] if uses_sibling_positions and q_key is not None else None,
                 q_layout=q_layout if uses_sibling_positions else None,
                 feature_key=key,
+                sensor_wrench_matrix=sensor_wrench_matrix if key == OBS_STATE else None,
             )
             logging.info("%s output channels: %s", key, converted_names[key])
 
@@ -462,6 +485,52 @@ def _validate_config(
         invalid = [field_name for field_name in config.convert_fields if field_name not in VALID_JOINT_FIELDS]
         if invalid:
             raise ValueError(f"convert_fields must be position, velocity, and/or effort, got {invalid}.")
+    if config.wrench_source not in _WRENCH_SOURCES:
+        raise ValueError(f"wrench_source must be one of {_WRENCH_SOURCES}, got {config.wrench_source!r}.")
+    if config.wrench_source == FT_SENSOR_WRENCH_SOURCE:
+        _validate_sensor_wrench_feature(dataset)
+
+
+def _validate_sensor_wrench_feature(dataset: LeRobotDataset) -> None:
+    feature = dataset.meta.features.get(SENSOR_WRENCH_FEATURE_KEY)
+    if feature is None:
+        raise ValueError(
+            f"wrench_source {FT_SENSOR_WRENCH_SOURCE!r} needs the {SENSOR_WRENCH_FEATURE_KEY} feature. "
+            "Convert the MCAP session with --wrench_topic."
+        )
+    channel_names = feature_channel_names(feature)
+    if channel_names != SENSOR_WRENCH_CHANNEL_NAMES:
+        raise ValueError(
+            f"{SENSOR_WRENCH_FEATURE_KEY} channels must be {SENSOR_WRENCH_CHANNEL_NAMES}, got {channel_names}."
+        )
+
+
+def _validate_sensor_wrench_layouts(
+    feature_layouts: Mapping[str, JointSpaceLayout],
+    urdf_joints: Sequence[UrdfJoint],
+    wrench_sensor_frame: str,
+) -> None:
+    state_layout = feature_layouts.get(OBS_STATE)
+    if state_layout is None or "effort" not in state_layout.resolve_convert_fields():
+        raise ValueError(
+            f"wrench_source {FT_SENSOR_WRENCH_SOURCE!r} replaces the effort channels of {OBS_STATE}, "
+            "so that feature and its effort field must be converted."
+        )
+    features_with_effort = [
+        key
+        for key, layout in feature_layouts.items()
+        if key != OBS_STATE and "effort" in layout.resolve_convert_fields()
+    ]
+    if features_with_effort:
+        raise ValueError(
+            f"wrench_source {FT_SENSOR_WRENCH_SOURCE!r} converts the effort of {OBS_STATE} only. "
+            f"{features_with_effort} also hold effort channels."
+        )
+    urdf_link_names = {joint.parent_link for joint in urdf_joints} | {
+        joint.child_link for joint in urdf_joints
+    }
+    if wrench_sensor_frame not in urdf_link_names:
+        raise ValueError(f"wrench_sensor_frame {wrench_sensor_frame!r} is not a link of the URDF.")
 
 
 def _resolve_frame_and_map(
@@ -807,6 +876,7 @@ def _convert_joint_matrix(
     q_matrix: np.ndarray | None = None,
     q_layout: JointSpaceLayout | None = None,
     feature_key: str = "",
+    sensor_wrench_matrix: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     convert_set = set(layout.resolve_convert_fields())
     names: list[str] | None = None
@@ -835,6 +905,8 @@ def _convert_joint_matrix(
             jacobian_frame_reference=config.jacobian_frame_reference,
             subtract_gravity=config.subtract_gravity,
             base_frame=base_frame,
+            sensor_wrench=None if sensor_wrench_matrix is None else sensor_wrench_matrix[index],
+            wrench_sensor_frame=config.wrench_sensor_frame,
         )
 
         # Keep the first frame's channel names for every later frame.
@@ -929,6 +1001,8 @@ def convert_joint_frame(
     jacobian_frame_reference: str = "local_world_aligned",
     subtract_gravity: bool = True,
     base_frame: str | None = None,
+    sensor_wrench: np.ndarray | None = None,
+    wrench_sensor_frame: str | None = None,
 ) -> CartesianFrameSample:
     """Map one joint sample to pose, twist, wrench, and gripper positions.
 
@@ -938,19 +1012,22 @@ def convert_joint_frame(
         qd (np.ndarray | None): Arm joint velocities in rad/s.
         tau (np.ndarray | None): Arm joint torques in N·m.
         layout (JointSpaceLayout): Source channel layout.
+        sensor_wrench (np.ndarray | None): Force-torque sensor reading used for the wrench.
+        wrench_sensor_frame (str | None): URDF link of the sensor reading.
 
     Returns:
         CartesianFrameSample: Cartesian sample.
     """
     convert_set = set(layout.resolve_convert_fields())
     needs_fk = "position" in convert_set
-    needs_jac = "velocity" in convert_set or "effort" in convert_set
+    uses_sensor_wrench = "effort" in convert_set and sensor_wrench is not None
+    needs_jac = "velocity" in convert_set or ("effort" in convert_set and not uses_sensor_wrench)
     jacobian = None
     transform = None
     q_values: np.ndarray | None = None
 
     # Compute FK and the Jacobian for the requested fields.
-    if needs_fk or needs_jac:
+    if needs_fk or needs_jac or uses_sensor_wrench:
         if q_deg is None:
             raise ValueError("Joint positions are required to convert pose, twist, or wrench.")
         q_values = np.asarray(q_deg, dtype=np.float64)
@@ -961,7 +1038,7 @@ def convert_joint_frame(
     external_tau = None if tau is None else np.asarray(tau, dtype=np.float64)
 
     # Subtract gravity from measured torques.
-    if "effort" in convert_set and external_tau is not None and subtract_gravity:
+    if "effort" in convert_set and external_tau is not None and subtract_gravity and not uses_sensor_wrench:
         if base_frame is None:
             raise ValueError("base_frame is required when subtract_gravity is true.")
         external_tau = external_tau - _compute_gravity_torques(kinematics, base_frame)
@@ -998,6 +1075,12 @@ def convert_joint_frame(
                 raise ValueError("Jacobian is required to convert velocity.")
             twist = jacobian @ np.asarray(qd, dtype=np.float64)
             quantities.append(FrameTwist(linear=twist[:3], angular=twist[3:]))
+        elif field_name == "effort" and uses_sensor_wrench:
+            quantities.append(
+                _transform_sensor_wrench_to_target_frame(
+                    kinematics, q_values, sensor_wrench, wrench_sensor_frame, jacobian_frame_reference
+                )
+            )
         elif field_name == "effort":
             if external_tau is None:
                 raise ValueError("Effort field is present but no joint torque was provided.")
@@ -1020,6 +1103,46 @@ def convert_joint_frame(
                 )
             )
     return CartesianFrameSample(quantities=tuple(quantities), fields=tuple(layout.fields))
+
+
+def _transform_sensor_wrench_to_target_frame(
+    kinematics: RobotKinematics,
+    joint_positions_degrees: np.ndarray | None,
+    sensor_wrench: np.ndarray | None,
+    wrench_sensor_frame: str | None,
+    jacobian_frame_reference: str,
+) -> FrameWrench:
+    if joint_positions_degrees is None or sensor_wrench is None or wrench_sensor_frame is None:
+        raise ValueError(
+            "Joint positions, a sensor wrench and its frame are required to transform the wrench."
+        )
+    target_frame_in_world = kinematics.forward_kinematics(joint_positions_degrees)
+    sensor_frame_in_world = np.asarray(kinematics.robot.get_T_world_frame(wrench_sensor_frame))
+    return transform_wrench_to_target_frame(
+        np.asarray(sensor_wrench, dtype=np.float64),
+        sensor_frame_in_world,
+        target_frame_in_world,
+        jacobian_frame_reference,
+    )
+
+
+def transform_wrench_to_target_frame(
+    sensor_wrench: np.ndarray,
+    sensor_frame_in_world: np.ndarray,
+    target_frame_in_world: np.ndarray,
+    jacobian_frame_reference: str,
+) -> FrameWrench:
+    sensor_rotation = sensor_frame_in_world[:3, :3]
+    force = sensor_rotation @ sensor_wrench[:3]
+
+    reference_origin = np.zeros(3) if jacobian_frame_reference == "world" else target_frame_in_world[:3, 3]
+    torque = sensor_rotation @ sensor_wrench[3:] + np.cross(
+        sensor_frame_in_world[:3, 3] - reference_origin, force
+    )
+    if jacobian_frame_reference == "local":
+        target_rotation = target_frame_in_world[:3, :3]
+        force, torque = target_rotation.T @ force, target_rotation.T @ torque
+    return FrameWrench(force=force, torque=torque)
 
 
 def _compute_gravity_torques(kinematics: RobotKinematics, base_frame: str) -> np.ndarray:
@@ -1069,9 +1192,12 @@ def _write_converted_dataset(
                 raise ValueError(f"{dest} already exists; cannot keep the original joint features.")
             feature = dataset.meta.features[key]
             add_features[dest] = (_cast_to_feature_dtype(original[key], feature), dict(feature))
+    # The sensor reading is in the state as the end-effector wrench, so its own feature is dropped.
+    remove_features = [SENSOR_WRENCH_FEATURE_KEY] if config.wrench_source == FT_SENSOR_WRENCH_SOURCE else None
     return modify_features(
         dataset,
         add_features=add_features or None,
+        remove_features=remove_features,
         replace_features=replace_features,
         output_dir=output_dir,
         repo_id=repo_id,
@@ -1796,6 +1922,10 @@ def _write_provenance(
         "orientation": "rotation_6d_columns",
         "jacobian_frame_reference": config.jacobian_frame_reference,
         "subtract_gravity": config.subtract_gravity,
+        "wrench_source": config.wrench_source,
+        "wrench_sensor_frame": (
+            config.wrench_sensor_frame if config.wrench_source == FT_SENSOR_WRENCH_SOURCE else None
+        ),
         "feature_keys": list(channel_names),
         "convert_fields": config.convert_fields,
         "channel_names": channel_names,

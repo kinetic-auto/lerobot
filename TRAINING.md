@@ -46,6 +46,7 @@ Flags:
 - `--fps` (default: 10), `--action_lookahead_frames` (default: 3), `--task`, `--robot_type`.
 - `--include_effort_in_actions`: keep the joint and gripper efforts in `action` (default: false, positions only).
 - `--include_gripper`: write the gripper channels to `observation.state` and `action` (default: true). With `false` the state and action hold the joints only, and the gripper topic is not required in the recording.
+- `--wrench_topic`: force-torque sensor topic to write as `observation.wrench`, force x, y, z then torque x, y, z, as recorded (default: unset, no sensor feature). For the teleop recordings it is `/force_torque_sensor_broadcaster/wrench`. `--wrench_frame_name` is the frame the messages must be in (default: `tool0_controller`); an episode in another frame is skipped.
 - `--camera_feature_names`: dataset camera names, matched to `topics_mapping` (default: `pc1`, `realsense`, `realsense_depth`). A name ending in `_depth` is stored as a depth map.
 - `--img_sizes`: `[width, height]` per camera name (default: `[640, 360]` for each camera).
 - `--joint_names`: joints in dataset order (default: the six UR joints, shoulder pan to wrist 3).
@@ -77,6 +78,8 @@ lerobot-dataset-valid \
 ```
 
 To express the dataset as end-effector pose, gripper opening and wrench, convert it with the robot's URDF and its kinematics calibration. Force and torque are written in the end-effector frame. See `docs/source/using_dataset_tools.mdx` for every flag.
+
+By default the force and torque are solved from the joint efforts. With `--operation.wrench_source ft_sensor_wrench` they come from the force-torque sensor reading in `observation.wrench` (a dataset converted with `--wrench_topic`), moved from `--operation.wrench_sensor_frame` (default: `tool0`, the URDF link that coincides with `tool0_controller`) to the target frame.
 
 ```bash
 lerobot-edit-dataset \

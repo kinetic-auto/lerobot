@@ -1,0 +1,92 @@
+# Manual Lambda Cloud API client for one single-GPU on-demand instance.
+# Does not SSH, sync a dataset, or start training.
+#
+# Requires the repository secret LAMBDA_CLOUD_API_KEY:
+#   gh secret set LAMBDA_CLOUD_API_KEY --repo kinetic-auto/lerobot
+
+name: Lambda instance
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Lambda Cloud API operation
+        type: choice
+        required: true
+        default: list-types
+        options:
+          - list-types
+          - list-instances
+          - list-ssh-keys
+          - launch
+          - status
+          - terminate
+      instance_type:
+        description: Single-GPU instance type (gpu_1x_*)
+        type: string
+        required: false
+        default: gpu_1x_a10
+      region:
+        description: Region, or empty to pick the first region with capacity
+        type: string
+        required: false
+        default: ""
+      ssh_key_name:
+        description: Lambda SSH key name (required for launch)
+        type: string
+        required: false
+        default: ""
+      instance_id:
+        description: Instance id (required for status and terminate)
+        type: string
+        required: false
+        default: ""
+      name:
+        description: Instance name on launch
+        type: string
+        required: false
+        default: lerobot-train
+
+# A second dispatch waits. It does not cancel a launch that is already billed.
+concurrency:
+  group: lambda-instance
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  lambda-cloud:
+    name: Lambda Cloud API
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require Lambda API key
+        env:
+          LAMBDA_CLOUD_API_KEY: ${{ secrets.LAMBDA_CLOUD_API_KEY }}
+        run: |
+          if [[ -z "${LAMBDA_CLOUD_API_KEY}" ]]; then
+            echo "error: repository secret LAMBDA_CLOUD_API_KEY is not set" >&2
+            exit 1
+          fi
+
+      - name: Call Lambda Cloud API
+        env:
+          LAMBDA_CLOUD_API_KEY: ${{ secrets.LAMBDA_CLOUD_API_KEY }}
+          OPERATION: ${{ inputs.operation }}
+          INSTANCE_TYPE: ${{ inputs.instance_type }}
+          REGION: ${{ inputs.region }}
+          SSH_KEY_NAME: ${{ inputs.ssh_key_name }}
+          INSTANCE_ID: ${{ inputs.instance_id }}
+          INSTANCE_NAME: ${{ inputs.name }}
+        run: |
+          ./scripts/lambda_cloud.sh "${OPERATION}" \
+            --instance-type "${INSTANCE_TYPE}" \
+            --region "${REGION}" \
+            --ssh-key-name "${SSH_KEY_NAME}" \
+            --instance-id "${INSTANCE_ID}" \
+            --name "${INSTANCE_NAME}"

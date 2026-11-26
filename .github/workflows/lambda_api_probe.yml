@@ -1,0 +1,74 @@
+# Read-only Lambda Cloud probes for the feature branch.
+# Does not launch, restart, or terminate instances.
+#
+# Runs on push because this branch has no pull request yet.
+# Requires the repository secret LAMBDA_CLOUD_API_KEY:
+#   gh secret set LAMBDA_CLOUD_API_KEY --repo kinetic-auto/lerobot
+
+name: Lambda API probe
+
+on:
+  push:
+    branches:
+      - feat/tensorboard-training
+  workflow_dispatch:
+
+concurrency:
+  group: lambda-api-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  require-key:
+    name: Require API key
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require Lambda Cloud API key
+        env:
+          LAMBDA_CLOUD_API_KEY: ${{ secrets.LAMBDA_CLOUD_API_KEY }}
+        run: |
+          if [[ -z "${LAMBDA_CLOUD_API_KEY}" ]]; then
+            echo "error: repository secret LAMBDA_CLOUD_API_KEY is not set" >&2
+            exit 1
+          fi
+
+  list-types:
+    name: List instance types
+    needs: require-key
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List instance types
+        env:
+          LAMBDA_CLOUD_API_KEY: ${{ secrets.LAMBDA_CLOUD_API_KEY }}
+        run: ./scripts/lambda_cloud.sh list-types
+
+  list-instances:
+    name: List instances
+    needs: require-key
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List instances
+        env:
+          LAMBDA_CLOUD_API_KEY: ${{ secrets.LAMBDA_CLOUD_API_KEY }}
+        run: ./scripts/lambda_cloud.sh list-instances
+
+  list-ssh-keys:
+    name: List SSH keys
+    needs: require-key
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List SSH keys
+        env:
+          LAMBDA_CLOUD_API_KEY: ${{ secrets.LAMBDA_CLOUD_API_KEY }}
+        run: ./scripts/lambda_cloud.sh list-ssh-keys

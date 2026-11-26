@@ -1,0 +1,17 @@
+---
+# Runner binary, pinned for first install only; the service self-updates after that.
+# github_runner_dir is set in group_vars/all.yaml.
+github_runner_version: "2.335.1"
+github_runner_checksum_map:
+  amd64: "sha256:4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf"
+github_runner_arch_map:
+  amd64: x64
+github_runner_label_map:
+  amd64: X64
+
+github_runner_service_user: kinetic
+# Distinct from the manager unit's kinetic-runner.service alias.
+github_runner_service_alias: lerobot-runner.service
+# kinetic-auto/lerobot + runner name supertower. Do not discover actions.runner.*
+# with head -1; that selects the existing manager unit.
+github_runner_service: "actions.runner.{{ github_repo_slug | replace('/', '-') }}.{{ inventory_hostname }}.service"

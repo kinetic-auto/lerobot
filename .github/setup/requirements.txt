@@ -1,0 +1,9 @@
+# Control-machine deps for .github/setup/runner-configure.sh
+# Installed into .github/setup/venv/ (gitignored) on first script run.
+#
+# `ansible` is the community package: ansible-core plus bundled collections
+# (ansible.posix, community.general, ...) so playbooks do not need Galaxy.
+# 9.x → core 2.16; 12.x → core 2.19 (same range as former ansible-core<2.20).
+ansible>=9.0.0,<13.0.0
+questionary>=2.0.0,<3
+PyYAML>=6.0,<7

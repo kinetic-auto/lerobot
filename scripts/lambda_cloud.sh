@@ -4,7 +4,8 @@
 #
 #   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh list-types
 #   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh launch \
-#     --instance-type gpu_1x_a10 --ssh-key-name <name>
+#     --ssh-key-name <name>
+#   # --instance-type defaults to auto: cheapest gpu_1x_* with capacity
 #   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh status --instance-id <id>
 #   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh terminate --instance-id <id>
 #
@@ -24,7 +25,7 @@ POLL_INTERVAL_SECONDS=15
 POLL_TIMEOUT_SECONDS=600
 
 OPERATION=""
-INSTANCE_TYPE="gpu_1x_a10"
+INSTANCE_TYPE="auto"
 REGION=""
 SSH_KEY_NAME=""
 INSTANCE_ID=""
@@ -171,6 +172,36 @@ list_ssh_keys() {
     jq -r '.data[].name' <<<"${body}"
 }
 
+# INSTANCE_TYPE=auto picks the cheapest gpu_1x_* type that has capacity.
+# When REGION is already set, only types offered in that region are eligible.
+resolve_instance_type() {
+    local body choice
+    [[ "${INSTANCE_TYPE}" == "auto" ]] || return 0
+    body=$(api GET /instance-types)
+    choice=$(jq -r --arg region "${REGION}" '
+        .data
+        | to_entries
+        | map(select(.key | test("^gpu_1x_[a-z0-9_]+$")))
+        | map(select(
+            if $region == "" then
+              ((.value.regions_with_capacity_available // []) | length) > 0
+            else
+              ([.value.regions_with_capacity_available[]?.name] | index($region)) != null
+            end
+          ))
+        | sort_by(.value.instance_type.price_cents_per_hour)
+        | .[0].key // empty
+    ' <<<"${body}")
+    if [[ -z "${choice}" ]]; then
+        if [[ -n "${REGION}" ]]; then
+            die "no single-GPU capacity in ${REGION}"
+        fi
+        die "no single-GPU instance type has capacity"
+    fi
+    INSTANCE_TYPE="${choice}"
+    log "auto-selected ${INSTANCE_TYPE}"
+}
+
 load_instance_type() {
     local body entry regions price description
     body=$(api GET /instance-types)
@@ -195,11 +226,12 @@ load_instance_type() {
 
 launch_instance() {
     local payload body instance_id
-    require_single_gpu
     [[ -n "${SSH_KEY_NAME}" ]] || die "--ssh-key-name is required for launch"
     [[ ${#INSTANCE_NAME} -le 64 ]] || die "instance name must be 64 characters or fewer"
     require_api_key
     require_tools
+    resolve_instance_type
+    require_single_gpu
     load_instance_type
 
     payload=$(jq -n \
@@ -338,12 +370,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${OPERATION}" ]] || die "operation is required (list-types, list-instances, list-ssh-keys, launch, status, terminate)"
-[[ -n "${INSTANCE_TYPE}" ]] || INSTANCE_TYPE="gpu_1x_a10"
+if [[ "${OPERATION}" == "launch" && -z "${INSTANCE_TYPE}" ]]; then
+    INSTANCE_TYPE="auto"
+fi
 [[ -n "${INSTANCE_NAME}" ]] || INSTANCE_NAME="lerobot-train"
 
 case "${OPERATION}" in
     launch)
-        require_single_gpu
+        if [[ "${INSTANCE_TYPE}" != "auto" ]]; then
+            require_single_gpu
+        fi
         [[ -n "${SSH_KEY_NAME}" ]] || die "--ssh-key-name is required for launch"
         [[ ${#INSTANCE_NAME} -le 64 ]] || die "instance name must be 64 characters or fewer"
         ;;

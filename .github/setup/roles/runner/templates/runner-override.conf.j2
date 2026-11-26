@@ -1,0 +1,10 @@
+[Unit]
+After=network-online.target
+Wants=network-online.target
+
+[Install]
+Alias={{ github_runner_service_alias }}
+
+[Service]
+Restart=on-failure
+RestartSec=30

@@ -1,0 +1,7 @@
+---
+- name: Register the lerobot GitHub runner on supertower
+  hosts: all
+  tasks:
+    - name: Run runner role
+      ansible.builtin.include_role:
+        name: runner

@@ -1,0 +1,8 @@
+---
+# One existing host. ansible_host is the IP; the inventory name is the
+# runner name and the extra GitHub label. Do not use mDNS.
+all:
+  hosts:
+    supertower:
+      ansible_host: 192.168.1.219
+      runner_arch: amd64

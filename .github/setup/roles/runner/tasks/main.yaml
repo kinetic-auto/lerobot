@@ -1,0 +1,205 @@
+---
+# Registers one repo-scoped runner for kinetic-auto/lerobot.
+# Installs only under github_runner_dir. Does not inspect or edit the
+# manager runner at /home/kinetic/actions-runner.
+
+- name: Check for an existing lerobot runner registration
+  ansible.builtin.stat:
+    path: "{{ github_runner_dir }}/.runner"
+  register: runner_file
+
+- name: Record whether config.sh is still required
+  ansible.builtin.set_fact:
+    runner_is_registered: "{{ runner_file.stat.exists }}"
+    runner_registration_needed: "{{ not runner_file.stat.exists }}"
+
+- name: Skip registration (already configured)
+  ansible.builtin.debug:
+    msg: >-
+      Runner already configured at {{ github_runner_dir }}/.runner.
+      Leaving the existing registration in place.
+  when: runner_is_registered | bool
+
+- name: Register runner with GitHub
+  when: runner_registration_needed | bool
+  block:
+    - name: Request runner registration token (control machine)
+      ansible.builtin.command:
+        argv:
+          - gh
+          - api
+          - --method
+          - POST
+          - "repos/{{ github_repo_slug }}/actions/runners/registration-token"
+          - --jq
+          - .token
+      delegate_to: localhost
+      become: false
+      environment:
+        GH_PROMPT_DISABLED: "1"
+      register: github_registration_token_cmd
+      changed_when: false
+      no_log: true
+
+    - name: Set registration token fact
+      ansible.builtin.set_fact:
+        github_runner_registration_token: "{{ github_registration_token_cmd.stdout | trim }}"
+      no_log: true
+
+    - name: Require a registration token
+      ansible.builtin.assert:
+        that: github_runner_registration_token | length > 0
+        fail_msg: >-
+          gh did not return a registration token for {{ github_repo_slug }}.
+          Authenticate with admin access to that repo and retry.
+      no_log: true
+
+    - name: Ensure the lerobot runner directory exists
+      ansible.builtin.file:
+        path: "{{ github_runner_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download GitHub Actions runner tarball
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/actions/runner/releases/download/v{{ github_runner_version }}/actions-runner-linux-{{ github_runner_arch_map[runner_arch] }}-{{ github_runner_version }}.tar.gz
+        dest: "/tmp/actions-runner-linux-{{ github_runner_arch_map[runner_arch] }}-{{ github_runner_version }}.tar.gz"
+        checksum: "{{ github_runner_checksum_map[runner_arch] }}"
+        mode: "0644"
+      register: runner_tarball_download
+
+    - name: Extract GitHub Actions runner tarball
+      ansible.builtin.unarchive:
+        src: "{{ runner_tarball_download.dest }}"
+        dest: "{{ github_runner_dir }}"
+        remote_src: true
+
+    - name: Install runner OS dependencies (best-effort)
+      ansible.builtin.command: ./bin/installdependencies.sh
+      args:
+        chdir: "{{ github_runner_dir }}"
+      become: true
+      register: install_deps_result
+      changed_when: false
+      failed_when: false
+
+    - name: Configure GitHub Actions runner (unattended)
+      ansible.builtin.command:
+        argv:
+          - ./config.sh
+          - --unattended
+          - --url
+          - "{{ github_repo_url }}"
+          - --token
+          - "{{ github_runner_registration_token }}"
+          - --name
+          - "{{ inventory_hostname }}"
+          - --labels
+          - "self-hosted,Linux,{{ github_runner_label_map[runner_arch] }},{{ inventory_hostname }}"
+          - --work
+          - _work
+      args:
+        chdir: "{{ github_runner_dir }}"
+      changed_when: true
+      no_log: true
+
+    - name: Mark runner as registered after config.sh
+      ansible.builtin.set_fact:
+        runner_is_registered: true
+
+    - name: Report runner registration complete
+      ansible.builtin.debug:
+        msg: "Runner '{{ inventory_hostname }}' registered at {{ github_runner_dir }}"
+
+- name: Manage the lerobot runner systemd service
+  when: runner_is_registered | bool
+  block:
+    - name: Check svc.sh exists
+      ansible.builtin.stat:
+        path: "{{ github_runner_dir }}/svc.sh"
+      register: svc_sh_stat
+
+    - name: Require svc.sh in the lerobot runner directory
+      ansible.builtin.assert:
+        that: svc_sh_stat.stat.exists
+        fail_msg: "GitHub Actions runner svc.sh not found at {{ github_runner_dir }}/svc.sh"
+
+    - name: Check whether the lerobot runner unit is installed
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ github_runner_service }}"
+      register: lerobot_unit_file
+
+    - name: Install the lerobot runner service via svc.sh
+      ansible.builtin.command: ./svc.sh install
+      args:
+        chdir: "{{ github_runner_dir }}"
+      become: true
+      when: not lerobot_unit_file.stat.exists
+
+    - name: Reload systemd so the new lerobot unit is visible
+      ansible.builtin.systemd:
+        daemon_reload: true
+      become: true
+      when: not lerobot_unit_file.stat.exists
+
+    - name: Require the lerobot runner unit
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ github_runner_service }}"
+      register: lerobot_unit_installed
+
+    - name: Fail unless the lerobot unit exists
+      ansible.builtin.assert:
+        that: lerobot_unit_installed.stat.exists
+        fail_msg: >-
+          Expected {{ github_runner_service }} after svc.sh install.
+          Refusing to select another actions.runner unit on this host.
+
+    - name: Read the service user
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - "{{ github_runner_service }}"
+          - -p
+          - User
+          - --value
+      register: runner_service_user
+      changed_when: false
+      become: true
+
+    - name: Require the service to run as kinetic
+      ansible.builtin.assert:
+        that: runner_service_user.stdout | trim == github_runner_service_user
+        fail_msg: >-
+          {{ github_runner_service }} User is
+          '{{ runner_service_user.stdout | trim }}', expected
+          '{{ github_runner_service_user }}'.
+
+    - name: Ensure the lerobot runner override directory exists
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ github_runner_service }}.d"
+        state: directory
+        mode: "0755"
+      become: true
+
+    - name: Install the systemd override for the lerobot runner
+      ansible.builtin.template:
+        src: runner-override.conf.j2
+        dest: "/etc/systemd/system/{{ github_runner_service }}.d/override.conf"
+        mode: "0644"
+      become: true
+      register: runner_override_installed
+
+    - name: Reload systemd after the lerobot override changes
+      ansible.builtin.systemd:
+        daemon_reload: true
+      become: true
+      when: runner_override_installed is changed
+
+    - name: Enable and start the lerobot runner service
+      ansible.builtin.systemd:
+        name: "{{ github_runner_service }}"
+        enabled: true
+        state: "{{ 'restarted' if runner_override_installed is changed else 'started' }}"
+      become: true

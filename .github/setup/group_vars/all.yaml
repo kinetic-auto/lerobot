@@ -1,0 +1,6 @@
+---
+ansible_user: kinetic
+github_runner_dir: /home/kinetic/actions-runner-lerobot
+
+github_repo_url: "https://github.com/kinetic-auto/lerobot"
+github_repo_slug: "kinetic-auto/lerobot"

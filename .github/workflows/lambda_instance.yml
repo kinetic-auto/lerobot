@@ -1,48 +1,34 @@
-# Manual Lambda Cloud API client for one single-GPU on-demand instance.
-# Does not SSH, sync a dataset, or start training.
+# Launch one single-GPU Lambda instance, then a host check.
+# Does not list, terminate, sync a dataset, or start training.
+# A push to feat/tensorboard-training launches too, and auto picks the GPU type.
 #
 # Requires the repository secret LAMBDA_CLOUD_API_KEY:
 #   gh secret set LAMBDA_CLOUD_API_KEY --repo kinetic-auto/lerobot
+#
+# The Lambda SSH key named supertower is the public key at
+# kinetic@supertower:~/.ssh/id_ed25519.pub. This job runs on that host
+# so it can SSH to the new instance with the matching private key.
 
 name: Lambda instance
 
 on:
+  push:
+    branches:
+      - feat/tensorboard-training
   workflow_dispatch:
     inputs:
-      operation:
-        description: Lambda Cloud API operation
-        type: choice
-        required: true
-        default: list-types
-        options:
-          - list-types
-          - list-instances
-          - list-ssh-keys
-          - launch
-          - status
-          - terminate
       instance_type:
-        description: Single-GPU instance type (gpu_1x_*)
+        description: gpu_1x_* type, or auto for the cheapest type with capacity
         type: string
         required: false
-        default: gpu_1x_a10
+        default: auto
       region:
         description: Region, or empty to pick the first region with capacity
         type: string
         required: false
         default: ""
-      ssh_key_name:
-        description: Lambda SSH key name (required for launch)
-        type: string
-        required: false
-        default: ""
-      instance_id:
-        description: Instance id (required for status and terminate)
-        type: string
-        required: false
-        default: ""
       name:
-        description: Instance name on launch
+        description: Instance name
         type: string
         required: false
         default: lerobot-train
@@ -56,10 +42,10 @@ permissions:
   contents: read
 
 jobs:
-  lambda-cloud:
-    name: Lambda Cloud API
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  launch:
+    name: Launch instance
+    runs-on: [self-hosted, X64, supertower]
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -74,19 +60,79 @@ jobs:
             exit 1
           fi
 
-      - name: Call Lambda Cloud API
+      - name: Launch instance
+        id: launch
         env:
           LAMBDA_CLOUD_API_KEY: ${{ secrets.LAMBDA_CLOUD_API_KEY }}
-          OPERATION: ${{ inputs.operation }}
-          INSTANCE_TYPE: ${{ inputs.instance_type }}
+          INSTANCE_TYPE: ${{ inputs.instance_type || 'auto' }}
           REGION: ${{ inputs.region }}
-          SSH_KEY_NAME: ${{ inputs.ssh_key_name }}
-          INSTANCE_ID: ${{ inputs.instance_id }}
-          INSTANCE_NAME: ${{ inputs.name }}
+          INSTANCE_NAME: ${{ inputs.name || 'lerobot-train' }}
         run: |
-          ./scripts/lambda_cloud.sh "${OPERATION}" \
+          set -euo pipefail
+          output="${RUNNER_TEMP}/lambda-launch.txt"
+          ./scripts/lambda_cloud.sh launch \
             --instance-type "${INSTANCE_TYPE}" \
             --region "${REGION}" \
-            --ssh-key-name "${SSH_KEY_NAME}" \
-            --instance-id "${INSTANCE_ID}" \
-            --name "${INSTANCE_NAME}"
+            --ssh-key-name supertower \
+            --name "${INSTANCE_NAME}" | tee "${output}"
+          instance_id="$(awk -F= '$1 == "instance_id" { print $2 }' "${output}" | tail -n 1)"
+          ip="$(awk -F= '$1 == "ip" { print $2 }' "${output}" | tail -n 1)"
+          if [[ -z "${instance_id}" || -z "${ip}" ]]; then
+            echo "error: launch did not print instance_id and ip" >&2
+            exit 1
+          fi
+          echo "instance_id=${instance_id}" >> "${GITHUB_OUTPUT}"
+          echo "ip=${ip}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check host commands for setup_lambda_train.sh
+        env:
+          INSTANCE_IP: ${{ steps.launch.outputs.ip }}
+        run: |
+          set -euo pipefail
+          key="${HOME}/.ssh/id_ed25519"
+          if [[ ! -f "${key}" ]]; then
+            echo "error: ${key} is not on this runner" >&2
+            exit 1
+          fi
+          ssh_opts=(
+            -i "${key}"
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=accept-new
+            -o ConnectTimeout=10
+            -o BatchMode=yes
+          )
+          deadline=$(( $(date +%s) + 180 ))
+          until ssh "${ssh_opts[@]}" "ubuntu@${INSTANCE_IP}" true; do
+            if (( $(date +%s) >= deadline )); then
+              echo "error: ssh to ubuntu@${INSTANCE_IP} did not come up within 3 minutes" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          ssh "${ssh_opts[@]}" "ubuntu@${INSTANCE_IP}" bash -s << 'EOF'
+          set -euo pipefail
+          missing=()
+          for cmd in nvidia-smi docker sudo git ssh-keyscan tmux; do
+            if ! command -v "${cmd}" >/dev/null 2>&1; then
+              missing+=("${cmd}")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "error: missing host commands: ${missing[*]}" >&2
+            exit 1
+          fi
+          echo "nvidia-smi -L"
+          nvidia-smi -L
+          echo "docker --version"
+          docker --version
+          if docker compose version >/dev/null 2>&1; then
+            docker compose version
+          else
+            echo "note: docker compose plugin is not installed; setup_lambda_train.sh will install it"
+          fi
+          if id -nG ubuntu | tr ' ' '\n' | grep -qx docker; then
+            echo "ubuntu is in the docker group"
+          else
+            echo "note: ubuntu is not in the docker group; setup_lambda_train.sh will add it"
+          fi
+          EOF

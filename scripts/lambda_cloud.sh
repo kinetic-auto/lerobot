@@ -3,13 +3,14 @@
 # Does not SSH, sync a dataset, or start training.
 #
 #   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh list-types
+#   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh resolve
+#   # --instance-type defaults to auto: cheapest pair, then closest to AWS us-west-1
 #   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh launch \
 #     --ssh-key-name <name>
-#   # --instance-type defaults to auto: cheapest gpu_1x_* with capacity
 #   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh status --instance-id <id>
 #   LAMBDA_CLOUD_API_KEY=... ./scripts/lambda_cloud.sh terminate --instance-id <id>
 #
-# Operations: list-types, list-instances, list-ssh-keys, launch, status, terminate
+# Operations: list-types, list-instances, list-ssh-keys, resolve, launch, status, terminate
 #
 # Launch refuses any instance type other than gpu_1x_*. The image is omitted so
 # Lambda uses the default Lambda Stack image. The instance is left running.
@@ -23,6 +24,27 @@ set -euo pipefail
 API_BASE="https://cloud.lambda.com/api/v1"
 POLL_INTERVAL_SECONDS=15
 POLL_TIMEOUT_SECONDS=600
+
+# Proximity to AWS us-west-1 (N. California). Lower is closer.
+# Lambda us-west-1 is Lambda's California region, not the AWS region.
+# A region missing from this table ranks 1000, then candidates sort by name.
+REGION_RANKS='{
+  "us-west-1": 0,
+  "us-west-4": 1,
+  "us-west-2": 2,
+  "us-west-3": 3,
+  "us-south-3": 4,
+  "us-south-1": 5,
+  "us-south-2": 6,
+  "us-midwest-1": 7,
+  "us-east-2": 8,
+  "us-east-1": 9,
+  "me-west-1": 10,
+  "europe-central-1": 11,
+  "asia-south-1": 12,
+  "asia-northeast-2": 13,
+  "asia-northeast-1": 14
+}'
 
 OPERATION=""
 INSTANCE_TYPE="auto"
@@ -172,38 +194,99 @@ list_ssh_keys() {
     jq -r '.data[].name' <<<"${body}"
 }
 
-# INSTANCE_TYPE=auto picks the cheapest gpu_1x_* type that has capacity.
-# When REGION is already set, only types offered in that region are eligible.
-resolve_instance_type() {
-    local body choice
-    [[ "${INSTANCE_TYPE}" == "auto" ]] || return 0
-    body=$(api GET /instance-types)
-    choice=$(jq -r --arg region "${REGION}" '
+# One TSV row per eligible pair, already sorted:
+# type, region, price_cents_per_hour, rank, description.
+# INSTANCE_TYPE=auto and an empty REGION consider every gpu_1x_* region with
+# capacity. A set type or region narrows the rows. Sort is price, proximity
+# to AWS us-west-1, type name, then region name.
+ranked_candidates() {
+    local body=$1
+    jq -r \
+        --arg type "${INSTANCE_TYPE}" \
+        --arg region "${REGION}" \
+        --argjson ranks "${REGION_RANKS}" '
         .data
         | to_entries
         | map(select(.key | test("^gpu_1x_[a-z0-9_]+$")))
-        | map(select(
-            if $region == "" then
-              ((.value.regions_with_capacity_available // []) | length) > 0
-            else
-              ([.value.regions_with_capacity_available[]?.name] | index($region)) != null
-            end
-          ))
-        | sort_by(.value.instance_type.price_cents_per_hour)
-        | .[0].key // empty
-    ' <<<"${body}")
-    if [[ -z "${choice}" ]]; then
-        if [[ -n "${REGION}" ]]; then
-            die "no single-GPU capacity in ${REGION}"
+        | map(select(if $type == "auto" or $type == "" then true else .key == $type end))
+        | map(
+            . as $entry
+            | ($entry.value.regions_with_capacity_available // [])[]
+            | select(if $region == "" then true else .name == $region end)
+            | {
+                type: $entry.key,
+                region: .name,
+                price: ($entry.value.instance_type.price_cents_per_hour | tonumber),
+                rank: ($ranks[.name] // 1000),
+                description: ($entry.value.instance_type.description // "")
+              }
+          )
+        | sort_by(.price, .rank, .type, .region)
+        | .[]
+        | [.type, .region, (.price | tostring), (.rank | tostring), .description]
+        | @tsv
+    ' <<<"${body}"
+}
+
+die_no_candidate() {
+    local body=$1
+    if [[ "${INSTANCE_TYPE}" != "auto" ]]; then
+        if [[ "$(jq -r --arg type "${INSTANCE_TYPE}" '.data[$type] == null' <<<"${body}")" == "true" ]]; then
+            die "instance type not offered: ${INSTANCE_TYPE}"
         fi
-        die "no single-GPU instance type has capacity"
+        if [[ -n "${REGION}" ]]; then
+            die "region ${REGION} has no capacity for ${INSTANCE_TYPE}"
+        fi
+        die "no capacity for ${INSTANCE_TYPE}"
     fi
-    INSTANCE_TYPE="${choice}"
-    log "auto-selected ${INSTANCE_TYPE}"
+    if [[ -n "${REGION}" ]]; then
+        die "no single-GPU capacity in ${REGION}"
+    fi
+    die "no single-GPU instance type has capacity"
+}
+
+# When either side is unset, take the first ranked pair. Both set leaves the
+# pair alone for load_instance_type.
+resolve_instance_type() {
+    local body price rank
+    local -a lines
+    [[ "${INSTANCE_TYPE}" == "auto" || -z "${REGION}" ]] || return 0
+    body=$(api GET /instance-types)
+    mapfile -t lines < <(ranked_candidates "${body}")
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        die_no_candidate "${body}"
+    fi
+    IFS=$'\t' read -r INSTANCE_TYPE REGION price rank _ <<<"${lines[0]}"
+    log "selected ${INSTANCE_TYPE} in ${REGION} at ${price} cents/hour rank=${rank}"
+}
+
+# Print the ranked pairs and the winner. Does not launch.
+resolve_selection() {
+    local body line type region price rank description
+    local -a lines
+    local n=0
+    if [[ "${INSTANCE_TYPE}" != "auto" ]]; then
+        require_single_gpu
+    fi
+    body=$(api GET /instance-types)
+    mapfile -t lines < <(ranked_candidates "${body}")
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        die_no_candidate "${body}"
+    fi
+    for line in "${lines[@]}"; do
+        IFS=$'\t' read -r type region price rank description <<<"${line}"
+        n=$((n + 1))
+        printf 'candidate=%s\tinstance_type=%s\tregion=%s\tprice_cents_per_hour=%s\trank=%s\tdescription=%s\n' \
+            "${n}" "${type}" "${region}" "${price}" "${rank}" "${description}"
+    done
+    IFS=$'\t' read -r type region price rank description <<<"${lines[0]}"
+    printf 'instance_type=%s\nregion=%s\nprice_cents_per_hour=%s\nrank=%s\ndescription=%s\n' \
+        "${type}" "${region}" "${price}" "${rank}" "${description}"
+    log "resolved ${type} in ${region}; not launching"
 }
 
 load_instance_type() {
-    local body entry regions price description
+    local body entry regions price description rank
     body=$(api GET /instance-types)
     entry=$(jq -c --arg type "${INSTANCE_TYPE}" '.data[$type] // empty' <<<"${body}")
     [[ -n "${entry}" ]] || die "instance type not offered: ${INSTANCE_TYPE}"
@@ -216,12 +299,13 @@ load_instance_type() {
         die "no capacity for ${INSTANCE_TYPE}"
     fi
     if [[ -z "${REGION}" ]]; then
-        REGION=${regions%%,*}
+        die "region was not selected for ${INSTANCE_TYPE}"
     elif [[ ",${regions}," != *",${REGION},"* ]]; then
         die "region ${REGION} has no capacity for ${INSTANCE_TYPE} (available: ${regions})"
     fi
 
-    log "${INSTANCE_TYPE} \"${description}\" ${price} cents/hour region=${REGION}"
+    rank=$(jq -nr --argjson ranks "${REGION_RANKS}" --arg name "${REGION}" '$ranks[$name] // 1000')
+    log "${INSTANCE_TYPE} \"${description}\" ${price} cents/hour region=${REGION} rank=${rank}"
 }
 
 launch_instance() {
@@ -329,7 +413,7 @@ terminate_instance() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        list-types|list-instances|list-ssh-keys|launch|status|terminate)
+        list-types|list-instances|list-ssh-keys|resolve|launch|status|terminate)
             [[ -z "${OPERATION}" ]] || die "unexpected argument: $1"
             OPERATION=$1
             shift
@@ -369,13 +453,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "${OPERATION}" ]] || die "operation is required (list-types, list-instances, list-ssh-keys, launch, status, terminate)"
-if [[ "${OPERATION}" == "launch" && -z "${INSTANCE_TYPE}" ]]; then
+[[ -n "${OPERATION}" ]] || die "operation is required (list-types, list-instances, list-ssh-keys, resolve, launch, status, terminate)"
+if [[ "${OPERATION}" == "launch" || "${OPERATION}" == "resolve" ]] && [[ -z "${INSTANCE_TYPE}" ]]; then
     INSTANCE_TYPE="auto"
 fi
 [[ -n "${INSTANCE_NAME}" ]] || INSTANCE_NAME="lerobot-train"
 
 case "${OPERATION}" in
+    resolve)
+        if [[ "${INSTANCE_TYPE}" != "auto" ]]; then
+            require_single_gpu
+        fi
+        ;;
     launch)
         if [[ "${INSTANCE_TYPE}" != "auto" ]]; then
             require_single_gpu
@@ -400,6 +489,9 @@ case "${OPERATION}" in
         ;;
     list-ssh-keys)
         list_ssh_keys
+        ;;
+    resolve)
+        resolve_selection
         ;;
     launch)
         launch_instance
